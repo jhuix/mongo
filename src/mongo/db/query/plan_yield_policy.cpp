@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,17 +34,24 @@
 
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_yield.h"
 #include "mongo/db/service_context.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
+namespace {
+MONGO_FAIL_POINT_DEFINE(setInterruptOnlyPlansCheckForInterruptHang);
+}  // namespace
+
 PlanYieldPolicy::PlanYieldPolicy(PlanExecutor* exec, PlanExecutor::YieldPolicy policy)
-    : _policy(policy),
+    : _policy(exec->getOpCtx()->lockState()->isGlobalLockedRecursively() ? PlanExecutor::NO_YIELD
+                                                                         : policy),
       _forceYield(false),
       _elapsedTracker(exec->getOpCtx()->getServiceContext()->getFastClockSource(),
                       internalQueryExecYieldIterations.load(),
@@ -58,6 +67,13 @@ PlanYieldPolicy::PlanYieldPolicy(PlanExecutor::YieldPolicy policy, ClockSource* 
                       Milliseconds(internalQueryExecYieldPeriodMS.load())),
       _planYielding(nullptr) {}
 
+bool PlanYieldPolicy::shouldYieldOrInterrupt() {
+    if (_policy == PlanExecutor::INTERRUPT_ONLY) {
+        return _elapsedTracker.intervalHasElapsed();
+    }
+    return shouldYield();
+}
+
 bool PlanYieldPolicy::shouldYield() {
     if (!canAutoYield())
         return false;
@@ -71,19 +87,29 @@ void PlanYieldPolicy::resetTimer() {
     _elapsedTracker.resetLastTime();
 }
 
-Status PlanYieldPolicy::yield(RecordFetcher* recordFetcher) {
+Status PlanYieldPolicy::yieldOrInterrupt(stdx::function<void()> whileYieldingFn) {
     invariant(_planYielding);
-    if (recordFetcher) {
+
+    if (_policy == PlanExecutor::INTERRUPT_ONLY) {
+        ON_BLOCK_EXIT([this]() { resetTimer(); });
         OperationContext* opCtx = _planYielding->getOpCtx();
-        return yield([recordFetcher, opCtx] { recordFetcher->setup(opCtx); },
-                     [recordFetcher] { recordFetcher->fetch(); });
-    } else {
-        return yield(nullptr, nullptr);
+        invariant(opCtx);
+        // If the 'setInterruptOnlyPlansCheckForInterruptHang' fail point is enabled, set the 'msg'
+        // field of this operation's CurOp to signal that we've hit this point.
+        if (MONGO_FAIL_POINT(setInterruptOnlyPlansCheckForInterruptHang)) {
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &setInterruptOnlyPlansCheckForInterruptHang,
+                opCtx,
+                "setInterruptOnlyPlansCheckForInterruptHang");
+        }
+
+        return opCtx->checkForInterruptNoAssert();
     }
+
+    return yield(whileYieldingFn);
 }
 
-Status PlanYieldPolicy::yield(stdx::function<void()> beforeYieldingFn,
-                              stdx::function<void()> whileYieldingFn) {
+Status PlanYieldPolicy::yield(stdx::function<void()> whileYieldingFn) {
     invariant(_planYielding);
     invariant(canAutoYield());
 
@@ -122,17 +148,20 @@ Status PlanYieldPolicy::yield(stdx::function<void()> beforeYieldingFn,
                 opCtx->recoveryUnit()->abandonSnapshot();
             } else {
                 // Release and reacquire locks.
-                if (beforeYieldingFn)
-                    beforeYieldingFn();
                 QueryYield::yieldAllLocks(opCtx, whileYieldingFn, _planYielding->nss());
             }
 
-            return _planYielding->restoreStateWithoutRetrying();
+            _planYielding->restoreStateWithoutRetrying();
+            return Status::OK();
         } catch (const WriteConflictException&) {
-            CurOp::get(opCtx)->debug().writeConflicts++;
+            CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
             WriteConflictException::logAndBackoff(
                 attempt, "plan execution restoreState", _planYielding->nss().ns());
             // retry
+        } catch (...) {
+            // Errors other than write conflicts don't get retried, and should instead result in the
+            // PlanExecutor dying. We propagate all such errors as status codes.
+            return exceptionToStatus();
         }
     }
 }

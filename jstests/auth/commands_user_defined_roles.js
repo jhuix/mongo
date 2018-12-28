@@ -5,7 +5,13 @@ Exhaustive test for authorization of commands with user-defined roles.
 The test logic implemented here operates on the test cases defined
 in jstests/auth/commands.js.
 
+@tags: [requires_sharding]
+
 */
+
+// TODO SERVER-35447: This test involves killing all sessions, which will not work as expected if
+// the kill command is sent with an implicit session.
+TestData.disableImplicitSessions = true;
 
 // constants
 var testUser = "userDefinedRolesTestUser";
@@ -35,7 +41,7 @@ function testProperAuthorization(conn, t, testcase, privileges) {
 
     var command = t.command;
     if (typeof(command) === "function") {
-        command = t.command(state);
+        command = t.command(state, testcase.commandArgs);
     }
     var res = runOnDb.runCommand(command);
 
@@ -50,7 +56,7 @@ function testProperAuthorization(conn, t, testcase, privileges) {
     }
 
     firstDb.logout();
-    authCommandsLib.teardown(conn, t, runOnDb);
+    authCommandsLib.teardown(conn, t, runOnDb, res);
     return out;
 }
 
@@ -73,7 +79,7 @@ function testInsufficientPrivileges(conn, t, testcase, privileges) {
 
     var command = t.command;
     if (typeof(command) === "function") {
-        command = t.command(state);
+        command = t.command(state, testcase.commandArgs);
     }
     var res = runOnDb.runCommand(command);
 
@@ -204,7 +210,12 @@ authCommandsLib.runTests(conn, impls);
 MongoRunner.stopMongod(conn);
 
 // run all tests sharded
-conn = new ShardingTest(
-    {shards: 2, mongos: 1, keyFile: "jstests/libs/key1", other: {shardOptions: opts}});
+// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
+conn = new ShardingTest({
+    shards: 2,
+    mongos: 1,
+    keyFile: "jstests/libs/key1",
+    other: {shardOptions: opts, shardAsReplicaSet: false}
+});
 authCommandsLib.runTests(conn, impls);
 conn.stop();

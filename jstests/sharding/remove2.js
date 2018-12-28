@@ -1,5 +1,10 @@
-// Test that removing and re-adding shard works correctly.
-
+/**
+ * Test that removing and re-adding shard works correctly.
+ *
+ * This test is labeled resource intensive because its total io_write is 59MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger.
+ * @tags: [resource_intensive]
+ */
 load("jstests/replsets/rslib.js");
 
 // The UUID consistency check uses connections to shards cached on the ShardingTest object, but this

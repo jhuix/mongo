@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,12 +38,14 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/curop_metrics.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/update.h"
 #include "mongo/db/introspect.h"
@@ -50,7 +54,6 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
-#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/ops/write_ops_gen.h"
@@ -60,16 +63,21 @@
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/retryable_writes_stats.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/top.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
+#include "mongo/util/log_and_backoff.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -78,9 +86,20 @@ namespace mongo {
 // single type of operation are static functions defined above their caller.
 namespace {
 
-MONGO_FP_DECLARE(failAllInserts);
-MONGO_FP_DECLARE(failAllUpdates);
-MONGO_FP_DECLARE(failAllRemoves);
+MONGO_FAIL_POINT_DEFINE(failAllInserts);
+MONGO_FAIL_POINT_DEFINE(failAllUpdates);
+MONGO_FAIL_POINT_DEFINE(failAllRemoves);
+MONGO_FAIL_POINT_DEFINE(hangBeforeChildRemoveOpFinishes);
+MONGO_FAIL_POINT_DEFINE(hangBeforeChildRemoveOpIsPopped);
+MONGO_FAIL_POINT_DEFINE(hangAfterAllChildRemoveOpsArePopped);
+MONGO_FAIL_POINT_DEFINE(hangDuringBatchInsert);
+MONGO_FAIL_POINT_DEFINE(hangDuringBatchUpdate);
+
+void updateRetryStats(OperationContext* opCtx, bool containsRetry) {
+    if (containsRetry) {
+        RetryableWritesStats::get(opCtx)->incrementRetriedCommandsCount();
+    }
+}
 
 void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
     try {
@@ -99,26 +118,20 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
                     curOp->isCommand(),
                     curOp->getReadWriteType());
 
-        if (!curOp->debug().exceptionInfo.isOK()) {
+        if (!curOp->debug().errInfo.isOK()) {
             LOG(3) << "Caught Assertion in " << redact(logicalOpToString(curOp->getLogicalOp()))
-                   << ": " << curOp->debug().exceptionInfo.toString();
+                   << ": " << curOp->debug().errInfo.toString();
         }
 
-        const bool logAll = logger::globalLogDomain()->shouldLog(logger::LogComponent::kCommand,
-                                                                 logger::LogSeverity::Debug(1));
-        const bool logSlow = executionTimeMicros > (serverGlobalParams.slowMS * 1000LL);
-
-        const bool shouldSample = serverGlobalParams.sampleRate == 1.0
-            ? true
-            : opCtx->getClient()->getPrng().nextCanonicalDouble() < serverGlobalParams.sampleRate;
-
-        if (logAll || (shouldSample && logSlow)) {
-            Locker::LockerInfo lockerInfo;
-            opCtx->lockState()->getLockerInfo(&lockerInfo);
-            log() << curOp->debug().report(opCtx->getClient(), *curOp, lockerInfo.stats);
-        }
+        // Mark the op as complete, and log it if appropriate. Returns a boolean indicating whether
+        // this op should be sampled for profiling.
+        const bool shouldSample =
+            curOp->completeAndLogOperation(opCtx, MONGO_LOG_DEFAULT_COMPONENT);
 
         if (curOp->shouldDBProfile(shouldSample)) {
+            // Stash the current transaction so that writes to the profile collection are not
+            // done as part of the transaction.
+            TransactionParticipant::SideTransactionBlock sideTxn(opCtx);
             profile(opCtx, CurOp::get(opCtx)->getNetworkOp());
         }
     } catch (const DBException& ex) {
@@ -130,7 +143,9 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
 }
 
 /**
- * Sets the Client's LastOp to the system OpTime if needed.
+ * Sets the Client's LastOp to the system OpTime if needed. This is especially helpful for
+ * adjusting the client opTime for cases when batched write performed multiple writes, but
+ * when the last write was a no-op (which will not advance the client opTime).
  */
 class LastOpFixer {
 public:
@@ -178,12 +193,23 @@ void assertCanWrite_inlock(OperationContext* opCtx, const NamespaceString& ns) {
 }
 
 void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    auto inTransaction = txnParticipant && txnParticipant->inMultiDocumentTransaction();
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            str::stream() << "Cannot create namespace " << ns.ns()
+                          << " in multi-document transaction.",
+            !inTransaction);
+
     writeConflictRetry(opCtx, "implicit collection creation", ns.ns(), [&opCtx, &ns] {
         AutoGetOrCreateDb db(opCtx, ns.db(), MODE_X);
         assertCanWrite_inlock(opCtx, ns);
         if (!db.getDb()->getCollection(opCtx, ns)) {  // someone else may have beat us to it.
+            uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
             WriteUnitOfWork wuow(opCtx);
-            uassertStatusOK(userCreateNS(opCtx, db.getDb(), ns.ns(), BSONObj()));
+            CollectionOptions collectionOptions;
+            uassertStatusOK(
+                collectionOptions.parse(BSONObj(), CollectionOptions::ParseKind::parseForCommand));
+            uassertStatusOK(db.getDb()->userCreateNS(opCtx, ns, collectionOptions));
             wuow.commit();
         }
     });
@@ -199,38 +225,39 @@ bool handleError(OperationContext* opCtx,
                  WriteResult* out) {
     LastError::get(opCtx->getClient()).setLastError(ex.code(), ex.reason());
     auto& curOp = *CurOp::get(opCtx);
-    curOp.debug().exceptionInfo = ex.toStatus();
+    curOp.debug().errInfo = ex.toStatus();
 
     if (ErrorCodes::isInterruption(ex.code())) {
         throw;  // These have always failed the whole batch.
     }
 
-    if (ErrorCodes::isStaleShardingError(ex.code())) {
-        auto staleConfigException = dynamic_cast<const StaleConfigException*>(&ex);
-        if (!staleConfigException) {
-            // We need to get extra info off of the SCE, but some common patterns can result in the
-            // exception being converted to a Status then rethrown as a AssertionException, losing
-            // the info we need. It would be a bug if this happens so we want to detect it in
-            // testing, but it isn't severe enough that we should bring down the server if it
-            // happens in production.
-            dassert(staleConfigException);
-            msgasserted(35475,
-                        str::stream()
-                            << "Got a StaleConfig error but exception was the wrong type: "
-                            << demangleName(typeid(ex)));
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    if (txnParticipant && txnParticipant->inActiveOrKilledMultiDocumentTransaction()) {
+        // If we are in a transaction, we must fail the whole batch.
+        throw;
+    }
+
+    if (ex.extraInfo<StaleConfigInfo>()) {
+        if (!opCtx->getClient()->isInDirectClient()) {
+            auto& oss = OperationShardingState::get(opCtx);
+            oss.setShardingOperationFailedStatus(ex.toStatus());
         }
 
-        if (!opCtx->getClient()->isInDirectClient()) {
-            ShardingState::get(opCtx)
-                ->onStaleShardVersion(opCtx, nss, staleConfigException->getVersionReceived())
-                .transitional_ignore();
-        }
-        out->staleConfigException = stdx::make_unique<StaleConfigException>(*staleConfigException);
+        // Don't try doing more ops since they will fail with the same error.
+        // Command reply serializer will handle repeating this error if needed.
+        out->results.emplace_back(ex.toStatus());
+        return false;
+    } else if (ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
+        auto& oss = OperationShardingState::get(opCtx);
+        oss.setShardingOperationFailedStatus(ex.toStatus());
+
+        // Don't try doing more ops since they will fail with the same error.
+        // Command reply serializer will handle repeating this error if needed.
+        out->results.emplace_back(ex.toStatus());
         return false;
     }
 
     out->results.emplace_back(ex.toStatus());
-
     return !wholeOp.getOrdered();
 }
 
@@ -255,50 +282,25 @@ SingleWriteResult createIndex(OperationContext* opCtx,
     cmdBuilder << "createIndexes" << ns.coll();
     cmdBuilder << "indexes" << BSON_ARRAY(spec);
 
-    auto cmdResult = Command::runCommandDirectly(
+    auto cmdResult = CommandHelpers::runCommandDirectly(
         opCtx, OpMsgRequest::fromDBAndBody(systemIndexes.db(), cmdBuilder.obj()));
     uassertStatusOK(getStatusFromCommandResult(cmdResult));
 
     // Unlike normal inserts, it is not an error to "insert" a duplicate index.
     long long n =
         cmdResult["numIndexesAfter"].numberInt() - cmdResult["numIndexesBefore"].numberInt();
-    CurOp::get(opCtx)->debug().ninserted += n;
+    CurOp::get(opCtx)->debug().additiveMetrics.incrementNinserted(n);
 
     SingleWriteResult result;
     result.setN(n);
     return result;
 }
 
-WriteResult performCreateIndexes(OperationContext* opCtx, const write_ops::Insert& wholeOp) {
-    // Currently this creates each index independently. We could pass multiple indexes to
-    // createIndexes, but there is a lot of complexity involved in doing it correctly. For one
-    // thing, createIndexes only takes indexes to a single collection, but this batch could include
-    // different collections. Additionally, the error handling is different: createIndexes is
-    // all-or-nothing while inserts are supposed to behave like a sequence that either skips over
-    // errors or stops at the first one. These could theoretically be worked around, but it doesn't
-    // seem worth it since users that want faster index builds should just use the createIndexes
-    // command rather than a legacy emulation.
-    LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
-    WriteResult out;
-    for (auto&& spec : wholeOp.getDocuments()) {
-        try {
-            lastOpFixer.startingOp();
-            out.results.emplace_back(createIndex(opCtx, wholeOp.getNamespace(), spec));
-            lastOpFixer.finishedOpSuccessfully();
-        } catch (const DBException& ex) {
-            const bool canContinue =
-                handleError(opCtx, ex, wholeOp.getNamespace(), wholeOp.getWriteCommandBase(), &out);
-            if (!canContinue)
-                break;
-        }
-    }
-    return out;
-}
-
 void insertDocuments(OperationContext* opCtx,
                      Collection* collection,
                      std::vector<InsertStatement>::iterator begin,
-                     std::vector<InsertStatement>::iterator end) {
+                     std::vector<InsertStatement>::iterator end,
+                     bool fromMigrate) {
     // Intentionally not using writeConflictRetry. That is handled by the caller so it can react to
     // oversized batches.
     WriteUnitOfWork wuow(opCtx);
@@ -307,11 +309,15 @@ void insertDocuments(OperationContext* opCtx,
     // This must only be done for doc-locking storage engines, which are allowed to insert oplog
     // documents out-of-timestamp-order.  For other storage engines, the oplog entries must be
     // physically written in timestamp order, so we defer optime assignment until the oplog is about
-    // to be written.
+    // to be written. Multidocument transactions should not generate opTimes because they are
+    // generated at the time of commit.
     auto batchSize = std::distance(begin, end);
     if (supportsDocLocking()) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        if (!replCoord->isOplogDisabledFor(opCtx, collection->ns())) {
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        auto inTransaction = txnParticipant && txnParticipant->inMultiDocumentTransaction();
+
+        if (!inTransaction && !replCoord->isOplogDisabledFor(opCtx, collection->ns())) {
             // Populate 'slots' with new optimes for each insert.
             // This also notifies the storage engine of each new timestamp.
             auto oplogSlots = repl::getNextOpTimes(opCtx, batchSize);
@@ -322,8 +328,8 @@ void insertDocuments(OperationContext* opCtx,
         }
     }
 
-    uassertStatusOK(collection->insertDocuments(
-        opCtx, begin, end, &CurOp::get(opCtx)->debug(), /*enforceQuota*/ true));
+    uassertStatusOK(
+        collection->insertDocuments(opCtx, begin, end, &CurOp::get(opCtx)->debug(), fromMigrate));
     wuow.commit();
 }
 
@@ -334,7 +340,8 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                                 const write_ops::Insert& wholeOp,
                                 std::vector<InsertStatement>& batch,
                                 LastOpFixer* lastOpFixer,
-                                WriteResult* out) {
+                                WriteResult* out,
+                                bool fromMigrate) {
     if (batch.empty())
         return true;
 
@@ -343,7 +350,16 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
     boost::optional<AutoGetCollection> collection;
     auto acquireCollection = [&] {
         while (true) {
-            opCtx->checkForInterrupt();
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &hangDuringBatchInsert,
+                opCtx,
+                "hangDuringBatchInsert",
+                []() {
+                    log() << "batch insert - hangDuringBatchInsert fail point enabled. Blocking "
+                             "until fail point is disabled.";
+                },
+                true  // Check for interrupt periodically.
+                );
 
             if (MONGO_FAIL_POINT(failAllInserts)) {
                 uasserted(ErrorCodes::InternalError, "failAllInserts failpoint active!");
@@ -367,21 +383,28 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
             // First try doing it all together. If all goes well, this is all we need to do.
             // See Collection::_insertDocuments for why we do all capped inserts one-at-a-time.
             lastOpFixer->startingOp();
-            insertDocuments(opCtx, collection->getCollection(), batch.begin(), batch.end());
+            insertDocuments(
+                opCtx, collection->getCollection(), batch.begin(), batch.end(), fromMigrate);
             lastOpFixer->finishedOpSuccessfully();
             globalOpCounters.gotInserts(batch.size());
             SingleWriteResult result;
             result.setN(1);
 
             std::fill_n(std::back_inserter(out->results), batch.size(), std::move(result));
-            curOp.debug().ninserted += batch.size();
+            curOp.debug().additiveMetrics.incrementNinserted(batch.size());
             return true;
         }
     } catch (const DBException&) {
-        collection.reset();
 
-        // Ignore this failure and behave as-if we never tried to do the combined batch insert.
-        // The loop below will handle reporting any non-transient errors.
+        // If we cannot abandon the current snapshot, we give up and rethrow the exception.
+        // No WCE retrying is attempted.  This code path is intended for snapshot read concern.
+        if (opCtx->lockState()->inAWriteUnitOfWork()) {
+            throw;
+        }
+
+        // Otherwise, ignore this failure and behave as-if we never tried to do the combined batch
+        // insert.  The loop below will handle reporting any non-transient errors.
+        collection.reset();
     }
 
     // Try to insert the batch one-at-a-time. This path is executed both for singular batches, and
@@ -394,15 +417,18 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                     if (!collection)
                         acquireCollection();
                     lastOpFixer->startingOp();
-                    insertDocuments(opCtx, collection->getCollection(), it, it + 1);
+                    insertDocuments(opCtx, collection->getCollection(), it, it + 1, fromMigrate);
                     lastOpFixer->finishedOpSuccessfully();
                     SingleWriteResult result;
                     result.setN(1);
                     out->results.emplace_back(std::move(result));
-                    curOp.debug().ninserted++;
+                    curOp.debug().additiveMetrics.incrementNinserted(1);
                 } catch (...) {
-                    // Release the lock following any error. Among other things, this ensures that
-                    // we don't sleep in the WCE retry loop with the lock held.
+                    // Release the lock following any error if we are not in multi-statement
+                    // transaction. Among other things, this ensures that we don't sleep in the WCE
+                    // retry loop with the lock held.
+                    // If we are in multi-statement transaction and under a under a WUOW, we will
+                    // not actually release the lock.
                     collection.reset();
                     throw;
                 }
@@ -424,10 +450,23 @@ StmtId getStmtIdForWriteOp(OperationContext* opCtx, const T& wholeOp, size_t opI
                                  : kUninitializedStmtId;
 }
 
+SingleWriteResult makeWriteResultForInsertOrDeleteRetry() {
+    SingleWriteResult res;
+    res.setN(1);
+    res.setNModified(0);
+    return res;
+}
+
 }  // namespace
 
-WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& wholeOp) {
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());  // Does own retries.
+WriteResult performInserts(OperationContext* opCtx,
+                           const write_ops::Insert& wholeOp,
+                           bool fromMigrate) {
+    // Insert performs its own retries, so we should only be within a WriteUnitOfWork when run in a
+    // transaction.
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    invariant(!opCtx->lockState()->inAWriteUnitOfWork() ||
+              (txnParticipant && txnParticipant->inActiveOrKilledMultiDocumentTransaction()));
     auto& curOp = *CurOp::get(opCtx);
     ON_BLOCK_EXIT([&] {
         // This is the only part of finishCurOp we need to do for inserts because they reuse the
@@ -449,14 +488,10 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
         curOp.setNS_inlock(wholeOp.getNamespace().ns());
         curOp.setLogicalOp_inlock(LogicalOp::opInsert);
         curOp.ensureStarted();
-        curOp.debug().ninserted = 0;
+        curOp.debug().additiveMetrics.ninserted = 0;
     }
 
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
-
-    if (wholeOp.getNamespace().isSystemDotIndexes()) {
-        return performCreateIndexes(opCtx, wholeOp);
-    }
 
     DisableDocumentValidationIfTrue docValidationDisabler(
         opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
@@ -464,6 +499,9 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
 
     WriteResult out;
     out.results.reserve(wholeOp.getDocuments().size());
+
+    bool containsRetry = false;
+    ON_BLOCK_EXIT([&] { updateRetryStats(opCtx, containsRetry); });
 
     size_t stmtIdIndex = 0;
     size_t bytesInBatch = 0;
@@ -481,10 +519,11 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
         } else {
             const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
             if (opCtx->getTxnNumber()) {
-                auto session = OperationContextSession::get(opCtx);
-                if (auto entry =
-                        session->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {
-                    out.results.emplace_back(parseOplogEntryForInsert(*entry));
+                if (!txnParticipant->inMultiDocumentTransaction() &&
+                    txnParticipant->checkStatementExecutedNoOplogEntryFetch(stmtId)) {
+                    containsRetry = true;
+                    RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
+                    out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
                     continue;
                 }
             }
@@ -496,18 +535,20 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
                 continue;  // Add more to batch before inserting.
         }
 
-        bool canContinue = insertBatchAndHandleErrors(opCtx, wholeOp, batch, &lastOpFixer, &out);
+        bool canContinue =
+            insertBatchAndHandleErrors(opCtx, wholeOp, batch, &lastOpFixer, &out, fromMigrate);
         batch.clear();  // We won't need the current batch any more.
         bytesInBatch = 0;
 
         if (canContinue && !fixedDoc.isOK()) {
             globalOpCounters.gotInsert();
-            canContinue = handleError(
-                opCtx,
-                AssertionException(fixedDoc.getStatus().code(), fixedDoc.getStatus().reason()),
-                wholeOp.getNamespace(),
-                wholeOp.getWriteCommandBase(),
-                &out);
+            try {
+                uassertStatusOK(fixedDoc.getStatus());
+                MONGO_UNREACHABLE;
+            } catch (const DBException& ex) {
+                canContinue = handleError(
+                    opCtx, ex, wholeOp.getNamespace(), wholeOp.getWriteCommandBase(), &out);
+            }
         }
 
         if (!canContinue)
@@ -520,40 +561,18 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
 static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
                                                const NamespaceString& ns,
                                                StmtId stmtId,
-                                               const write_ops::UpdateOpEntry& op) {
-    uassert(ErrorCodes::InvalidOptions,
-            "Cannot use (or request) retryable writes with multi=true",
-            !(opCtx->getTxnNumber() && op.getMulti()));
-
-    globalOpCounters.gotUpdate();
-    auto& curOp = *CurOp::get(opCtx);
-    {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        curOp.setNS_inlock(ns.ns());
-        curOp.setNetworkOp_inlock(dbUpdate);
-        curOp.setLogicalOp_inlock(LogicalOp::opUpdate);
-        curOp.setOpDescription_inlock(op.toBSON());
-        curOp.ensureStarted();
-    }
-
-    UpdateLifecycleImpl updateLifecycle(ns);
-    UpdateRequest request(ns);
-    request.setLifecycle(&updateLifecycle);
-    request.setQuery(op.getQ());
-    request.setUpdates(op.getU());
-    request.setCollation(write_ops::collationOf(op));
-    request.setStmtId(stmtId);
-    request.setArrayFilters(write_ops::arrayFiltersOf(op));
-    request.setMulti(op.getMulti());
-    request.setUpsert(op.getUpsert());
-    request.setYieldPolicy(PlanExecutor::YIELD_AUTO);  // ParsedUpdate overrides this for $isolated.
-
-    ParsedUpdate parsedUpdate(opCtx, &request);
+                                               const UpdateRequest& updateRequest) {
+    ParsedUpdate parsedUpdate(opCtx, &updateRequest);
     uassertStatusOK(parsedUpdate.parseRequest());
 
     boost::optional<AutoGetCollection> collection;
     while (true) {
-        opCtx->checkForInterrupt();
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangDuringBatchUpdate, opCtx, "hangDuringBatchUpdate", [opCtx]() {
+                log() << "batch update - hangDuringBatchUpdate fail point enabled. Blocking until "
+                         "fail point is disabled.";
+            });
+
         if (MONGO_FAIL_POINT(failAllUpdates)) {
             uasserted(ErrorCodes::InternalError, "failAllUpdates failpoint active!");
         }
@@ -561,13 +580,15 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
         collection.emplace(opCtx,
                            ns,
                            MODE_IX,  // DB is always IX, even if collection is X.
-                           parsedUpdate.isIsolated() ? MODE_X : MODE_IX);
-        if (collection->getCollection() || !op.getUpsert())
+                           MODE_IX);
+        if (collection->getCollection() || !updateRequest.isUpsert())
             break;
 
         collection.reset();  // unlock.
         makeCollection(opCtx, ns);
     }
+
+    auto& curOp = *CurOp::get(opCtx);
 
     if (collection->getDb()) {
         curOp.raiseDbProfileLevel(collection->getDb()->getProfilingLevel());
@@ -614,13 +635,90 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
     return result;
 }
 
+/**
+ * Performs a single update, retrying failure due to DuplicateKeyError when eligible.
+ */
+static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(OperationContext* opCtx,
+                                                              const NamespaceString& ns,
+                                                              StmtId stmtId,
+                                                              const write_ops::UpdateOpEntry& op) {
+    globalOpCounters.gotUpdate();
+    auto& curOp = *CurOp::get(opCtx);
+    {
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        curOp.setNS_inlock(ns.ns());
+        curOp.setNetworkOp_inlock(dbUpdate);
+        curOp.setLogicalOp_inlock(LogicalOp::opUpdate);
+        curOp.setOpDescription_inlock(op.toBSON());
+        curOp.ensureStarted();
+    }
+
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    uassert(ErrorCodes::InvalidOptions,
+            "Cannot use (or request) retryable writes with multi=true",
+            (txnParticipant && txnParticipant->inMultiDocumentTransaction()) ||
+                !opCtx->getTxnNumber() || !op.getMulti());
+
+    UpdateRequest request(ns);
+    request.setQuery(op.getQ());
+    request.setUpdates(op.getU());
+    request.setCollation(write_ops::collationOf(op));
+    request.setStmtId(stmtId);
+    request.setArrayFilters(write_ops::arrayFiltersOf(op));
+    request.setMulti(op.getMulti());
+    request.setUpsert(op.getUpsert());
+
+    auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    request.setYieldPolicy(readConcernArgs.getLevel() ==
+                                   repl::ReadConcernLevel::kSnapshotReadConcern
+                               ? PlanExecutor::INTERRUPT_ONLY
+                               : PlanExecutor::YIELD_AUTO);
+
+    size_t numAttempts = 0;
+    while (true) {
+        ++numAttempts;
+
+        try {
+            return performSingleUpdateOp(opCtx, ns, stmtId, request);
+        } catch (ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
+            ParsedUpdate parsedUpdate(opCtx, &request);
+            uassertStatusOK(parsedUpdate.parseRequest());
+
+            if (!parsedUpdate.hasParsedQuery()) {
+                uassertStatusOK(parsedUpdate.parseQueryToCQ());
+            }
+
+            if (!UpdateStage::shouldRetryDuplicateKeyException(
+                    parsedUpdate, *ex.extraInfo<DuplicateKeyErrorInfo>())) {
+                throw;
+            }
+
+            logAndBackoff(::mongo::logger::LogComponent::kWrite,
+                          logger::LogSeverity::Debug(1),
+                          numAttempts,
+                          str::stream()
+                              << "Caught DuplicateKey exception during upsert for namespace "
+                              << ns.ns());
+        }
+    }
+
+    MONGO_UNREACHABLE;
+}
+
 WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& wholeOp) {
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());  // Does own retries.
+    // Update performs its own retries, so we should not be in a WriteUnitOfWork unless run in a
+    // transaction.
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    invariant(!opCtx->lockState()->inAWriteUnitOfWork() ||
+              (txnParticipant && txnParticipant->inActiveOrKilledMultiDocumentTransaction()));
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
     DisableDocumentValidationIfTrue docValidationDisabler(
         opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
     LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
+
+    bool containsRetry = false;
+    ON_BLOCK_EXIT([&] { updateRetryStats(opCtx, containsRetry); });
 
     size_t stmtIdIndex = 0;
     WriteResult out;
@@ -629,18 +727,20 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
     for (auto&& singleOp : wholeOp.getUpdates()) {
         const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
         if (opCtx->getTxnNumber()) {
-            auto session = OperationContextSession::get(opCtx);
-            if (auto entry =
-                    session->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {
-                out.results.emplace_back(parseOplogEntryForUpdate(*entry));
-                continue;
+            if (!txnParticipant->inMultiDocumentTransaction()) {
+                if (auto entry = txnParticipant->checkStatementExecuted(stmtId)) {
+                    containsRetry = true;
+                    RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
+                    out.results.emplace_back(parseOplogEntryForUpdate(*entry));
+                    continue;
+                }
             }
         }
 
         // TODO: don't create nested CurOp for legacy writes.
         // Add Command pointer to the nested CurOp.
         auto& parentCurOp = *CurOp::get(opCtx);
-        Command* cmd = parentCurOp.getCommand();
+        const Command* cmd = parentCurOp.getCommand();
         CurOp curOp(opCtx);
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -649,8 +749,8 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
         ON_BLOCK_EXIT([&] { finishCurOp(opCtx, &curOp); });
         try {
             lastOpFixer.startingOp();
-            out.results.emplace_back(
-                performSingleUpdateOp(opCtx, wholeOp.getNamespace(), stmtId, singleOp));
+            out.results.emplace_back(performSingleUpdateOpWithDupKeyRetry(
+                opCtx, wholeOp.getNamespace(), stmtId, singleOp));
             lastOpFixer.finishedOpSuccessfully();
         } catch (const DBException& ex) {
             const bool canContinue =
@@ -667,9 +767,11 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
                                                const NamespaceString& ns,
                                                StmtId stmtId,
                                                const write_ops::DeleteOpEntry& op) {
+    auto txnParticipant = TransactionParticipant::get(opCtx);
     uassert(ErrorCodes::InvalidOptions,
             "Cannot use (or request) retryable writes with limit=0",
-            !(opCtx->getTxnNumber() && op.getMulti()));
+            (txnParticipant && txnParticipant->inMultiDocumentTransaction()) ||
+                !opCtx->getTxnNumber() || !op.getMulti());
 
     globalOpCounters.gotDelete();
     auto& curOp = *CurOp::get(opCtx);
@@ -682,19 +784,19 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         curOp.ensureStarted();
     }
 
-    curOp.debug().ndeleted = 0;
-
     DeleteRequest request(ns);
     request.setQuery(op.getQ());
     request.setCollation(write_ops::collationOf(op));
     request.setMulti(op.getMulti());
-    request.setYieldPolicy(PlanExecutor::YIELD_AUTO);  // ParsedDelete overrides this for $isolated.
+    auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    request.setYieldPolicy(readConcernArgs.getLevel() ==
+                                   repl::ReadConcernLevel::kSnapshotReadConcern
+                               ? PlanExecutor::INTERRUPT_ONLY
+                               : PlanExecutor::YIELD_AUTO);
     request.setStmtId(stmtId);
 
     ParsedDelete parsedDelete(opCtx, &request);
     uassertStatusOK(parsedDelete.parseRequest());
-
-    opCtx->checkForInterrupt();
 
     if (MONGO_FAIL_POINT(failAllRemoves)) {
         uasserted(ErrorCodes::InternalError, "failAllRemoves failpoint active!");
@@ -703,7 +805,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
     AutoGetCollection collection(opCtx,
                                  ns,
                                  MODE_IX,  // DB is always IX, even if collection is X.
-                                 parsedDelete.isIsolated() ? MODE_X : MODE_IX);
+                                 MODE_IX);
     if (collection.getDb()) {
         curOp.raiseDbProfileLevel(collection.getDb()->getProfilingLevel());
     }
@@ -720,7 +822,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
 
     uassertStatusOK(exec->executePlan());
     long long n = DeleteStage::getNumDeleted(*exec);
-    curOp.debug().ndeleted = n;
+    curOp.debug().additiveMetrics.ndeleted = n;
 
     PlanSummaryStats summary;
     Explain::getSummaryStats(*exec, &summary);
@@ -743,12 +845,19 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
 }
 
 WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& wholeOp) {
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());  // Does own retries.
+    // Delete performs its own retries, so we should not be in a WriteUnitOfWork unless we are in a
+    // transaction.
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    invariant(!opCtx->lockState()->inAWriteUnitOfWork() ||
+              (txnParticipant && txnParticipant->inActiveOrKilledMultiDocumentTransaction()));
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
     DisableDocumentValidationIfTrue docValidationDisabler(
         opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
     LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
+
+    bool containsRetry = false;
+    ON_BLOCK_EXIT([&] { updateRetryStats(opCtx, containsRetry); });
 
     size_t stmtIdIndex = 0;
     WriteResult out;
@@ -757,10 +866,11 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
     for (auto&& singleOp : wholeOp.getDeletes()) {
         const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
         if (opCtx->getTxnNumber()) {
-            auto session = OperationContextSession::get(opCtx);
-            if (auto entry =
-                    session->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {
-                out.results.emplace_back(parseOplogEntryForDelete(*entry));
+            if (!txnParticipant->inMultiDocumentTransaction() &&
+                txnParticipant->checkStatementExecutedNoOplogEntryFetch(stmtId)) {
+                containsRetry = true;
+                RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
+                out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
                 continue;
             }
         }
@@ -768,13 +878,23 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
         // TODO: don't create nested CurOp for legacy writes.
         // Add Command pointer to the nested CurOp.
         auto& parentCurOp = *CurOp::get(opCtx);
-        Command* cmd = parentCurOp.getCommand();
+        const Command* cmd = parentCurOp.getCommand();
         CurOp curOp(opCtx);
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             curOp.setCommand_inlock(cmd);
         }
-        ON_BLOCK_EXIT([&] { finishCurOp(opCtx, &curOp); });
+        ON_BLOCK_EXIT([&] {
+            if (MONGO_FAIL_POINT(hangBeforeChildRemoveOpFinishes)) {
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &hangBeforeChildRemoveOpFinishes, opCtx, "hangBeforeChildRemoveOpFinishes");
+            }
+            finishCurOp(opCtx, &curOp);
+            if (MONGO_FAIL_POINT(hangBeforeChildRemoveOpIsPopped)) {
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &hangBeforeChildRemoveOpIsPopped, opCtx, "hangBeforeChildRemoveOpIsPopped");
+            }
+        });
         try {
             lastOpFixer.startingOp();
             out.results.emplace_back(
@@ -786,6 +906,11 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
             if (!canContinue)
                 break;
         }
+    }
+
+    if (MONGO_FAIL_POINT(hangAfterAllChildRemoveOpsArePopped)) {
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangAfterAllChildRemoveOpsArePopped, opCtx, "hangAfterAllChildRemoveOpsArePopped");
     }
 
     return out;

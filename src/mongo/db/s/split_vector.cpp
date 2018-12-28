@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,7 +37,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -83,7 +85,7 @@ StatusWith<std::vector<BSONObj>> splitVector(OperationContext* opCtx,
 
         // Allow multiKey based on the invariant that shard keys must be single-valued. Therefore,
         // any multi-key index prefixed by shard key cannot be multikey over the shard key fields.
-        IndexDescriptor* idx =
+        const IndexDescriptor* idx =
             collection->getIndexCatalog()->findShardKeyPrefixedIndex(opCtx, keyPattern, false);
         if (idx == NULL) {
             return {ErrorCodes::IndexNotFound,
@@ -123,9 +125,8 @@ StatusWith<std::vector<BSONObj>> splitVector(OperationContext* opCtx,
             maxChunkSize = maxChunkSize.get() * 1 << 20;
         }
 
-        // We need a maximum size for the chunk, unless we're not actually capable of finding any
-        // split points.
-        if ((!maxChunkSize || maxChunkSize.get() <= 0) && recCount != 0) {
+        // We need a maximum size for the chunk.
+        if (!maxChunkSize || maxChunkSize.get() <= 0) {
             return {ErrorCodes::InvalidOptions, "need to specify the desired max chunk size"};
         }
 
@@ -215,9 +216,8 @@ StatusWith<std::vector<BSONObj>> splitVector(OperationContext* opCtx,
             }
 
             if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
-                return {ErrorCodes::OperationFailed,
-                        "Executor error during splitVector command: " +
-                            WorkingSetCommon::toStatusString(currKey)};
+                return WorkingSetCommon::getMemberObjectStatus(currKey).withContext(
+                    "Executor error during splitVector command");
             }
 
             if (!force)

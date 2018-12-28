@@ -58,6 +58,17 @@ errors = [
         more than the configured cache size to complete. The operation
         may be retried; if a transaction is in progress, it should be
         rolled back and the operation retried in a new transaction.'''),
+    Error('WT_PREPARE_CONFLICT', -31808,
+        'conflict with a prepared update', '''
+        This error is generated when the application attempts to update
+        an already updated record which is in prepared state. An updated
+        record will be in prepared state, when the transaction that performed
+        the update is in prepared state.'''),
+    Error('WT_TRY_SALVAGE', -31809,
+        'database corruption detected', '''
+        This error is generated when corruption is detected in an on-disk file.
+        The application may choose to salvage the file or retry wiredtiger_open
+        with the 'salvage=true' configuration setting.'''),
 ]
 
 # Update the #defines in the wiredtiger.in file.

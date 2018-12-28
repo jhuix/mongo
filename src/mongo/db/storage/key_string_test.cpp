@@ -1,25 +1,27 @@
 // key_string_test.cpp
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -50,6 +52,7 @@
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
@@ -60,6 +63,15 @@ using namespace mongo;
 
 BSONObj toBson(const KeyString& ks, Ordering ord) {
     return KeyString::toBson(ks.getBuffer(), ks.getSize(), ord, ks.getTypeBits());
+}
+
+BSONObj toBsonAndCheckKeySize(const KeyString& ks, Ordering ord) {
+    auto keyStringSize = ks.getSize();
+
+    // Validate size of the key in KeyString.
+    ASSERT_EQUALS(keyStringSize,
+                  KeyString::getKeySize(ks.getBuffer(), keyStringSize, ord, ks.getTypeBits()));
+    return KeyString::toBson(ks.getBuffer(), keyStringSize, ord, ks.getTypeBits());
 }
 
 Ordering ALL_ASCENDING = Ordering::make(BSONObj());
@@ -86,6 +98,112 @@ protected:
     KeyString::Version version;
 };
 
+template <typename T>
+void checkSizeWhileAppendingTypeBits(int numOfBitsUsedForType, T&& appendBitsFunc) {
+    KeyString::TypeBits typeBits(KeyString::Version::V1);
+    const int kItems = 10000;  // Pick an arbitrary large number.
+    for (int i = 0; i < kItems; i++) {
+        appendBitsFunc(typeBits);
+        size_t currentRawSize = ((i + 1) * numOfBitsUsedForType - 1) / 8 + 1;
+        size_t currentSize = currentRawSize;
+        if (currentRawSize > KeyString::TypeBits::kMaxBytesForShortEncoding) {
+            // Case 4: plus 1 signal byte + 4 size bytes.
+            currentSize += 5;
+            ASSERT(typeBits.isLongEncoding());
+        } else {
+            ASSERT(!typeBits.isLongEncoding());
+            if (currentRawSize == 1 && !(typeBits.getBuffer()[0] & 0x80)) {  // Case 2
+                currentSize = 1;
+            } else {
+                // Case 3: plus 1 size byte.
+                currentSize += 1;
+            }
+        }
+        ASSERT_EQ(typeBits.getSize(), currentSize);
+    }
+}
+
+TEST(TypeBitsTest, AppendSymbol) {
+    checkSizeWhileAppendingTypeBits(
+        1, [](KeyString::TypeBits& typeBits) -> void { typeBits.appendSymbol(); });
+}
+TEST(TypeBitsTest, AppendString) {
+    // The typeBits should be all zeros, so numOfBitsUsedForType is set to 0 for
+    // passing the test although it technically uses 1 bit.
+    checkSizeWhileAppendingTypeBits(
+        0, [](KeyString::TypeBits& typeBits) -> void { typeBits.appendString(); });
+}
+TEST(typebitstest, appendDouble) {
+    checkSizeWhileAppendingTypeBits(
+        2, [](KeyString::TypeBits& typeBits) -> void { typeBits.appendNumberDouble(); });
+}
+TEST(TypeBitsTest, AppendNumberLong) {
+    checkSizeWhileAppendingTypeBits(
+        2, [](KeyString::TypeBits& typeBits) -> void { typeBits.appendNumberLong(); });
+}
+TEST(TypeBitsTest, AppendNumberInt) {
+    // The typeBits should be all zeros, so numOfBitsUsedForType is set to 0 for
+    // passing the test although it technically uses 2 bits.
+    checkSizeWhileAppendingTypeBits(
+        0, [](KeyString::TypeBits& typeBits) -> void { typeBits.appendNumberInt(); });
+}
+TEST(TypeBitsTest, AppendNumberDecimal) {
+    checkSizeWhileAppendingTypeBits(
+        2, [](KeyString::TypeBits& typeBits) -> void { typeBits.appendNumberDecimal(); });
+}
+TEST(TypeBitsTest, AppendLongZero) {
+    checkSizeWhileAppendingTypeBits(2, [](KeyString::TypeBits& typeBits) -> void {
+        typeBits.appendZero(KeyString::TypeBits::kLong);
+    });
+}
+TEST(TypeBitsTest, AppendDecimalZero) {
+    checkSizeWhileAppendingTypeBits(12 + 5, [](KeyString::TypeBits& typeBits) -> void {
+        typeBits.appendDecimalZero(KeyString::TypeBits::kDecimalZero1xxx);
+    });
+}
+TEST(TypeBitsTest, AppendDecimalExponent) {
+    checkSizeWhileAppendingTypeBits(
+        KeyString::TypeBits::kStoredDecimalExponentBits,
+        [](KeyString::TypeBits& typeBits) -> void { typeBits.appendDecimalExponent(1); });
+}
+
+TEST(TypeBitsTest, UninitializedTypeBits) {
+    KeyString::TypeBits typeBits(KeyString::Version::V1);
+    ASSERT_EQ(typeBits.getSize(), 1u);
+    ASSERT_EQ(typeBits.getBuffer()[0], 0);
+    ASSERT(typeBits.isAllZeros());
+}
+
+TEST(TypeBitsTest, AllZerosTypeBits) {
+    {
+        std::string emptyBuffer = "";
+        BufReader reader(emptyBuffer.c_str(), 0);
+        KeyString::TypeBits typeBits =
+            KeyString::TypeBits::fromBuffer(KeyString::Version::V1, &reader);
+        ASSERT_EQ(typeBits.getSize(), 1u);
+        ASSERT_EQ(typeBits.getBuffer()[0], 0);
+        ASSERT(typeBits.isAllZeros());
+    }
+
+    {
+        std::string allZerosBuffer = "0000000000000000";
+        BufReader reader(allZerosBuffer.c_str(), 0);
+        KeyString::TypeBits typeBits =
+            KeyString::TypeBits::fromBuffer(KeyString::Version::V1, &reader);
+        ASSERT_EQ(typeBits.getSize(), 1u);
+        ASSERT_EQ(typeBits.getBuffer()[0], 0);
+        ASSERT(typeBits.isAllZeros());
+    }
+}
+
+TEST(TypeBitsTest, AppendLotsOfZeroTypeBits) {
+    KeyString::TypeBits typeBits(KeyString::Version::V1);
+    for (int i = 0; i < 100000; i++) {
+        typeBits.appendString();
+    }
+    // TypeBits should still be in short encoding format.
+    ASSERT(!typeBits.isLongEncoding());
+}
 
 TEST_F(KeyStringTest, Simple1) {
     BSONObj a = BSON("" << 5);
@@ -97,13 +215,13 @@ TEST_F(KeyStringTest, Simple1) {
                      KeyString(version, b, ALL_ASCENDING, RecordId()));
 }
 
-#define ROUNDTRIP_ORDER(version, x, order)             \
-    do {                                               \
-        const BSONObj _orig = x;                       \
-        const KeyString _ks(version, _orig, order);    \
-        const BSONObj _converted = toBson(_ks, order); \
-        ASSERT_BSONOBJ_EQ(_converted, _orig);          \
-        ASSERT(_converted.binaryEqual(_orig));         \
+#define ROUNDTRIP_ORDER(version, x, order)                            \
+    do {                                                              \
+        const BSONObj _orig = x;                                      \
+        const KeyString _ks(version, _orig, order);                   \
+        const BSONObj _converted = toBsonAndCheckKeySize(_ks, order); \
+        ASSERT_BSONOBJ_EQ(_converted, _orig);                         \
+        ASSERT(_converted.binaryEqual(_orig));                        \
     } while (0)
 
 #define ROUNDTRIP(version, x)                        \
@@ -164,7 +282,7 @@ TEST_F(KeyStringTest, ActualBytesDouble) {
     // last byte (kEnd) doesn't get flipped
     string hexFlipped;
     for (size_t i = 0; i < hex.size() - 2; i += 2) {
-        char c = fromHex(hex.c_str() + i);
+        char c = uassertStatusOK(fromHex(hex.c_str() + i));
         c = ~c;
         hexFlipped += toHex(&c, 1);
     }
@@ -607,6 +725,15 @@ const std::vector<BSONObj>& getInterestingElements(KeyString::Version version) {
 
     // Something that needs multiple bytes of typeBits
     elements.push_back(BSON("" << BSON_ARRAY("" << BSONSymbol("") << 0 << 0ll << 0.0 << -0.0)));
+    if (version != KeyString::Version::V0) {
+        // Something with exceptional typeBits for Decimal
+        elements.push_back(
+            BSON("" << BSON_ARRAY("" << BSONSymbol("") << Decimal128::kNegativeInfinity
+                                     << Decimal128::kPositiveInfinity
+                                     << Decimal128::kPositiveNaN
+                                     << Decimal128("0.0000000")
+                                     << Decimal128("-0E1000"))));
+    }
 
     //
     // Interesting numeric cases
@@ -616,6 +743,11 @@ const std::vector<BSONObj>& getInterestingElements(KeyString::Version version) {
     elements.push_back(BSON("" << 0ll));
     elements.push_back(BSON("" << 0.0));
     elements.push_back(BSON("" << -0.0));
+    if (version != KeyString::Version::V0) {
+        Decimal128("0.0.0000000");
+        Decimal128("-0E1000");
+    }
+
     elements.push_back(BSON("" << std::numeric_limits<double>::quiet_NaN()));
     elements.push_back(BSON("" << std::numeric_limits<double>::infinity()));
     elements.push_back(BSON("" << -std::numeric_limits<double>::infinity()));
@@ -751,6 +883,11 @@ const std::vector<BSONObj>& getInterestingElements(KeyString::Version version) {
         elements.push_back(BSON("" << Decimal128("4.940656458412465441765687928682214E-324")));
         elements.push_back(BSON("" << Decimal128("-4.940656458412465441765687928682214E-324")));
         elements.push_back(BSON("" << Decimal128("-4.940656458412465441765687928682213E-324")));
+
+        // Non-finite values. Note: can't roundtrip negative NaNs, so not testing here.
+        elements.push_back(BSON("" << Decimal128::kPositiveNaN));
+        elements.push_back(BSON("" << Decimal128::kNegativeInfinity));
+        elements.push_back(BSON("" << Decimal128::kPositiveInfinity));
     }
 
     // Tricky double precision number for binary/decimal conversion: very close to a decimal
@@ -843,8 +980,36 @@ void testPermutation(KeyString::Version version,
     }
 }
 
+namespace {
+std::random_device rd;
+std::mt19937_64 seedGen(rd());
+
+// To be used by perf test for seeding, so that the entire test is repeatable in case of error.
+unsigned newSeed() {
+    unsigned int seed = seedGen();  // Replace by the reported number to repeat test execution.
+    log() << "Initializing random number generator using seed " << seed;
+    return seed;
+};
+
+std::vector<BSONObj> thinElements(std::vector<BSONObj> elements,
+                                  unsigned seed,
+                                  size_t maxElements) {
+    std::mt19937_64 gen(seed);
+
+    if (elements.size() <= maxElements)
+        return elements;
+
+    log() << "only keeping " << maxElements << " of " << elements.size()
+          << " elements using random selection";
+    std::shuffle(elements.begin(), elements.end(), gen);
+    elements.resize(maxElements);
+    return elements;
+}
+}  // namespace
+
+
 TEST_F(KeyStringTest, AllPermCompare) {
-    const std::vector<BSONObj>& elements = getInterestingElements(version);
+    std::vector<BSONObj> elements = getInterestingElements(version);
 
     for (size_t i = 0; i < elements.size(); i++) {
         const BSONObj& o = elements[i];
@@ -859,19 +1024,23 @@ TEST_F(KeyStringTest, AllPermCompare) {
 }
 
 TEST_F(KeyStringTest, AllPerm2Compare) {
-#if !defined(MONGO_CONFIG_OPTIMIZED_BUILD)
-    log() << "\t\t\tskipping permutation testing on non-optimized build";
-    return;
-#endif
+    std::vector<BSONObj> baseElements = getInterestingElements(version);
+    auto seed = newSeed();
 
-    const std::vector<BSONObj>& baseElements = getInterestingElements(version);
+    // Select only a small subset of elements, as the combination is quadratic.
+    // We want to select two subsets independently, so all combinations will get tested eventually.
+    // kMaxPermElements is the desired number of elements to pass to testPermutation.
+    const size_t kMaxPermElements = kDebugBuild ? 100'000 : 500'000;
+    size_t maxElements = sqrt(kMaxPermElements);
+    auto firstElements = thinElements(baseElements, seed, maxElements);
+    auto secondElements = thinElements(baseElements, seed + 1, maxElements);
 
     std::vector<BSONObj> elements;
-    for (size_t i = 0; i < baseElements.size(); i++) {
-        for (size_t j = 0; j < baseElements.size(); j++) {
+    for (size_t i = 0; i < firstElements.size(); i++) {
+        for (size_t j = 0; j < secondElements.size(); j++) {
             BSONObjBuilder b;
-            b.appendElements(baseElements[i]);
-            b.appendElements(baseElements[j]);
+            b.appendElements(firstElements[i]);
+            b.appendElements(secondElements[j]);
             BSONObj o = b.obj();
             elements.push_back(o);
         }
@@ -947,6 +1116,27 @@ TEST_F(KeyStringTest, NaNs) {
     ASSERT(std::isnan(toBson(ks2a, ONE_ASCENDING)[""].Double()));
     ASSERT(std::isnan(toBson(ks1d, ONE_DESCENDING)[""].Double()));
     ASSERT(std::isnan(toBson(ks2d, ONE_DESCENDING)[""].Double()));
+
+    if (version == KeyString::Version::V0)
+        return;
+
+    const auto nan3 = Decimal128::kPositiveNaN;
+    const auto nan4 = Decimal128::kNegativeNaN;
+    // Since we only output a single NaN, we can only do ROUNDTRIP testing for nan1.
+    ROUNDTRIP(version, BSON("" << nan3));
+    const KeyString ks3a(version, BSON("" << nan3), ONE_ASCENDING);
+    const KeyString ks3d(version, BSON("" << nan3), ONE_DESCENDING);
+
+    const KeyString ks4a(version, BSON("" << nan4), ONE_ASCENDING);
+    const KeyString ks4d(version, BSON("" << nan4), ONE_DESCENDING);
+
+    ASSERT_EQ(ks1a, ks4a);
+    ASSERT_EQ(ks1d, ks4d);
+
+    ASSERT(toBson(ks3a, ONE_ASCENDING)[""].Decimal().isNaN());
+    ASSERT(toBson(ks4a, ONE_ASCENDING)[""].Decimal().isNaN());
+    ASSERT(toBson(ks3d, ONE_DESCENDING)[""].Decimal().isNaN());
+    ASSERT(toBson(ks4d, ONE_DESCENDING)[""].Decimal().isNaN());
 }
 TEST_F(KeyStringTest, NumberOrderLots) {
     std::vector<BSONObj> numbers;
@@ -1041,7 +1231,7 @@ TEST_F(KeyStringTest, RecordIds) {
                 ASSERT(reader.atEof());
             }
 
-            if (rid.isNormal()) {
+            if (rid.isValid()) {
                 ASSERT_GT(ks, KeyString(version, RecordId()));
                 ASSERT_GT(ks, KeyString(version, RecordId::min()));
                 ASSERT_LT(ks, KeyString(version, RecordId::max()));
@@ -1089,20 +1279,209 @@ TEST_F(KeyStringTest, RecordIds) {
     }
 }
 
+TEST_F(KeyStringTest, KeyWithLotsOfTypeBits) {
+    BSONObj obj;
+    {
+        BSONObjBuilder builder;
+        {
+            int kArrSize = 54321;
+            BSONArrayBuilder array(builder.subarrayStart("x"));
+            auto zero = BSON("" << 0.0);
+            for (int i = 0; i < kArrSize; i++)
+                array.append(zero.firstElement());
+        }
+
+        obj = BSON("" << builder.obj());
+    }
+    ROUNDTRIP(version, obj);
+}
+
+BSONObj buildKeyWhichWillHaveNByteOfTypeBits(size_t n, bool allZeros) {
+    int numItems = n * 8 / 2 /* kInt/kDouble needs two bits */;
+
+    BSONObj obj;
+    BSONArrayBuilder array;
+    for (int i = 0; i < numItems; i++)
+        if (allZeros)
+            array.append(123); /* kInt uses 00 */
+        else
+            array.append(1.2); /* kDouble uses 10 */
+
+    obj = BSON("" << array.arr());
+    return obj;
+}
+
+void checkKeyWithNByteOfTypeBits(KeyString::Version version, size_t n, bool allZeros) {
+    const BSONObj orig = buildKeyWhichWillHaveNByteOfTypeBits(n, allZeros);
+    const KeyString ks(version, orig, ALL_ASCENDING);
+    const size_t typeBitsSize = ks.getTypeBits().getSize();
+    if (n == 1 || allZeros) {
+        // Case 1&2
+        // Case 2: Since we use kDouble, TypeBits="01010101" when n=1. The size
+        // is thus 1.
+        ASSERT_EQ(1u, typeBitsSize);
+    } else if (n <= 127) {
+        // Case 3
+        ASSERT_EQ(n + 1, typeBitsSize);
+    } else {
+        // Case 4
+        ASSERT_EQ(n + 5, typeBitsSize);
+    }
+    const BSONObj converted = toBsonAndCheckKeySize(ks, ALL_ASCENDING);
+    ASSERT_BSONOBJ_EQ(converted, orig);
+    ASSERT(converted.binaryEqual(orig));
+
+    // Also test TypeBits::fromBuffer()
+    BufReader bufReader(ks.getTypeBits().getBuffer(), typeBitsSize);
+    KeyString::TypeBits newTypeBits = KeyString::TypeBits::fromBuffer(version, &bufReader);
+    ASSERT_EQ(toHex(newTypeBits.getBuffer(), newTypeBits.getSize()),
+              toHex(ks.getTypeBits().getBuffer(), ks.getTypeBits().getSize()));
+}
+
+TEST_F(KeyStringTest, KeysWithNBytesTypeBits) {
+    checkKeyWithNByteOfTypeBits(version, 0, false);
+    checkKeyWithNByteOfTypeBits(version, 1, false);
+    checkKeyWithNByteOfTypeBits(version, 1, true);
+    checkKeyWithNByteOfTypeBits(version, 127, false);
+    checkKeyWithNByteOfTypeBits(version, 127, true);
+    checkKeyWithNByteOfTypeBits(version, 128, false);
+    checkKeyWithNByteOfTypeBits(version, 128, true);
+    checkKeyWithNByteOfTypeBits(version, 129, false);
+    checkKeyWithNByteOfTypeBits(version, 129, true);
+}
+
+TEST_F(KeyStringTest, VeryLargeString) {
+    BSONObj obj = BSON("" << std::string(123456, 'x'));
+    ROUNDTRIP(version, obj);
+}
+
+TEST_F(KeyStringTest, ToBsonSafeShouldNotTerminate) {
+    KeyString::TypeBits typeBits(KeyString::Version::V1);
+
+    const char invalidString[] = {
+        60,  // CType::kStringLike
+        55,  // Non-null terminated
+    };
+    ASSERT_THROWS_CODE(
+        KeyString::toBsonSafe(invalidString, sizeof(invalidString), ALL_ASCENDING, typeBits),
+        AssertionException,
+        50816);
+
+    const char invalidNumber[] = {
+        43,  // CType::kNumericPositive1ByteInt
+        1,   // Encoded integer part, least significant bit indicates there's a fractional part.
+        0,   // Since the integer part is 1 byte, the next 7 bytes are expected to be the fractional
+             // part and are needed to prevent the BufReader from overflowing.
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    };
+    ASSERT_THROWS_CODE(
+        KeyString::toBsonSafe(invalidNumber, sizeof(invalidNumber), ALL_ASCENDING, typeBits),
+        AssertionException,
+        50810);
+}
+
+TEST_F(KeyStringTest, InvalidDecimalExponent) {
+    const Decimal128 dec("1125899906842624.1");
+    const KeyString ks(KeyString::Version::V1, BSON("" << dec), ALL_ASCENDING);
+
+    // Overwrite the 1st byte to 0, corrupting the exponent. This is meant to reproduce
+    // SERVER-34767.
+    char* ksBuffer = (char*)ks.getBuffer();
+    ksBuffer[1] = 0;
+
+    ASSERT_THROWS_CODE(
+        KeyString::toBsonSafe(ksBuffer, ks.getSize(), ALL_ASCENDING, ks.getTypeBits()),
+        AssertionException,
+        50814);
+}
+
+TEST_F(KeyStringTest, InvalidDecimalZero) {
+    const KeyString ks(KeyString::Version::V1, BSON("" << Decimal128("-0")), ALL_ASCENDING);
+
+    char* ksBuffer = (char*)ks.getBuffer();
+    ksBuffer[2] = 100;
+
+    uint8_t* typeBits = (uint8_t*)ks.getTypeBits().getBuffer();
+    typeBits[1] = 147;
+
+    ASSERT_THROWS_CODE(
+        KeyString::toBsonSafe(ksBuffer, ks.getSize(), ALL_ASCENDING, ks.getTypeBits()),
+        AssertionException,
+        50846);
+}
+
+TEST_F(KeyStringTest, InvalidDecimalContinuation) {
+    auto elem = Decimal128("1.797693134862315708145274237317043E308");
+    const KeyString ks(KeyString::Version::V1, BSON("" << elem), ALL_ASCENDING);
+
+    uint8_t* ksBuffer = (uint8_t*)ks.getBuffer();
+    ksBuffer[2] = 239;
+
+    uint8_t* typeBits = (uint8_t*)ks.getTypeBits().getBuffer();
+    typeBits[1] = 231;
+
+    ASSERT_THROWS_CODE(
+        KeyString::toBsonSafe((char*)ksBuffer, ks.getSize(), ALL_ASCENDING, ks.getTypeBits()),
+        AssertionException,
+        50850);
+}
+
+TEST_F(KeyStringTest, RandomizedInputsForToBsonSafe) {
+    std::mt19937 gen(newSeed());
+    std::uniform_int_distribution<unsigned int> randomNum(std::numeric_limits<unsigned int>::min(),
+                                                          std::numeric_limits<unsigned int>::max());
+
+    const auto interestingElements = getInterestingElements(KeyString::Version::V1);
+    for (auto elem : interestingElements) {
+        const KeyString ks(KeyString::Version::V1, elem, ALL_ASCENDING);
+
+        auto ksBuffer = SharedBuffer::allocate(ks.getSize());
+        memcpy(ksBuffer.get(), ks.getBuffer(), ks.getSize());
+        auto tbBuffer = SharedBuffer::allocate(ks.getTypeBits().getSize());
+        memcpy(tbBuffer.get(), ks.getTypeBits().getBuffer(), ks.getTypeBits().getSize());
+
+        // Select a random byte to change, except for the first byte as it will likely become an
+        // invalid CType and not test anything interesting.
+        auto offset = randomNum(gen) % (ks.getSize() - 1);
+        uint8_t newValue = randomNum(gen) % std::numeric_limits<uint8_t>::max();
+        ksBuffer.get()[offset + 1] = newValue;
+
+        // Ditto for the type bits buffer.
+        offset = randomNum(gen) % ks.getTypeBits().getSize();
+        newValue = randomNum(gen) % std::numeric_limits<uint8_t>::max();
+        tbBuffer.get()[offset] = newValue;
+
+        // Build the new TypeBits.
+        BufReader reader(tbBuffer.get(), ks.getTypeBits().getSize());
+
+        try {
+            auto newTypeBits = KeyString::TypeBits::fromBuffer(KeyString::Version::V1, &reader);
+            KeyString::toBsonSafe(ksBuffer.get(), ks.getSize(), ALL_ASCENDING, newTypeBits);
+        } catch (const AssertionException&) {
+            // The expectation is that the randomized buffer is likely an invalid KeyString,
+            // however attempting to decode it should fail gracefully.
+        }
+
+        // Retest with descending.
+        try {
+            auto newTypeBits = KeyString::TypeBits::fromBuffer(KeyString::Version::V1, &reader);
+            KeyString::toBsonSafe(ksBuffer.get(), ks.getSize(), ONE_DESCENDING, newTypeBits);
+        } catch (const AssertionException&) {
+            // The expectation is that the randomized buffer is likely an invalid KeyString,
+            // however attempting to decode it should fail gracefully.
+        }
+    }
+}
+
 namespace {
 const uint64_t kMinPerfMicros = 20 * 1000;
 const uint64_t kMinPerfSamples = 50 * 1000;
 typedef std::vector<BSONObj> Numbers;
-
-std::random_device rd;
-std::mt19937 seedGen(rd());
-
-// To be used by perf test for seeding, so that the entire test is repeatable in case of error.
-unsigned newSeed() {
-    unsigned int seed = seedGen();  // Replace by the reported number to repeat test execution.
-    log() << "Initializing random number generator using seed " << seed;
-    return seed;
-};
 
 /**
  * Evaluates ROUNDTRIP on all items in Numbers a sufficient number of times to take at least
@@ -1250,4 +1629,13 @@ TEST_F(KeyStringTest, DecimalFromUniformDoublePerf) {
         }
     }
     perfTest(version, numbers);
+}
+
+DEATH_TEST(KeyStringTest, ToBsonPromotesAssertionsToTerminate, "terminate() called") {
+    const char invalidString[] = {
+        60,  // CType::kStringLike
+        55,  // Non-null terminated
+    };
+    KeyString::TypeBits typeBits(KeyString::Version::V1);
+    KeyString::toBson(invalidString, sizeof(invalidString), ALL_ASCENDING, typeBits);
 }

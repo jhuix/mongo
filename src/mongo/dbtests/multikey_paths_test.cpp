@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -31,7 +33,6 @@
 #include <iostream>
 #include <string>
 
-#include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -85,25 +86,21 @@ public:
                              BSONObj keyPattern,
                              const MultikeyPaths& expectedMultikeyPaths) {
         IndexCatalog* indexCatalog = collection->getIndexCatalog();
-        std::vector<IndexDescriptor*> indexes;
+        std::vector<const IndexDescriptor*> indexes;
         indexCatalog->findIndexesByKeyPattern(_opCtx.get(), keyPattern, false, &indexes);
         ASSERT_EQ(indexes.size(), 1U);
-        IndexDescriptor* desc = indexes[0];
+        auto desc = indexes[0];
         const IndexCatalogEntry* ice = indexCatalog->getEntry(desc);
 
         auto actualMultikeyPaths = ice->getMultikeyPaths(_opCtx.get());
-        if (storageEngineSupportsPathLevelMultikeyTracking()) {
-            ASSERT_FALSE(actualMultikeyPaths.empty());
-            const bool match = (expectedMultikeyPaths == actualMultikeyPaths);
-            if (!match) {
-                FAIL(str::stream() << "Expected: " << dumpMultikeyPaths(expectedMultikeyPaths)
-                                   << ", Actual: "
-                                   << dumpMultikeyPaths(actualMultikeyPaths));
-            }
-            ASSERT_TRUE(match);
-        } else {
-            ASSERT_TRUE(actualMultikeyPaths.empty());
+        ASSERT_FALSE(actualMultikeyPaths.empty());
+        const bool match = (expectedMultikeyPaths == actualMultikeyPaths);
+        if (!match) {
+            FAIL(str::stream() << "Expected: " << dumpMultikeyPaths(expectedMultikeyPaths)
+                               << ", Actual: "
+                               << dumpMultikeyPaths(actualMultikeyPaths));
         }
+        ASSERT_TRUE(match);
     }
 
 protected:
@@ -111,14 +108,6 @@ protected:
     const NamespaceString _nss;
 
 private:
-    bool storageEngineSupportsPathLevelMultikeyTracking() {
-        // Path-level multikey tracking is supported for all storage engines that use the KVCatalog.
-        // MMAPv1 is the only storage engine that does not.
-        //
-        // TODO SERVER-22727: Store path-level multikey information in MMAPv1 index catalog.
-        return !getGlobalServiceContext()->getGlobalStorageEngine()->isMmapV1();
-    }
-
     std::string dumpMultikeyPaths(const MultikeyPaths& multikeyPaths) {
         std::stringstream ss;
 
@@ -144,12 +133,10 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnIndexCreation) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 
@@ -176,17 +163,14 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnIndexCreationWithMultipleDocuments) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2 << 3) << "b" << 5)),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 
@@ -225,12 +209,10 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentInsert) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 
@@ -239,12 +221,10 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentInsert) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2 << 3) << "b" << 5)),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 
@@ -271,11 +251,8 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentUpdate) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
-        ASSERT_OK(collection->insertDocument(_opCtx.get(),
-                                             InsertStatement(BSON("_id" << 0 << "a" << 5)),
-                                             nullOpDebug,
-                                             enforceQuota));
+        ASSERT_OK(collection->insertDocument(
+            _opCtx.get(), InsertStatement(BSON("_id" << 0 << "a" << 5)), nullOpDebug));
         wuow.commit();
     }
 
@@ -289,16 +266,14 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentUpdate) {
         auto oldDoc = collection->docFor(_opCtx.get(), record->id);
         {
             WriteUnitOfWork wuow(_opCtx.get());
-            const bool enforceQuota = true;
             const bool indexesAffected = true;
             OpDebug* opDebug = nullptr;
-            OplogUpdateEntryArgs args;
+            CollectionUpdateArgs args;
             collection->updateDocument(
                 _opCtx.get(),
                 record->id,
                 oldDoc,
                 BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3)),
-                enforceQuota,
                 indexesAffected,
                 opDebug,
                 &args);
@@ -329,12 +304,10 @@ TEST_F(MultikeyPathsTest, PathsNotUpdatedOnDocumentDelete) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 
@@ -387,13 +360,11 @@ TEST_F(MultikeyPathsTest, PathsUpdatedForMultipleIndexesOnDocumentInsert) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        const bool enforceQuota = true;
         ASSERT_OK(collection->insertDocument(
             _opCtx.get(),
             InsertStatement(
                 BSON("_id" << 0 << "a" << BSON_ARRAY(1 << 2 << 3) << "b" << 5 << "c" << 8)),
-            nullOpDebug,
-            enforceQuota));
+            nullOpDebug));
         wuow.commit();
     }
 

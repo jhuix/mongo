@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -76,9 +76,6 @@ __rebalance_leaf_append(WT_SESSION_IMPL *session,
 	WT_RET(__wt_calloc_one(session, &copy));
 	rs->leaf[rs->leaf_next++] = copy;
 
-	copy->page = NULL;
-	copy->home = NULL;
-	copy->pindex_hint = 0;
 	copy->state = WT_REF_DISK;
 
 	WT_RET(__wt_calloc_one(session, &copy_addr));
@@ -92,7 +89,6 @@ __rebalance_leaf_append(WT_SESSION_IMPL *session,
 	else
 		copy->ref_recno = recno;
 
-	copy->page_del = NULL;
 	return (0);
 }
 
@@ -198,11 +194,9 @@ __rebalance_col_walk(
     WT_SESSION_IMPL *session, const WT_PAGE_HEADER *dsk, WT_REBALANCE_STUFF *rs)
 {
 	WT_BTREE *btree;
-	WT_CELL *cell;
 	WT_CELL_UNPACK unpack;
 	WT_DECL_ITEM(buf);
 	WT_DECL_RET;
-	uint32_t i;
 
 	btree = S2BT(session);
 
@@ -217,8 +211,7 @@ __rebalance_col_walk(
 	 * location cookie pairs.  Keys are on-page/overflow items and location
 	 * cookies are WT_CELL_ADDR_XXX items.
 	 */
-	WT_CELL_FOREACH(btree, dsk, cell, &unpack, i) {
-		__wt_cell_unpack(cell, &unpack);
+	WT_CELL_FOREACH_BEGIN(btree, dsk, unpack, true) {
 		switch (unpack.type) {
 		case WT_CELL_ADDR_INT:
 			/* An internal page: read it and recursively walk it. */
@@ -239,9 +232,9 @@ __rebalance_col_walk(
 			    unpack.type == WT_CELL_ADDR_LEAF ?
 			    WT_ADDR_LEAF : WT_ADDR_LEAF_NO, rs));
 			break;
-		WT_ILLEGAL_VALUE_ERR(session);
+		WT_ILLEGAL_VALUE_ERR(session, unpack.type);
 		}
-	}
+	} WT_CELL_FOREACH_END;
 
 err:	__wt_scr_free(session, &buf);
 	return (ret);
@@ -282,13 +275,11 @@ __rebalance_row_walk(
     WT_SESSION_IMPL *session, const WT_PAGE_HEADER *dsk, WT_REBALANCE_STUFF *rs)
 {
 	WT_BTREE *btree;
-	WT_CELL *cell;
 	WT_CELL_UNPACK key, unpack;
 	WT_DECL_ITEM(buf);
 	WT_DECL_ITEM(leafkey);
 	WT_DECL_RET;
 	size_t len;
-	uint32_t i;
 	bool first_cell;
 	const void *p;
 
@@ -308,8 +299,7 @@ __rebalance_row_walk(
 	 * cookies are WT_CELL_ADDR_XXX items.
 	 */
 	first_cell = true;
-	WT_CELL_FOREACH(btree, dsk, cell, &unpack, i) {
-		__wt_cell_unpack(cell, &unpack);
+	WT_CELL_FOREACH_BEGIN(btree, dsk, unpack, true) {
 		switch (unpack.type) {
 		case WT_CELL_KEY:
 			key = unpack;
@@ -390,9 +380,9 @@ __rebalance_row_walk(
 
 			first_cell = false;
 			break;
-		WT_ILLEGAL_VALUE_ERR(session);
+		WT_ILLEGAL_VALUE_ERR(session, unpack.type);
 		}
-	}
+	} WT_CELL_FOREACH_END;
 
 err:	__wt_scr_free(session, &buf);
 	__wt_scr_free(session, &leafkey);
@@ -444,7 +434,7 @@ __wt_bt_rebalance(WT_SESSION_IMPL *session, const char *cfg[])
 		WT_ERR(
 		    __rebalance_col_walk(session, btree->root.page->dsk, rs));
 		break;
-	WT_ILLEGAL_VALUE_ERR(session);
+	WT_ILLEGAL_VALUE_ERR(session, rs->type);
 	}
 
 	/* Build a new root page. */

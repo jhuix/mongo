@@ -1,7 +1,16 @@
 /**
  * Tests that invalid view definitions in system.views do not impact valid commands on existing
  * collections.
+ *
+ * @tags: [
+ *  requires_non_retryable_commands,
+ *  requires_non_retryable_writes,
+ *
+ *  # applyOps uses the oplog that require replication support
+ *  requires_replication,
+ * ]
  */
+
 (function() {
     "use strict";
     const isMongos = db.runCommand({isdbgrid: 1}).isdbgrid;
@@ -84,10 +93,13 @@
         assert.commandWorked(viewsDB.collection.createIndex({x: 1}),
                              makeErrorMessage("createIndexes"));
 
-        assert.commandWorked(viewsDB.collection.reIndex(), makeErrorMessage("reIndex"));
+        if (!isMongos) {
+            assert.commandWorked(viewsDB.collection.reIndex(), makeErrorMessage("reIndex"));
+        }
 
         const storageEngine = jsTest.options().storageEngine;
-        if (isMongos || storageEngine === "ephemeralForTest" || storageEngine === "inMemory") {
+        if (isMongos || storageEngine === "ephemeralForTest" || storageEngine === "inMemory" ||
+            storageEngine === "biggie") {
             print("Not testing compact command on mongos or ephemeral storage engine");
         } else {
             assert.commandWorked(viewsDB.runCommand({compact: "collection", force: true}),

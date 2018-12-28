@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -45,16 +47,19 @@
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/document_source_project.h"
 #include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/document_source_test_optimizations.h"
 #include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stub_mongo_process_interface.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/s/query/cluster_aggregation_planner.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/ensure_fcv.h"
+#include "mongo/unittest/temp_dir.h"
 
 namespace mongo {
 namespace {
@@ -97,6 +102,8 @@ void assertPipelineOptimizesAndSerializesTo(std::string inputPipeJson,
     AggregationRequest request(kTestNss, rawPipeline);
     intrusive_ptr<ExpressionContextForTest> ctx =
         new ExpressionContextForTest(opCtx.get(), request);
+    TempDir tempDir("PipelineTest");
+    ctx->tempDir = tempDir.path();
 
     // For $graphLookup and $lookup, we have to populate the resolvedNamespaces so that the
     // operations will be able to have a resolved view definition.
@@ -120,55 +127,115 @@ TEST(PipelineOptimizationTest, MoveSkipBeforeProject) {
                               "[{$skip : 5}, {$project: {_id: true, a : true}}]");
 }
 
-TEST(PipelineOptimizationTest, MoveLimitBeforeProject) {
+TEST(PipelineOptimizationTest, LimitDoesNotMoveBeforeProject) {
     assertPipelineOptimizesTo("[{$project: {a : 1}}, {$limit : 5}]",
-                              "[{$limit : 5}, {$project: {_id: true, a : true}}]");
+                              "[{$project: {_id: true, a : true}}, {$limit : 5}]");
 }
 
-TEST(PipelineOptimizationTest, MoveMultipleSkipsAndLimitsBeforeProject) {
-    assertPipelineOptimizesTo("[{$project: {a : 1}}, {$limit : 5}, {$skip : 3}]",
-                              "[{$limit : 5}, {$skip : 3}, {$project: {_id: true, a : true}}]");
+TEST(PipelineOptimizationTest, SampleLegallyPushedBefore) {
+    string inputPipe =
+        "[{$replaceRoot: { newRoot: \"$a\" }}, "
+        "{$project: { b: 1 }}, "
+        "{$addFields: { c: 1 }}, "
+        "{$sample: { size: 4 }}]";
+
+    string outputPipe =
+        "[{$sample: {size: 4}}, "
+        "{$replaceRoot: {newRoot: \"$a\"}}, "
+        "{$project: {_id: true, b : true}}, "
+        "{$addFields: {c : {$const : 1}}}]";
+
+    assertPipelineOptimizesTo(inputPipe, outputPipe);
+}
+
+TEST(PipelineOptimizationTest, SampleNotIllegallyPushedBefore) {
+    string inputPipe =
+        "[{$project: { a : 1 }}, "
+        "{$match: { a: 1 }}, "
+        "{$sample: { size: 4 }}]";
+
+    string outputPipe =
+        "[{$match: {a: {$eq: 1}}}, "
+        "{$sample : {size: 4}}, "
+        "{$project: {_id: true, a : true}}]";
+
+    string serializedPipe =
+        "[{$match: {a: 1}}, "
+        "{$sample : {size: 4}}, "
+        "{$project: {_id: true, a : true}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MoveMatchBeforeAddFieldsIfInvolvedFieldsNotRelated) {
-    assertPipelineOptimizesTo("[{$addFields : {a : 1}}, {$match : {b : 1}}]",
-                              "[{$match : {b : 1}}, {$addFields : {a : {$const : 1}}}]");
+    string inputPipe = "[{$addFields : {a : 1}}, {$match : {b : 1}}]";
+
+    string outputPipe = "[{$match : {b : {$eq : 1}}}, {$addFields : {a : {$const : 1}}}]";
+
+    string serializedPipe = "[{$match: {b : 1}}, {$addFields: {a : {$const : 1}}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchDoesNotMoveBeforeAddFieldsIfInvolvedFieldsAreRelated) {
-    assertPipelineOptimizesTo("[{$addFields : {a : 1}}, {$match : {a : 1}}]",
-                              "[{$addFields : {a : {$const : 1}}}, {$match : {a : 1}}]");
+    string inputPipe = "[{$addFields : {a : 1}}, {$match : {a : 1}}]";
+
+    string outputPipe = "[{$addFields : {a : {$const : 1}}}, {$match : {a : {$eq : 1}}}]";
+
+    string serializedPipe = "[{$addFields : {a : {$const : 1}}}, {$match: {a : 1}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchOnTopLevelFieldDoesNotMoveBeforeAddFieldsOfNestedPath) {
-    assertPipelineOptimizesTo("[{$addFields : {'a.b' : 1}}, {$match : {a : 1}}]",
-                              "[{$addFields : {a : {b : {$const : 1}}}}, {$match : {a : 1}}]");
+    string inputPipe = "[{$addFields : {'a.b' : 1}}, {$match : {a : 1}}]";
+
+    string outputPipe = "[{$addFields : {a : {b : {$const : 1}}}}, {$match : {a : {$eq : 1}}}]";
+
+    string serializedPipe = "[{$addFields: {a: {b: {$const: 1}}}}, {$match: {a: 1}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchOnNestedFieldDoesNotMoveBeforeAddFieldsOfPrefixOfPath) {
-    assertPipelineOptimizesTo("[{$addFields : {a : 1}}, {$match : {'a.b' : 1}}]",
-                              "[{$addFields : {a : {$const : 1}}}, {$match : {'a.b' : 1}}]");
+    string inputPipe = "[{$addFields : {a : 1}}, {$match : {'a.b' : 1}}]";
+
+    string outputPipe = "[{$addFields : {a : {$const : 1}}}, {$match : {'a.b' : {$eq : 1}}}]";
+
+    string serializedPipe = "[{$addFields : {a : {$const : 1}}}, {$match : {'a.b' : 1}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MoveMatchOnNestedFieldBeforeAddFieldsOfDifferentNestedField) {
-    assertPipelineOptimizesTo("[{$addFields : {'a.b' : 1}}, {$match : {'a.c' : 1}}]",
-                              "[{$match : {'a.c' : 1}}, {$addFields : {a : {b : {$const : 1}}}}]");
+    string inputPipe = "[{$addFields : {'a.b' : 1}}, {$match : {'a.c' : 1}}]";
+
+    string outputPipe = "[{$match : {'a.c' : {$eq : 1}}}, {$addFields : {a : {b : {$const : 1}}}}]";
+
+    string serializedPipe = "[{$match : {'a.c' : 1}}, {$addFields : {a : {b: {$const : 1}}}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MoveMatchBeforeAddFieldsWhenMatchedFieldIsPrefixOfAddedFieldName) {
-    assertPipelineOptimizesTo("[{$addFields : {abcd : 1}}, {$match : {abc : 1}}]",
-                              "[{$match : {abc : 1}}, {$addFields : {abcd: {$const: 1}}}]");
+    string inputPipe = "[{$addFields : {abcd : 1}}, {$match : {abc : 1}}]";
+
+    string outputPipe = "[{$match : {abc : {$eq : 1}}}, {$addFields : {abcd: {$const: 1}}}]";
+
+    string serializedPipe = "[{$match : {abc : 1}}, {$addFields : {abcd : {$const : 1}}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
-TEST(PipelineOptimizationTest, SkipSkipLimitBecomesLimitSkip) {
+TEST(PipelineOptimizationTest, LimitDoesNotSwapBeforeSkipWithoutSort) {
     std::string inputPipe =
         "[{$skip : 3}"
         ",{$skip : 5}"
         ",{$limit: 5}"
         "]";
     std::string outputPipe =
-        "[{$limit: 13}"
-        ",{$skip :  8}"
+        "[{$skip : 8}"
+        ",{$limit: 5}"
         "]";
     assertPipelineOptimizesTo(inputPipe, outputPipe);
 }
@@ -183,7 +250,7 @@ TEST(PipelineOptimizationTest, SortMatchProjSkipLimBecomesMatchTopKSortSkipProj)
         "]";
 
     std::string outputPipe =
-        "[{$match: {a: 1}}"
+        "[{$match: {a: {$eq: 1}}}"
         ",{$sort: {sortKey: {a: 1}, limit: 8}}"
         ",{$skip: 3}"
         ",{$project: {_id: true, a: true}}"
@@ -213,16 +280,28 @@ TEST(PipelineOptimizationTest, RemoveEmptyMatch) {
 }
 
 TEST(PipelineOptimizationTest, RemoveMultipleEmptyMatches) {
-    assertPipelineOptimizesTo("[{$match: {}}, {$match: {}}]", "[{$match: {$and: [{}, {}]}}]");
+    string inputPipe = "[{$match: {}}, {$match: {}}]";
+
+    string outputPipe = "[{$match: {}}]";
+
+    string serializedPipe = "[{$match: {$and: [{}, {}]}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, DoNotRemoveNonEmptyMatch) {
-    assertPipelineOptimizesTo("[{$match: {_id: 1}}]", "[{$match: {_id: 1}}]");
+    string inputPipe = "[{$match: {_id: 1}}]";
+
+    string outputPipe = "[{$match: {_id: {$eq : 1}}}]";
+
+    string serializedPipe = "[{$match: {_id: 1}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MoveMatchBeforeSort) {
     std::string inputPipe = "[{$sort: {b: 1}}, {$match: {a: 2}}]";
-    std::string outputPipe = "[{$match: {a: 2}}, {$sort: {sortKey: {b: 1}}}]";
+    std::string outputPipe = "[{$match: {a: {$eq : 2}}}, {$sort: {sortKey: {b: 1}}}]";
     std::string serializedPipe = "[{$match: {a: 2}}, {$sort: {b: 1}}]";
     assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
@@ -326,10 +405,14 @@ TEST(PipelineOptimizationTest, LookupShouldSwapWithMatch) {
         "'z'}}, "
         " {$match: {'independent': 0}}]";
     string outputPipe =
-        "[{$match: {independent: 0}}, "
+        "[{$match: {independent: {$eq : 0}}}, "
         " {$lookup: {from: 'lookupColl', as: 'asField', localField: 'y', foreignField: "
         "'z'}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+    string serializedPipe =
+        "[{$match: {independent: 0}}, "
+        "{$lookup: {from: 'lookupColl', as: 'asField', localField: 'y', foreignField: 'z'}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, LookupWithPipelineSyntaxShouldSwapWithMatch) {
@@ -337,9 +420,13 @@ TEST(PipelineOptimizationTest, LookupWithPipelineSyntaxShouldSwapWithMatch) {
         "[{$lookup: {from: 'lookupColl', as: 'asField', pipeline: []}}, "
         " {$match: {'independent': 0}}]";
     string outputPipe =
-        "[{$match: {independent: 0}}, "
+        "[{$match: {independent: {$eq : 0}}}, "
         " {$lookup: {from: 'lookupColl', as: 'asField', let: {}, pipeline: []}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+    string serializedPipe =
+        "[{$match: {independent: 0}}, "
+        "{$lookup: {from: 'lookupColl', as: 'asField', let: {}, pipeline: []}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, LookupShouldSplitMatch) {
@@ -363,8 +450,13 @@ TEST(PipelineOptimizationTest, LookupShouldNotAbsorbMatchOnAs) {
     string outputPipe =
         "[{$lookup: {from: 'lookupColl', as: 'asField', localField: 'y', foreignField: "
         "'z'}}, "
+        " {$match: {'asField.subfield': {$eq : 0}}}]";
+    string serializedPipe =
+        "[{$lookup: {from: 'lookupColl', as: 'asField', localField: 'y', foreignField: "
+        "'z'}}, "
         " {$match: {'asField.subfield': 0}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, LookupShouldAbsorbUnwindMatch) {
@@ -525,7 +617,7 @@ TEST(PipelineOptimizationTest, LookupDoesNotAbsorbElemMatch) {
         "             } "
         "           } "
         " }, "
-        " {$match: {x: {$elemMatch: {a: 1}}}}]";
+        " {$match: {x: {$elemMatch: {a: {$eq: 1}}}}}]";
     string serializedPipe =
         "[{$lookup: {from: 'lookupColl', as: 'x', localField: 'y', foreignField: 'z'}}, "
         " {$unwind: {path: '$x'}}, "
@@ -569,8 +661,11 @@ TEST(PipelineOptimizationTest, LookupDoesNotAbsorbUnwindOnSubfieldOfAsButStillMo
 TEST(PipelineOptimizationTest, MatchShouldDuplicateItselfBeforeRedact) {
     string inputPipe = "[{$redact: '$$PRUNE'}, {$match: {a: 1, b:12}}]";
     string outputPipe =
-        "[{$match: {a: 1, b:12}}, {$redact: {$const: 'prune'}}, {$match: {a: 1, b:12}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+        "[{$match: {$and: [{a: {$eq: 1}}, {b: {$eq: 12}}]}}, {$redact: '$$PRUNE'}, "
+        "{$match: {$and: [{a: {$eq: 1}}, {b: {$eq: 12}}]}}]";
+    string serializedPipe =
+        "[{$match: {a: 1, b: 12}}, {$redact: '$$PRUNE'}, {$match: {a: 1, b: 12}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchShouldSwapWithUnwind) {
@@ -578,9 +673,10 @@ TEST(PipelineOptimizationTest, MatchShouldSwapWithUnwind) {
         "[{$unwind: '$a.b.c'}, "
         "{$match: {'b': 1}}]";
     string outputPipe =
-        "[{$match: {'b': 1}}, "
+        "[{$match: {'b': {$eq : 1}}}, "
         "{$unwind: {path: '$a.b.c'}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+    string serializedPipe = "[{$match: {b: 1}}, {$unwind: {path: '$a.b.c'}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchOnPrefixShouldNotSwapOnUnwind) {
@@ -589,8 +685,9 @@ TEST(PipelineOptimizationTest, MatchOnPrefixShouldNotSwapOnUnwind) {
         "{$match: {'a.b': 1}}]";
     string outputPipe =
         "[{$unwind: {path: '$a.b.c'}}, "
-        "{$match: {'a.b': 1}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+        "{$match: {'a.b': {$eq : 1}}}]";
+    string serializedPipe = "[{$unwind: {path: '$a.b.c'}}, {$match: {'a.b': 1}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchShouldSplitOnUnwind) {
@@ -612,8 +709,10 @@ TEST(PipelineOptimizationTest, MatchShouldNotOptimizeWithElemMatch) {
         "{$match: {a: {$elemMatch: {b: {d: 1}}}}}]";
     string outputPipe =
         "[{$unwind: {path: '$a.b'}}, "
-        "{$match: {a: {$elemMatch: {b: {d: 1}}}}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+        "{$match: {a: {$elemMatch: {b: {$eq : {d: 1}}}}}}]";
+    string serializedPipe =
+        "[{$unwind : {path : '$a.b'}}, {$match : {a : {$elemMatch : {b : {d : 1}}}}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchShouldNotOptimizeWhenMatchingOnIndexField) {
@@ -741,7 +840,7 @@ TEST(PipelineOptimizationTest, GraphLookupShouldSwapWithMatch) {
         " {$match: {independent: 'x'}}"
         "]";
     string outputPipe =
-        "[{$match: {independent: 'x'}},"
+        "[{$match: {independent: {$eq : 'x'}}},"
         " {$graphLookup: {"
         "    from: 'lookupColl',"
         "    as: 'results',"
@@ -749,18 +848,28 @@ TEST(PipelineOptimizationTest, GraphLookupShouldSwapWithMatch) {
         "    connectFromField: 'from',"
         "    startWith: '$startVal'"
         " }}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+    string serializedPipe =
+        "[{$match: {independent: 'x'}}, "
+        " {$graphLookup: {"
+        "   from: 'lookupColl',"
+        "   as: 'results',"
+        "   connectToField: 'to',"
+        "   connectFromField: 'from',"
+        "   startWith: '$startVal'"
+        " }}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, ExclusionProjectShouldSwapWithIndependentMatch) {
     string inputPipe = "[{$project: {redacted: 0}}, {$match: {unrelated: 4}}]";
-    string outputPipe = "[{$match: {unrelated: 4}}, {$project: {redacted: false}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+    string outputPipe = "[{$match: {unrelated: {$eq : 4}}}, {$project: {redacted: false}}]";
+    string serializedPipe = "[{$match : {unrelated : 4}}, {$project : {redacted : false}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, ExclusionProjectShouldNotSwapWithMatchOnExcludedFields) {
     std::string pipeline =
-        "[{$project: {subdoc: {redacted: false}}}, {$match: {'subdoc.redacted': 4}}]";
+        "[{$project: {subdoc: {redacted: false}}}, {$match: {'subdoc.redacted': {$eq : 4}}}]";
     assertPipelineOptimizesTo(pipeline, pipeline);
 }
 
@@ -777,15 +886,24 @@ TEST(PipelineOptimizationTest, MatchShouldSplitIfPartIsIndependentOfExclusionPro
 
 TEST(PipelineOptimizationTest, InclusionProjectShouldSwapWithIndependentMatch) {
     string inputPipe = "[{$project: {included: 1}}, {$match: {included: 4}}]";
-    string outputPipe = "[{$match: {included: 4}}, {$project: {_id: true, included: true}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+    string outputPipe =
+        "[{$match: {included: {$eq : 4}}}, {$project: {_id: true, included: true}}]";
+    string serializedPipe =
+        "[{$match : {included : 4}}, {$project : {_id: true, included : true}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, InclusionProjectShouldNotSwapWithMatchOnFieldsNotIncluded) {
-    string pipeline =
+    string inputPipe =
         "[{$project: {_id: true, included: true, subdoc: {included: true}}},"
         " {$match: {notIncluded: 'x', unrelated: 4}}]";
-    assertPipelineOptimizesTo(pipeline, pipeline);
+    string outputPipe =
+        "[{$project: {_id: true, included: true, subdoc: {included: true}}},"
+        " {$match: {$and: [{notIncluded: {$eq: 'x'}}, {unrelated: {$eq: 4}}]}}]";
+    string serializedPipe =
+        "[{$project: {_id: true, included: true, subdoc: {included: true}}},"
+        " {$match: {notIncluded: 'x', unrelated: 4}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchShouldSplitIfPartIsIndependentOfInclusionProjection) {
@@ -815,18 +933,23 @@ TEST(PipelineOptimizationTest, NeighboringMatchesShouldCoalesce) {
     string inputPipe =
         "[{$match: {x: 'x'}},"
         " {$match: {y: 'y'}}]";
-    string outputPipe = "[{$match: {$and: [{x: 'x'}, {y: 'y'}]}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+    string outputPipe = "[{$match: {$and: [{x: {$eq: 'x'}}, {y: {$eq : 'y'}}]}}]";
+    string serializedPipe = "[{$match: {$and: [{x: 'x'}, {y: 'y'}]}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchShouldNotSwapBeforeLimit) {
-    string pipeline = "[{$limit: 3}, {$match: {y: 'y'}}]";
-    assertPipelineOptimizesTo(pipeline, pipeline);
+    string inputPipe = "[{$limit: 3}, {$match: {y: 'y'}}]";
+    string outputPipe = "[{$limit: 3}, {$match: {y: {$eq : 'y'}}}]";
+    string serializedPipe = "[{$limit: 3}, {$match: {y: 'y'}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchShouldNotSwapBeforeSkip) {
-    string pipeline = "[{$skip: 3}, {$match: {y: 'y'}}]";
-    assertPipelineOptimizesTo(pipeline, pipeline);
+    string inputPipe = "[{$skip: 3}, {$match: {y: 'y'}}]";
+    string outputPipe = "[{$skip: 3}, {$match: {y: {$eq : 'y'}}}]";
+    string serializedPipe = "[{$skip: 3}, {$match: {y: 'y'}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchShouldMoveAcrossProjectRename) {
@@ -1008,20 +1131,20 @@ TEST(PipelineOptimizationTest,
 // optimizations, but it currently does not.
 TEST(PipelineOptimizationTest, MatchOnArrayIndexShouldNotSwapSinceCategoryIsArrayMatching) {
     string inputPipe = R"(
-        [{$project: {_id: true, a: '$b'}}, 
-        {$match: {a: {$_internalSchemaMatchArrayIndex: 
+        [{$project: {_id: true, a: '$b'}},
+        {$match: {a: {$_internalSchemaMatchArrayIndex:
            {index: 0, namePlaceholder: 'i', expression: {i: {$lt: 0}}}}}}])";
     assertPipelineOptimizesTo(inputPipe, inputPipe);
 
     inputPipe = R"(
-        [{$project: {redacted: false}}, 
-        {$match: {a: {$_internalSchemaMatchArrayIndex: 
+        [{$project: {redacted: false}},
+        {$match: {a: {$_internalSchemaMatchArrayIndex:
            {index: 0, namePlaceholder: 'i', expression: {i: {$lt: 0}}}}}}])";
     assertPipelineOptimizesTo(inputPipe, inputPipe);
 
     inputPipe = R"(
-        [{$addFields : {a : {$const: 1}}}, 
-        {$match: {a: {$_internalSchemaMatchArrayIndex: 
+        [{$addFields : {a : {$const: 1}}},
+        {$match: {a: {$_internalSchemaMatchArrayIndex:
            {index: 0, namePlaceholder: 'i', expression: {i: {$lt: 0}}}}}}])";
     assertPipelineOptimizesTo(inputPipe, inputPipe);
 }
@@ -1051,17 +1174,38 @@ TEST(PipelineOptimizationTest, MatchOnObjectMatchShouldNotSwapSinceCategoryIsOth
     string inputPipe =
         "[{$project: {_id: true, a: '$b'}}, "
         "{$match: {a: {$_internalSchemaObjectMatch: {b: 1}}}}]";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    string outputPipe =
+        "[{$project: {_id: true, a: '$b'}}, "
+        "{$match: {a: {$_internalSchemaObjectMatch: {b: {$eq: 1}}}}}]";
+    string serializedPipe =
+        "[{$project: {_id: true, a: '$b'}},"
+        "{$match: {a: {$_internalSchemaObjectMatch: {b: 1}}}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 
     inputPipe =
         "[{$project: {redacted: false}}, "
         "{$match: {a: {$_internalSchemaObjectMatch: {b: 1}}}}]";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    outputPipe =
+        "[{$project: {redacted: false}},"
+        "{$match: {a: {$_internalSchemaObjectMatch: {b: {$eq: 1}}}}}]";
+    serializedPipe =
+        "[{$project: {redacted: false}},"
+        "{$match: {a: {$_internalSchemaObjectMatch: {b: 1}}}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 
     inputPipe =
         "[{$addFields : {a : {$const: 1}}}, "
         "{$match: {a: {$_internalSchemaObjectMatch: {b: 1}}}}]";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    outputPipe =
+        "[{$addFields : {a : {$const: 1}}}, "
+        "{$match: {a: {$_internalSchemaObjectMatch: {b: {$eq: 1}}}}}]";
+    serializedPipe =
+        "[{$addFields : {a : {$const: 1}}}, "
+        "{$match: {a: {$_internalSchemaObjectMatch: {b: 1}}}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 // Descriptive test. The following internal match expression *could* participate in pipeline
@@ -1106,34 +1250,82 @@ TEST(PipelineOptimizationTest, MatchOnMaxPropertiesShouldNotSwapSinceCategoryIsO
 // optimizations, but it currently does not.
 TEST(PipelineOptimizationTest, MatchOnAllowedPropertiesShouldNotSwapSinceCategoryIsOther) {
     string inputPipe = R"(
-        [{$project: {_id: true, a: '$b'}}, 
+        [{$project: {_id: true, a: '$b'}},
         {$match: {$_internalSchemaAllowedProperties: {
-            properties: ['b'], 
-            namePlaceholder: 'i', 
-            patternProperties: [], 
+            properties: ['b'],
+            namePlaceholder: 'i',
+            patternProperties: [],
             otherwise: {i: 1}
         }}}])";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    string outputPipe = R"(
+        [{$project: {_id: true, a: '$b'}},
+        {$match: {$_internalSchemaAllowedProperties: {
+            properties: ['b'],
+            namePlaceholder: 'i',
+            patternProperties: [],
+            otherwise: {i: {$eq : 1}}
+        }}}])";
+    string serializedPipe = R"(
+        [{$project: {_id: true, a: '$b'}},
+        {$match: {$_internalSchemaAllowedProperties: {
+            properties: ['b'],
+            namePlaceholder: 'i',
+            patternProperties: [],
+            otherwise: {i : 1}}
+        }}])";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 
     inputPipe = R"(
-        [{$project: {redacted: false}}, 
+        [{$project: {redacted: false}},
         {$match: {$_internalSchemaAllowedProperties: {
-            properties: ['b'], 
-            namePlaceholder: 'i', 
-            patternProperties: [], 
+            properties: ['b'],
+            namePlaceholder: 'i',
+            patternProperties: [],
             otherwise: {i: 1}
         }}}])";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    outputPipe = R"(
+        [{$project: {redacted: false}},
+        {$match: {$_internalSchemaAllowedProperties: {
+            properties: ['b'],
+            namePlaceholder: 'i',
+            patternProperties: [],
+            otherwise: {i: {$eq: 1}
+        }}}}])";
+    serializedPipe = R"(
+        [{$project: {redacted: false}},
+        {$match: {$_internalSchemaAllowedProperties: {
+            properties: ['b'],
+            namePlaceholder: 'i',
+            patternProperties: [],
+            otherwise: {i: 1}
+        }}}])";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 
     inputPipe = R"(
-        [{$addFields : {a : {$const: 1}}}, 
+        [{$addFields : {a : {$const: 1}}},
         {$match: {$_internalSchemaAllowedProperties: {
-            properties: ['b'], 
-            namePlaceholder: 'i', 
-            patternProperties: [], 
+            properties: ['b'],
+            namePlaceholder: 'i',
+            patternProperties: [],
             otherwise: {i: 1}
         }}}])";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    outputPipe = R"(
+        [{$addFields: {a: {$const: 1}}},
+        {$match: {$_internalSchemaAllowedProperties: {
+            properties: ["b"],
+            namePlaceholder: "i",
+            patternProperties: [],
+            otherwise: {i: {$eq: 1}
+        }}}}])";
+    serializedPipe = R"(
+        [{$addFields : {a : {$const: 1}}},
+        {$match: {$_internalSchemaAllowedProperties: {
+            properties: ['b'],
+            namePlaceholder: 'i',
+            patternProperties: [],
+            otherwise: {i: 1}
+        }}}])";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 // Descriptive test. The following internal match expression *could* participate in pipeline
@@ -1142,17 +1334,35 @@ TEST(PipelineOptimizationTest, MatchOnCondShouldNotSwapSinceCategoryIsOther) {
     string inputPipe =
         "[{$project: {_id: true, a: '$b'}}, "
         "{$match: {$_internalSchemaCond: [{a: 1}, {b: 1}, {c: 1}]}}]";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    string outputPipe =
+        "[{$project: {_id: true, a: '$b'}}, "
+        "{$match: {$_internalSchemaCond: [{a: {$eq : 1}}, {b: {$eq : 1}}, {c: {$eq : 1}}]}}]";
+    string serializedPipe =
+        "[{$project: {_id: true, a: '$b'}}, "
+        "{$match: {$_internalSchemaCond: [{a: 1}, {b: 1}, {c: 1}]}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 
     inputPipe =
         "[{$project: {redacted: false}}, "
         "{$match: {$_internalSchemaCond: [{a: 1}, {b: 1}, {c: 1}]}}]";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    outputPipe =
+        "[{$project: {redacted: false}}, "
+        "{$match: {$_internalSchemaCond: [{a: {$eq : 1}}, {b: {$eq: 1}}, {c: {$eq: 1}}]}}]";
+    serializedPipe =
+        "[{$project: {redacted: false}}, "
+        "{$match: {$_internalSchemaCond: [{a: 1}, {b: 1}, {c: 1}]}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 
     inputPipe =
         "[{$addFields : {a : {$const: 1}}}, "
         "{$match: {$_internalSchemaCond: [{a: 1}, {b: 1}, {c: 1}]}}]";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    outputPipe =
+        "[{$addFields : {a : {$const: 1}}}, "
+        "{$match: {$_internalSchemaCond: [{a: {$eq : 1}}, {b: {$eq: 1}}, {c: {$eq : 1}}]}}]";
+    serializedPipe =
+        "[{$addFields : {a : {$const: 1}}}, "
+        "{$match: {$_internalSchemaCond: [{a: 1}, {b: 1}, {c: 1}]}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 // Descriptive test. The following internal match expression *could* participate in pipeline
@@ -1180,17 +1390,35 @@ TEST(PipelineOptimizationTest, MatchOnInternalSchemaTypeShouldNotSwapSinceCatego
     string inputPipe =
         "[{$project: {_id: true, a: '$b'}}, "
         "{$match: {a: {$_internalSchemaType: 1}}}]";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    string outputPipe =
+        "[{$project: {_id: true, a: '$b'}}, "
+        " {$match: {a: {$_internalSchemaType: [1]}}}]";
+    string serializedPipe =
+        "[{$project: {_id: true, a: '$b'}}, "
+        "{$match: {a: {$_internalSchemaType: 1}}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 
     inputPipe =
         "[{$project: {redacted: false}}, "
         "{$match: {a: {$_internalSchemaType: 1}}}]";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    outputPipe =
+        "[{$project: {redacted: false}}, "
+        " {$match: {a: {$_internalSchemaType: [1]}}}]";
+    serializedPipe =
+        "[{$project: {redacted: false}}, "
+        "{$match: {a: {$_internalSchemaType: 1}}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 
     inputPipe =
         "[{$addFields : {a : {$const: 1}}}, "
         "{$match: {b: {$_internalSchemaType: 1}}}]";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    outputPipe =
+        "[{$addFields : {a : {$const: 1}}}, "
+        " {$match: {b: {$_internalSchemaType: [1]}}}]";
+    serializedPipe =
+        "[{$addFields : {a : {$const: 1}}}, "
+        "{$match: {b: {$_internalSchemaType: 1}}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchOnMinLengthShouldSwapWithAdjacentStage) {
@@ -1278,28 +1506,40 @@ TEST(PipelineOptimizationTest, MatchOnXorShouldSwapIfEverySubExpressionIsEligibl
     string outputPipe =
         "[{$match: {$_internalSchemaXor: [{b: {$eq: 1}}, {d: {$eq: 1}}]}}, "
         "{$project: {_id: true, a: '$b', c: '$d'}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, outputPipe);
 
     inputPipe =
         "[{$project: {redacted: false}}, "
         "{$match: {$_internalSchemaXor: [{a: 1}, {b: 1}]}}]";
     outputPipe =
-        "[{$match: {$_internalSchemaXor: [{a: 1}, {b: 1}]}}, "
+        "[{$match: {$_internalSchemaXor: [{a: {$eq : 1}}, {b: {$eq : 1}}]}}, "
         "{$project: {redacted: false}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+    string serializedPipe =
+        "[{$match: {$_internalSchemaXor: [{a: 1}, {b: 1}]}}, "
+        " {$project: {redacted: false}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 
     inputPipe =
         "[{$addFields : {a : {$const: 1}}}, "
         "{$match: {$_internalSchemaXor: [{b: 1}, {c: 1}]}}]";
     outputPipe =
-        "[{$match: {$_internalSchemaXor: [{b: 1}, {c: 1}]}}, "
+        "[{$match: {$_internalSchemaXor: [{b: {$eq: 1}}, {c: {$eq: 1}}]}}, "
         "{$addFields: {a: {$const: 1}}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+    serializedPipe =
+        "[{$match: {$_internalSchemaXor: [{b: 1}, {c: 1}]}}, "
+        "{$addFields : {a : {$const: 1}}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 
     inputPipe =
         "[{$addFields : {a : {$const: 1}}}, "
         "{$match: {$_internalSchemaXor: [{b: 1}, {a: 1}]}}]";
-    assertPipelineOptimizesTo(inputPipe, inputPipe);
+    outputPipe =
+        "[{$addFields: {a: {$const: 1}}}, "
+        "{$match: {$_internalSchemaXor: [{b: {$eq: 1}}, {a: {$eq: 1}}]}}]";
+    serializedPipe =
+        "[{$addFields: {a: {$const: 1}}}, "
+        "{$match: {$_internalSchemaXor: [{b: 1}, {a: 1}]}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchOnFmodShouldSwapWithAdjacentStage) {
@@ -1329,7 +1569,6 @@ TEST(PipelineOptimizationTest, MatchOnFmodShouldSwapWithAdjacentStage) {
 }
 
 TEST(PipelineOptimizationTest, ChangeStreamLookupSwapsWithIndependentMatch) {
-    EnsureFCV ensureFCV(EnsureFCV::Version::k36);
     QueryTestServiceContext testServiceContext;
     auto opCtx = testServiceContext.makeOperationContext();
 
@@ -1340,7 +1579,7 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupSwapsWithIndependentMatch) {
     auto spec = BSON("$changeStream" << BSON("fullDocument"
                                              << "updateLookup"));
     auto stages = DocumentSourceChangeStream::createFromBson(spec.firstElement(), expCtx);
-    ASSERT_EQ(stages.size(), 4UL);
+    ASSERT_EQ(stages.size(), 5UL);
     // Make sure the change lookup is at the end.
     ASSERT(dynamic_cast<DocumentSourceLookupChangePostImage*>(stages.back().get()));
 
@@ -1355,7 +1594,6 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupSwapsWithIndependentMatch) {
 }
 
 TEST(PipelineOptimizationTest, ChangeStreamLookupDoesNotSwapWithMatchOnPostImage) {
-    EnsureFCV ensureFCV(EnsureFCV::Version::k36);
     QueryTestServiceContext testServiceContext;
     auto opCtx = testServiceContext.makeOperationContext();
 
@@ -1366,7 +1604,7 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupDoesNotSwapWithMatchOnPostImage
     auto spec = BSON("$changeStream" << BSON("fullDocument"
                                              << "updateLookup"));
     auto stages = DocumentSourceChangeStream::createFromBson(spec.firstElement(), expCtx);
-    ASSERT_EQ(stages.size(), 4UL);
+    ASSERT_EQ(stages.size(), 5UL);
     // Make sure the change lookup is at the end.
     ASSERT(dynamic_cast<DocumentSourceLookupChangePostImage*>(stages.back().get()));
 
@@ -1377,6 +1615,151 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupDoesNotSwapWithMatchOnPostImage
 
     // Make sure the $match stage stays at the end.
     ASSERT(dynamic_cast<DocumentSourceMatch*>(pipeline->getSources().back().get()));
+}
+
+TEST(PipelineOptimizationTest, SortLimProjLimBecomesTopKSortProj) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 7}"
+        ",{$project : {a: 1}}"
+        ",{$limit: 5}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 5}}"
+        ",{$project: {_id: true, a: true}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 5}"
+        ",{$project : {_id: true, a: true}}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SortProjUnwindLimLimBecomesSortProjUnwindLim) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$project : {a: 1}}"
+        ",{$unwind: {path: '$a'}}"
+        ",{$limit: 7}"
+        ",{$limit: 5}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}}}"
+        ",{$project: {_id: true, a: true}}"
+        ",{$unwind: {path: '$a'}}"
+        ",{$limit: 5}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$project : {_id: true, a: true}}"
+        ",{$unwind: {path: '$a'}}"
+        ",{$limit: 5}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SortSkipLimBecomesTopKSortSkip) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$skip: 2}"
+        ",{$limit: 5}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 7}}"
+        ",{$skip: 2}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 7}"
+        ",{$skip: 2}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, LimDoesNotCoalesceWithSortInSortProjGroupLim) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$project : {a: 1}}"
+        ",{$group: {_id: '$a'}}"
+        ",{$limit: 5}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}}}"
+        ",{$project: {_id: true, a: true}}"
+        ",{$group: {_id: '$a'}}"
+        ",{$limit: 5}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$project : {_id: true, a: true}}"
+        ",{$group: {_id: '$a'}}"
+        ",{$limit: 5}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SortProjSkipLimBecomesTopKSortSkipProj) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$project : {a: 1}}"
+        ",{$skip: 3}"
+        ",{$limit: 5}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 8}}"
+        ",{$skip: 3}"
+        ",{$project: {_id: true, a: true}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 8}"
+        ",{$skip: 3}"
+        ",{$project : {_id: true, a: true}}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SortSkipProjSkipLimSkipLimBecomesTopKSortSkipProj) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$skip: 2}"
+        ",{$project : {a: 1}}"
+        ",{$skip: 4}"
+        ",{$limit: 25}"
+        ",{$skip: 6}"
+        ",{$limit: 3}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 15}}"
+        ",{$skip: 12}"
+        ",{$project: {_id: true, a: true}}"
+        "]";
+
+    std::string serializedPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 15}"
+        ",{$skip: 12}"
+        ",{$project : {_id: true, a: true}}"
+        "]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 }  // namespace Local
@@ -1407,6 +1790,8 @@ public:
         AggregationRequest request(kTestNss, rawPipeline);
         intrusive_ptr<ExpressionContextForTest> ctx =
             new ExpressionContextForTest(&_opCtx, request);
+        TempDir tempDir("PipelineTest");
+        ctx->tempDir = tempDir.path();
 
         // For $graphLookup and $lookup, we have to populate the resolvedNamespaces so that the
         // operations will be able to have a resolved view definition.
@@ -1417,31 +1802,24 @@ public:
         mergePipe = uassertStatusOK(Pipeline::parse(request.getPipeline(), ctx));
         mergePipe->optimizePipeline();
 
-        auto beforeSplit = Value(mergePipe->serialize());
+        auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(mergePipe));
 
-        shardPipe = mergePipe->splitForSharded();
-        ASSERT(shardPipe);
-
-        shardPipe->unsplitFromSharded(std::move(mergePipe));
-        ASSERT_FALSE(mergePipe);
-
-        ASSERT_VALUE_EQ(Value(shardPipe->serialize()), beforeSplit);
-
-        mergePipe = std::move(shardPipe);
-        shardPipe = mergePipe->splitForSharded();
-        ASSERT(shardPipe);
-
-        ASSERT_VALUE_EQ(Value(shardPipe->writeExplainOps(ExplainOptions::Verbosity::kQueryPlanner)),
+        ASSERT_VALUE_EQ(Value(splitPipeline.shardsPipeline->writeExplainOps(
+                            ExplainOptions::Verbosity::kQueryPlanner)),
                         Value(shardPipeExpected["pipeline"]));
-        ASSERT_VALUE_EQ(Value(mergePipe->writeExplainOps(ExplainOptions::Verbosity::kQueryPlanner)),
+        ASSERT_VALUE_EQ(Value(splitPipeline.mergePipeline->writeExplainOps(
+                            ExplainOptions::Verbosity::kQueryPlanner)),
                         Value(mergePipeExpected["pipeline"]));
+
+        shardPipe = std::move(splitPipeline.shardsPipeline);
+        mergePipe = std::move(splitPipeline.mergePipeline);
     }
 
     virtual ~Base() {}
 
 protected:
-    std::unique_ptr<Pipeline, Pipeline::Deleter> mergePipe;
-    std::unique_ptr<Pipeline, Pipeline::Deleter> shardPipe;
+    std::unique_ptr<Pipeline, PipelineDeleter> mergePipe;
+    std::unique_ptr<Pipeline, PipelineDeleter> shardPipe;
 
 private:
     OperationContextNoop _opCtx;
@@ -1491,7 +1869,7 @@ class UnwindNotFinal : public Base {
         return "[{$unwind: {path: '$a'}}, {$match: {a:1}}]}";
     }
     string shardPipeJson() {
-        return "[{$unwind: {path: '$a'}}, {$match: {a:1}}]}";
+        return "[{$unwind: {path: '$a'}}, {$match: {a:{$eq:1}}}]}";
     }
     string mergePipeJson() {
         return "[]}";
@@ -1503,7 +1881,7 @@ class UnwindWithOther : public Base {
         return "[{$match: {a:1}}, {$unwind: {path: '$a'}}]}";
     }
     string shardPipeJson() {
-        return "[{$match: {a:1}}]}";
+        return "[{$match: {a:{$eq:1}}}]}";
     }
     string mergePipeJson() {
         return "[{$unwind: {path: '$a'}}]}";
@@ -1511,6 +1889,111 @@ class UnwindWithOther : public Base {
 };
 }  // namespace moveFinalUnwindFromShardsToMerger
 
+namespace propagateDocLimitToShards {
+
+/**
+ * The $skip stage splits the pipeline into a shard pipeline and merge pipeline. Because the $limit
+ * stage in the merge pipeline creates an upper bound on how many documents are necessary from any
+ * of the shards, we can add a $limit to the shard pipeline to prevent it from sending more
+ * documents than necessary. See the comment for propagateDocLimitToShard in
+ * cluster_aggregation_planner.cpp and the explanation in SERVER-36881.
+ */
+class MatchWithSkipAndLimit : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$skip: 10}, {$limit: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}, {$limit: 15}]";
+    }
+    string mergePipeJson() {
+        return "[{$skip: 10}, {$limit: 5}]";
+    }
+};
+
+/**
+ * When computing an upper bound on how many documents we need from each shard, make sure to count
+ * all $skip stages in any pipeline that has more than one.
+ */
+class MatchWithMultipleSkipsAndLimit : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$skip: 7}, {$skip: 3}, {$limit: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}, {$limit: 15}]";
+    }
+    string mergePipeJson() {
+        return "[{$skip: 10}, {$limit: 5}]";
+    }
+};
+
+/**
+ * A $limit stage splits the pipeline with the $limit in place on both the shard and merge
+ * pipelines. Make sure that the propagateDocLimitToShards() optimization does not add another
+ * $limit to the shard pipeline.
+ */
+class MatchWithLimitAndSkip : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$limit: 10}, {$skip: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}, {$limit: 10}]";
+    }
+    string mergePipeJson() {
+        return "[{$limit: 10}, {$skip: 5}]";
+    }
+};
+
+
+/**
+ * The addition of an $addFields stage between the $skip and $limit stages does not prevent us from
+ * propagating the limit to the shards.
+ */
+class MatchWithSkipAddFieldsAndLimit : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$skip: 10}, {$addFields: {y: 1}}, {$limit: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}, {$limit: 15}]";
+    }
+    string mergePipeJson() {
+        return "[{$skip: 10}, {$addFields: {y: {$const: 1}}}, {$limit: 5}]";
+    }
+};
+
+/**
+ * The addition of a $group stage between the $skip and $limit stages _does_ prevent us from
+ * propagating the limit to the shards. The merger will need to see all the documents from each
+ * shard before it can aply the $limit.
+ */
+class MatchWithSkipGroupAndLimit : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$skip: 10}, {$group: {_id: '$y'}}, {$limit: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}, {$project: {_id: false, y: true}}]";
+    }
+    string mergePipeJson() {
+        return "[{$skip: 10}, {$group: {_id: '$y'}}, {$limit: 5}]";
+    }
+};
+
+/**
+ * The addition of a $match stage between the $skip and $limit stages also prevents us from
+ * propagating the limit to the shards. We don't know in advance how many documents will pass the
+ * filter in the second $match, so we also don't know how many documents we'll need from the shards.
+ */
+class MatchWithSkipSecondMatchAndLimit : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$skip: 10}, {$match: {y: {$gt: 10}}}, {$limit: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}]";
+    }
+    string mergePipeJson() {
+        return "[{$skip: 10}, {$match: {y: {$gt: 10}}}, {$limit: 5}]";
+    }
+};
+}  // namespace propagateDocLimitToShards
 
 namespace limitFieldsSentFromShardsToMerger {
 // These tests use $limit to split the pipelines between shards and merger as it is
@@ -1601,14 +2084,93 @@ class ShardedSortMatchProjSkipLimBecomesMatchTopKSortSkipProj : public Base {
                "]";
     }
     string shardPipeJson() {
-        return "[{$match: {a: 1}}"
+        return "[{$match: {a: {$eq : 1}}}"
                ",{$sort: {sortKey: {a: 1}, limit: 8}}"
                ",{$project: {_id: true, a: true}}"
                "]";
     }
     string mergePipeJson() {
-        return "[{$sort: {sortKey: {a: 1}, mergePresorted: true, limit: 8}}"
+        return "[{$limit: 8}"
                ",{$skip: 3}"
+               ",{$project: {_id: true, a: true}}"
+               "]";
+    }
+};
+
+class ShardedMatchProjLimDoesNotBecomeMatchLimProj : public Base {
+    string inputPipeJson() {
+        return "[{$match: {a: 1}}"
+               ",{$project : {a: 1}}"
+               ",{$limit: 5}"
+               "]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {a: {$eq : 1}}}"
+               ",{$project: {_id: true, a: true}}"
+               ",{$limit: 5}"
+               "]";
+    }
+    string mergePipeJson() {
+        return "[{$limit: 5}]";
+    }
+};
+
+class ShardedSortProjLimBecomesTopKSortProj : public Base {
+    string inputPipeJson() {
+        return "[{$sort: {a : 1}}"
+               ",{$project : {a: 1}}"
+               ",{$limit: 5}"
+               "]";
+    }
+    string shardPipeJson() {
+        return "[{$sort: {sortKey: {a: 1}, limit: 5}}"
+               ",{$project: {_id: true, a: true}}"
+               "]";
+    }
+    string mergePipeJson() {
+        return "[{$limit: 5}"
+               ",{$project: {_id: true, a: true}}"
+               "]";
+    }
+};
+
+class ShardedSortGroupProjLimDoesNotBecomeTopKSortProjGroup : public Base {
+    string inputPipeJson() {
+        return "[{$sort: {a : 1}}"
+               ",{$group : {_id: {a: '$a'}}}"
+               ",{$project : {a: 1}}"
+               ",{$limit: 5}"
+               "]";
+    }
+    string shardPipeJson() {
+        return "[{$sort: {sortKey: {a: 1}}}"
+               ",{$project : {_id: false, a: true}}"
+               "]";
+    }
+    string mergePipeJson() {
+        return "[{$group : {_id: {a: '$a'}}}"
+               ",{$project: {_id: true, a: true}}"
+               ",{$limit: 5}"
+               "]";
+    }
+};
+
+class ShardedMatchSortProjLimBecomesMatchTopKSortProj : public Base {
+    string inputPipeJson() {
+        return "[{$match: {a: {$eq : 1}}}"
+               ",{$sort: {a: -1}}"
+               ",{$project : {a: 1}}"
+               ",{$limit: 6}"
+               "]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {a: {$eq : 1}}}"
+               ",{$sort: {sortKey: {a: -1}, limit: 6}}"
+               ",{$project: {_id: true, a: true}}"
+               "]";
+    }
+    string mergePipeJson() {
+        return "[{$limit: 6}"
                ",{$project: {_id: true, a: true}}"
                "]";
     }
@@ -1710,7 +2272,9 @@ class Out : public needsPrimaryShardMergerBase {
         return "[]";
     }
     string mergePipeJson() {
-        return "[{$out: 'outColl'}]";
+        return "[{$out: {to: 'outColl', db: 'a', mode: '" +
+            WriteMode_serializer(WriteModeEnum::kModeReplaceCollection) +
+            "', uniqueKey: {_id: 1}}}]";
     }
 };
 
@@ -1761,7 +2325,8 @@ public:
                 PositionRequirement::kNone,
                 HostTypeRequirement::kMongoS,
                 DiskUseRequirement::kNoDiskUse,
-                FacetRequirement::kNotAllowed};
+                FacetRequirement::kNotAllowed,
+                TransactionRequirement::kAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSourceMustRunOnMongoS> create() {
@@ -1769,7 +2334,7 @@ public:
     }
 };
 
-using HostTypeRequirement = DocumentSource::StageConstraints::HostTypeRequirement;
+using HostTypeRequirement = StageConstraints::HostTypeRequirement;
 using PipelineMustRunOnMongoSTest = AggregationContextFixture;
 
 TEST_F(PipelineMustRunOnMongoSTest, UnsplittablePipelineMustRunOnMongoS) {
@@ -1820,21 +2385,34 @@ DEATH_TEST_F(PipelineMustRunOnMongoSTest,
     // $_internalSplitPipeline.
     ASSERT_FALSE(pipeline->requiredToRunOnMongos());
 
-    auto shardPipe = pipeline->splitForSharded();
-    ASSERT(shardPipe);
+    auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(pipeline));
+    ASSERT(splitPipeline.shardsPipeline);
+    ASSERT(splitPipeline.mergePipeline);
 
-    // The merge half of the pipeline must run on mongoS.
-    ASSERT_TRUE(pipeline->requiredToRunOnMongos());
+    ASSERT_TRUE(splitPipeline.mergePipeline->requiredToRunOnMongos());
 
     // Calling 'requiredToRunOnMongos' on the shard pipeline will hit an invariant.
-    shardPipe->requiredToRunOnMongos();
+    splitPipeline.shardsPipeline->requiredToRunOnMongos();
 }
+
+/**
+ * For the purpsoses of this test, assume every collection is unsharded. Stages may ask this during
+ * setup. For example, to compute its constraints, the $out stage needs to know if the output
+ * collection is sharded.
+ */
+class FakeMongoProcessInterface : public StubMongoProcessInterface {
+public:
+    bool isSharded(OperationContext* opCtx, const NamespaceString& ns) override {
+        return false;
+    }
+};
 
 TEST_F(PipelineMustRunOnMongoSTest, SplitMongoSMergePipelineAssertsIfShardStagePresent) {
     auto expCtx = getExpCtx();
 
     expCtx->allowDiskUse = true;
     expCtx->inMongos = true;
+    expCtx->mongoProcessInterface = std::make_shared<FakeMongoProcessInterface>();
 
     auto match = DocumentSourceMatch::create(fromjson("{x: 5}"), expCtx);
     auto split = DocumentSourceInternalSplitPipeline::create(expCtx, HostTypeRequirement::kNone);
@@ -1848,12 +2426,12 @@ TEST_F(PipelineMustRunOnMongoSTest, SplitMongoSMergePipelineAssertsIfShardStageP
     // $_internalSplitPipeline.
     ASSERT_FALSE(pipeline->requiredToRunOnMongos());
 
-    auto shardPipe = pipeline->splitForSharded();
-    ASSERT(shardPipe);
+    auto splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(pipeline));
 
     // The merge pipeline must run on mongoS, but $out needs to run on  the primary shard.
-    ASSERT_THROWS_CODE(
-        pipeline->requiredToRunOnMongos(), AssertionException, ErrorCodes::IllegalOperation);
+    ASSERT_THROWS_CODE(splitPipeline.mergePipeline->requiredToRunOnMongos(),
+                       AssertionException,
+                       ErrorCodes::IllegalOperation);
 }
 
 TEST_F(PipelineMustRunOnMongoSTest, SplittablePipelineAssertsIfMongoSStageOnShardSideOfSplit) {
@@ -1917,9 +2495,10 @@ TEST(PipelineInitialSource, MatchInitialQuery) {
     ASSERT_BSONOBJ_EQ(pipe->getInitialQuery(), BSON("a" << 4));
 }
 
-namespace Namespaces {
+// Contains test cases for validation done on pipeline creation.
+namespace pipeline_validate {
 
-using PipelineInitialSourceNSTest = AggregationContextFixture;
+using PipelineValidateTest = AggregationContextFixture;
 
 class DocumentSourceCollectionlessMock : public DocumentSourceMock {
 public:
@@ -1930,7 +2509,8 @@ public:
                                      PositionRequirement::kFirst,
                                      HostTypeRequirement::kNone,
                                      DiskUseRequirement::kNoDiskUse,
-                                     FacetRequirement::kNotAllowed);
+                                     FacetRequirement::kNotAllowed,
+                                     TransactionRequirement::kAllowed);
         constraints.isIndependentOfAnyCollection = true;
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -1941,7 +2521,7 @@ public:
     }
 };
 
-TEST_F(PipelineInitialSourceNSTest, AggregateOneNSNotValidForEmptyPipeline) {
+TEST_F(PipelineValidateTest, AggregateOneNSNotValidForEmptyPipeline) {
     const std::vector<BSONObj> rawPipeline = {};
     auto ctx = getExpCtx();
 
@@ -1950,7 +2530,7 @@ TEST_F(PipelineInitialSourceNSTest, AggregateOneNSNotValidForEmptyPipeline) {
     ASSERT_NOT_OK(Pipeline::parse(rawPipeline, ctx).getStatus());
 }
 
-TEST_F(PipelineInitialSourceNSTest, AggregateOneNSNotValidIfInitialStageRequiresCollection) {
+TEST_F(PipelineValidateTest, AggregateOneNSNotValidIfInitialStageRequiresCollection) {
     const std::vector<BSONObj> rawPipeline = {fromjson("{$match: {}}")};
     auto ctx = getExpCtx();
 
@@ -1959,7 +2539,7 @@ TEST_F(PipelineInitialSourceNSTest, AggregateOneNSNotValidIfInitialStageRequires
     ASSERT_NOT_OK(Pipeline::parse(rawPipeline, ctx).getStatus());
 }
 
-TEST_F(PipelineInitialSourceNSTest, AggregateOneNSValidIfInitialStageIsCollectionless) {
+TEST_F(PipelineValidateTest, AggregateOneNSValidIfInitialStageIsCollectionless) {
     auto collectionlessSource = DocumentSourceCollectionlessMock::create();
     auto ctx = getExpCtx();
 
@@ -1968,7 +2548,7 @@ TEST_F(PipelineInitialSourceNSTest, AggregateOneNSValidIfInitialStageIsCollectio
     ASSERT_OK(Pipeline::create({collectionlessSource}, ctx).getStatus());
 }
 
-TEST_F(PipelineInitialSourceNSTest, CollectionNSNotValidIfInitialStageIsCollectionless) {
+TEST_F(PipelineValidateTest, CollectionNSNotValidIfInitialStageIsCollectionless) {
     auto collectionlessSource = DocumentSourceCollectionlessMock::create();
     auto ctx = getExpCtx();
 
@@ -1977,7 +2557,7 @@ TEST_F(PipelineInitialSourceNSTest, CollectionNSNotValidIfInitialStageIsCollecti
     ASSERT_NOT_OK(Pipeline::create({collectionlessSource}, ctx).getStatus());
 }
 
-TEST_F(PipelineInitialSourceNSTest, AggregateOneNSValidForFacetPipelineRegardlessOfInitialStage) {
+TEST_F(PipelineValidateTest, AggregateOneNSValidForFacetPipelineRegardlessOfInitialStage) {
     const std::vector<BSONObj> rawPipeline = {fromjson("{$match: {}}")};
     auto ctx = getExpCtx();
 
@@ -1986,8 +2566,7 @@ TEST_F(PipelineInitialSourceNSTest, AggregateOneNSValidForFacetPipelineRegardles
     ASSERT_OK(Pipeline::parseFacetPipeline(rawPipeline, ctx).getStatus());
 }
 
-TEST_F(PipelineInitialSourceNSTest, ChangeStreamIsValidAsFirstStage) {
-    EnsureFCV ensureFCV(EnsureFCV::Version::k36);
+TEST_F(PipelineValidateTest, ChangeStreamIsValidAsFirstStage) {
     const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}")};
     auto ctx = getExpCtx();
     setMockReplicationCoordinatorOnOpCtx(ctx->opCtx);
@@ -1995,30 +2574,76 @@ TEST_F(PipelineInitialSourceNSTest, ChangeStreamIsValidAsFirstStage) {
     ASSERT_OK(Pipeline::parse(rawPipeline, ctx).getStatus());
 }
 
-TEST_F(PipelineInitialSourceNSTest, ChangeStreamIsNotValidIfNotFirstStage) {
-    EnsureFCV ensureFCV(EnsureFCV::Version::k36);
+TEST_F(PipelineValidateTest, ChangeStreamIsNotValidIfNotFirstStage) {
     const std::vector<BSONObj> rawPipeline = {fromjson("{$match: {custom: 'filter'}}"),
                                               fromjson("{$changeStream: {}}")};
     auto ctx = getExpCtx();
     setMockReplicationCoordinatorOnOpCtx(ctx->opCtx);
     ctx->ns = NamespaceString("a.collection");
     auto parseStatus = Pipeline::parse(rawPipeline, ctx).getStatus();
-    ASSERT_EQ(parseStatus, ErrorCodes::fromInt(40602));
+    ASSERT_EQ(parseStatus, ErrorCodes::duplicateCodeForTest(40602));
 }
 
-TEST_F(PipelineInitialSourceNSTest, ChangeStreamIsNotValidIfNotFirstStageInFacet) {
-    EnsureFCV ensureFCV(EnsureFCV::Version::k36);
+TEST_F(PipelineValidateTest, ChangeStreamIsNotValidIfNotFirstStageInFacet) {
     const std::vector<BSONObj> rawPipeline = {fromjson("{$match: {custom: 'filter'}}"),
                                               fromjson("{$changeStream: {}}")};
     auto ctx = getExpCtx();
     setMockReplicationCoordinatorOnOpCtx(ctx->opCtx);
     ctx->ns = NamespaceString("a.collection");
     auto parseStatus = Pipeline::parseFacetPipeline(rawPipeline, ctx).getStatus();
-    ASSERT_EQ(parseStatus, ErrorCodes::fromInt(40600));
+    ASSERT_EQ(parseStatus, ErrorCodes::duplicateCodeForTest(40600));
     ASSERT(std::string::npos != parseStatus.reason().find("$changeStream"));
 }
 
-}  // namespace Namespaces
+class DocumentSourceDisallowedInTransactions : public DocumentSourceMock {
+public:
+    DocumentSourceDisallowedInTransactions() : DocumentSourceMock({}) {}
+
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return StageConstraints{StreamType::kStreaming,
+                                PositionRequirement::kNone,
+                                HostTypeRequirement::kNone,
+                                DiskUseRequirement::kNoDiskUse,
+                                FacetRequirement::kAllowed,
+                                TransactionRequirement::kNotAllowed};
+    }
+
+    static boost::intrusive_ptr<DocumentSourceDisallowedInTransactions> create() {
+        return new DocumentSourceDisallowedInTransactions();
+    }
+};
+
+TEST_F(PipelineValidateTest, TopLevelPipelineValidatedForStagesIllegalInTransactions) {
+    BSONObj readConcernSnapshot = BSON("readConcern" << BSON("level"
+                                                             << "snapshot"));
+    auto ctx = getExpCtx();
+    ctx->inMultiDocumentTransaction = true;
+
+    // Make a pipeline with a legal $match, and then an illegal mock stage, and verify that pipeline
+    // creation fails with the expected error code.
+    auto matchStage = DocumentSourceMatch::create(BSON("_id" << 3), ctx);
+    auto illegalStage = DocumentSourceDisallowedInTransactions::create();
+    auto pipeline = Pipeline::create({matchStage, illegalStage}, ctx);
+    ASSERT_NOT_OK(pipeline.getStatus());
+    ASSERT_EQ(pipeline.getStatus(), ErrorCodes::OperationNotSupportedInTransaction);
+}
+
+TEST_F(PipelineValidateTest, FacetPipelineValidatedForStagesIllegalInTransactions) {
+    BSONObj readConcernSnapshot = BSON("readConcern" << BSON("level"
+                                                             << "snapshot"));
+    auto ctx = getExpCtx();
+    ctx->inMultiDocumentTransaction = true;
+
+    // Make a pipeline with a legal $match, and then an illegal mock stage, and verify that pipeline
+    // creation fails with the expected error code.
+    auto matchStage = DocumentSourceMatch::create(BSON("_id" << 3), ctx);
+    auto illegalStage = DocumentSourceDisallowedInTransactions::create();
+    auto pipeline = Pipeline::createFacetPipeline({matchStage, illegalStage}, ctx);
+    ASSERT_NOT_OK(pipeline.getStatus());
+    ASSERT_EQ(pipeline.getStatus(), ErrorCodes::OperationNotSupportedInTransaction);
+}
+
+}  // namespace pipeline_validate
 
 namespace Dependencies {
 
@@ -2029,11 +2654,11 @@ TEST_F(PipelineDependenciesTest, EmptyPipelineShouldRequireWholeDocument) {
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata);
     ASSERT_TRUE(depsTracker.needWholeDocument);
-    ASSERT_FALSE(depsTracker.getNeedTextScore());
+    ASSERT_FALSE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 
     depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kTextScore);
     ASSERT_TRUE(depsTracker.needWholeDocument);
-    ASSERT_TRUE(depsTracker.getNeedTextScore());
+    ASSERT_TRUE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 //
@@ -2051,14 +2676,15 @@ public:
                 PositionRequirement::kNone,
                 HostTypeRequirement::kNone,
                 DiskUseRequirement::kNoDiskUse,
-                FacetRequirement::kAllowed};
+                FacetRequirement::kAllowed,
+                TransactionRequirement::kAllowed};
     }
 };
 
 class DocumentSourceDependenciesNotSupported : public DocumentSourceDependencyDummy {
 public:
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
-        return GetDepsReturn::NOT_SUPPORTED;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
+        return DepsTracker::State::NOT_SUPPORTED;
     }
 
     static boost::intrusive_ptr<DocumentSourceDependenciesNotSupported> create() {
@@ -2068,9 +2694,9 @@ public:
 
 class DocumentSourceNeedsASeeNext : public DocumentSourceDependencyDummy {
 public:
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
         deps->fields.insert("a");
-        return GetDepsReturn::SEE_NEXT;
+        return DepsTracker::State::SEE_NEXT;
     }
 
     static boost::intrusive_ptr<DocumentSourceNeedsASeeNext> create() {
@@ -2080,9 +2706,9 @@ public:
 
 class DocumentSourceNeedsOnlyB : public DocumentSourceDependencyDummy {
 public:
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
         deps->fields.insert("b");
-        return GetDepsReturn::EXHAUSTIVE_FIELDS;
+        return DepsTracker::State::EXHAUSTIVE_FIELDS;
     }
 
     static boost::intrusive_ptr<DocumentSourceNeedsOnlyB> create() {
@@ -2092,9 +2718,9 @@ public:
 
 class DocumentSourceNeedsOnlyTextScore : public DocumentSourceDependencyDummy {
 public:
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
-        deps->setNeedTextScore(true);
-        return GetDepsReturn::EXHAUSTIVE_META;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
+        deps->setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, true);
+        return DepsTracker::State::EXHAUSTIVE_META;
     }
 
     static boost::intrusive_ptr<DocumentSourceNeedsOnlyTextScore> create() {
@@ -2104,8 +2730,8 @@ public:
 
 class DocumentSourceStripsTextScore : public DocumentSourceDependencyDummy {
 public:
-    GetDepsReturn getDependencies(DepsTracker* deps) const final {
-        return GetDepsReturn::EXHAUSTIVE_META;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final {
+        return DepsTracker::State::EXHAUSTIVE_META;
     }
 
     static boost::intrusive_ptr<DocumentSourceStripsTextScore> create() {
@@ -2122,7 +2748,7 @@ TEST_F(PipelineDependenciesTest, ShouldRequireWholeDocumentIfAnyStageDoesNotSupp
     auto depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata);
     ASSERT_TRUE(depsTracker.needWholeDocument);
     // The inputs did not have a text score available, so we should not require a text score.
-    ASSERT_FALSE(depsTracker.getNeedTextScore());
+    ASSERT_FALSE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 
     // Now in the other order.
     pipeline = unittest::assertGet(Pipeline::create({notSupported, needsASeeNext}, ctx));
@@ -2161,7 +2787,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotAddAnyRequiredFieldsAfterFirstStageWit
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata);
     ASSERT_FALSE(depsTracker.needWholeDocument);
-    ASSERT_FALSE(depsTracker.getNeedTextScore());
+    ASSERT_FALSE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 
     // 'needsOnlyB' claims to know all its field dependencies, so we shouldn't add any from
     // 'needsASeeNext'.
@@ -2174,7 +2800,7 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfThereIsNoScoreAvaila
     auto pipeline = unittest::assertGet(Pipeline::create({}, ctx));
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata);
-    ASSERT_FALSE(depsTracker.getNeedTextScore());
+    ASSERT_FALSE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 TEST_F(PipelineDependenciesTest, ShouldThrowIfTextScoreIsNeededButNotPresent) {
@@ -2191,12 +2817,12 @@ TEST_F(PipelineDependenciesTest, ShouldRequireTextScoreIfAvailableAndNoStageRetu
     auto pipeline = unittest::assertGet(Pipeline::create({}, ctx));
 
     auto depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kTextScore);
-    ASSERT_TRUE(depsTracker.getNeedTextScore());
+    ASSERT_TRUE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 
     auto needsASeeNext = DocumentSourceNeedsASeeNext::create();
     pipeline = unittest::assertGet(Pipeline::create({needsASeeNext}, ctx));
     depsTracker = pipeline->getDependencies(DepsTracker::MetadataAvailable::kTextScore);
-    ASSERT_TRUE(depsTracker.getNeedTextScore());
+    ASSERT_TRUE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfAvailableButDefinitelyNotNeeded) {
@@ -2209,10 +2835,205 @@ TEST_F(PipelineDependenciesTest, ShouldNotRequireTextScoreIfAvailableButDefinite
 
     // 'stripsTextScore' claims that no further stage will need metadata information, so we
     // shouldn't have the text score as a dependency.
-    ASSERT_FALSE(depsTracker.getNeedTextScore());
+    ASSERT_FALSE(depsTracker.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 }  // namespace Dependencies
+
+namespace {
+TEST(PipelineRenameTracking, ReportsIdentityMapWhenEmpty) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::create()}, expCtx));
+    auto renames = pipeline->renamedPaths({"a", "b", "c.d"});
+    ASSERT(static_cast<bool>(renames));
+    auto nameMap = *renames;
+    ASSERT_EQ(nameMap.size(), 3UL);
+    ASSERT_EQ(nameMap["a"], "a");
+    ASSERT_EQ(nameMap["b"], "b");
+    ASSERT_EQ(nameMap["c.d"], "c.d");
+}
+
+class NoModifications : public DocumentSourceTestOptimizations {
+public:
+    NoModifications() : DocumentSourceTestOptimizations() {}
+    static boost::intrusive_ptr<NoModifications> create() {
+        return new NoModifications();
+    }
+
+    /**
+     * Returns a description which communicate that this stage modifies nothing.
+     */
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>(), {}};
+    }
+};
+
+TEST(PipelineRenameTracking, ReportsIdentityWhenNoStageModifiesAnything) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    {
+        auto pipeline = unittest::assertGet(
+            Pipeline::create({DocumentSourceMock::create(), NoModifications::create()}, expCtx));
+        auto renames = pipeline->renamedPaths({"a", "b", "c.d"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 3UL);
+        ASSERT_EQ(nameMap["a"], "a");
+        ASSERT_EQ(nameMap["b"], "b");
+        ASSERT_EQ(nameMap["c.d"], "c.d");
+    }
+    {
+        auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::create(),
+                                                              NoModifications::create(),
+                                                              NoModifications::create(),
+                                                              NoModifications::create()},
+                                                             expCtx));
+        auto renames = pipeline->renamedPaths({"a", "b", "c.d"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 3UL);
+        ASSERT_EQ(nameMap["a"], "a");
+        ASSERT_EQ(nameMap["b"], "b");
+        ASSERT_EQ(nameMap["c.d"], "c.d");
+    }
+}
+
+class NotSupported : public DocumentSourceTestOptimizations {
+public:
+    NotSupported() : DocumentSourceTestOptimizations() {}
+    static boost::intrusive_ptr<NotSupported> create() {
+        return new NotSupported();
+    }
+
+    /**
+     * Returns a description which communicate that this stage modifies nothing.
+     */
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kNotSupported, std::set<std::string>(), {}};
+    }
+};
+
+TEST(PipelineRenameTracking, DoesNotReportRenamesIfAStageDoesNotSupportTrackingThem) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(Pipeline::create({DocumentSourceMock::create(),
+                                                          NoModifications::create(),
+                                                          NotSupported::create(),
+                                                          NoModifications::create()},
+                                                         expCtx));
+    ASSERT_FALSE(static_cast<bool>(pipeline->renamedPaths({"a"})));
+    ASSERT_FALSE(static_cast<bool>(pipeline->renamedPaths({"a", "b"})));
+    ASSERT_FALSE(static_cast<bool>(pipeline->renamedPaths({"x", "yahoo", "c.d"})));
+}
+
+class RenamesAToB : public DocumentSourceTestOptimizations {
+public:
+    RenamesAToB() : DocumentSourceTestOptimizations() {}
+    static boost::intrusive_ptr<RenamesAToB> create() {
+        return new RenamesAToB();
+    }
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"b", "a"}}};
+    }
+};
+
+TEST(PipelineRenameTracking, ReportsNewNamesWhenSingleStageRenames) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(
+        Pipeline::create({DocumentSourceMock::create(), RenamesAToB::create()}, expCtx));
+    {
+        auto renames = pipeline->renamedPaths({"b"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 1UL);
+        ASSERT_EQ(nameMap["b"], "a");
+    }
+    {
+        auto renames = pipeline->renamedPaths({"b", "c.d"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 2UL);
+        ASSERT_EQ(nameMap["b"], "a");
+        ASSERT_EQ(nameMap["c.d"], "c.d");
+    }
+    {
+        // This is strange; the mock stage reports to essentially duplicate the "a" field into "b".
+        // Because of this, both "b" and "a" should map to "a".
+        auto renames = pipeline->renamedPaths({"b", "a"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 2UL);
+        ASSERT_EQ(nameMap["b"], "a");
+        ASSERT_EQ(nameMap["a"], "a");
+    }
+}
+
+TEST(PipelineRenameTracking, ReportsIdentityMapWhenGivenEmptyIteratorRange) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(
+        Pipeline::create({DocumentSourceMock::create(), RenamesAToB::create()}, expCtx));
+    {
+        auto renames = Pipeline::renamedPaths(
+            pipeline->getSources().rbegin(), pipeline->getSources().rbegin(), {"b"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 1UL);
+        ASSERT_EQ(nameMap["b"], "b");
+    }
+    {
+        auto renames = Pipeline::renamedPaths(
+            pipeline->getSources().rbegin(), pipeline->getSources().rbegin(), {"b", "c.d"});
+        ASSERT(static_cast<bool>(renames));
+        auto nameMap = *renames;
+        ASSERT_EQ(nameMap.size(), 2UL);
+        ASSERT_EQ(nameMap["b"], "b");
+        ASSERT_EQ(nameMap["c.d"], "c.d");
+    }
+}
+
+class RenamesBToC : public DocumentSourceTestOptimizations {
+public:
+    RenamesBToC() : DocumentSourceTestOptimizations() {}
+    static boost::intrusive_ptr<RenamesBToC> create() {
+        return new RenamesBToC();
+    }
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"c", "b"}}};
+    }
+};
+
+TEST(PipelineRenameTracking, ReportsNewNameAcrossMultipleRenames) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(Pipeline::create(
+        {DocumentSourceMock::create(), RenamesAToB::create(), RenamesBToC::create()}, expCtx));
+    auto renames = pipeline->renamedPaths({"c"});
+    ASSERT(static_cast<bool>(renames));
+    auto nameMap = *renames;
+    ASSERT_EQ(nameMap.size(), 1UL);
+    ASSERT_EQ(nameMap["c"], "a");
+}
+
+class RenamesBToA : public DocumentSourceTestOptimizations {
+public:
+    RenamesBToA() : DocumentSourceTestOptimizations() {}
+    static boost::intrusive_ptr<RenamesBToA> create() {
+        return new RenamesBToA();
+    }
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"b", "a"}}};
+    }
+};
+
+TEST(PipelineRenameTracking, CanHandleBackAndForthRename) {
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest());
+    auto pipeline = unittest::assertGet(Pipeline::create(
+        {DocumentSourceMock::create(), RenamesAToB::create(), RenamesBToA::create()}, expCtx));
+    auto renames = pipeline->renamedPaths({"a"});
+    ASSERT(static_cast<bool>(renames));
+    auto nameMap = *renames;
+    ASSERT_EQ(nameMap.size(), 1UL);
+    ASSERT_EQ(nameMap["a"], "a");
+}
+
+}  // namespace
 
 class All : public Suite {
 public:
@@ -2229,6 +3050,12 @@ public:
         add<Optimizations::Sharded::moveFinalUnwindFromShardsToMerger::TwoUnwind>();
         add<Optimizations::Sharded::moveFinalUnwindFromShardsToMerger::UnwindNotFinal>();
         add<Optimizations::Sharded::moveFinalUnwindFromShardsToMerger::UnwindWithOther>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithSkipAndLimit>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithMultipleSkipsAndLimit>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithLimitAndSkip>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithSkipAddFieldsAndLimit>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithSkipGroupAndLimit>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithSkipSecondMatchAndLimit>();
         add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::NeedWholeDoc>();
         add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::JustNeedsId>();
         add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::JustNeedsNonId>();
@@ -2236,6 +3063,14 @@ public:
         add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::ShardAlreadyExhaustive>();
         add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::
                 ShardedSortMatchProjSkipLimBecomesMatchTopKSortSkipProj>();
+        add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::
+                ShardedMatchProjLimDoesNotBecomeMatchLimProj>();
+        add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::
+                ShardedSortProjLimBecomesTopKSortProj>();
+        add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::
+                ShardedSortGroupProjLimDoesNotBecomeTopKSortProjGroup>();
+        add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::
+                ShardedMatchSortProjLimBecomesMatchTopKSortProj>();
         add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::ShardAlreadyExhaustive>();
         add<Optimizations::Sharded::needsPrimaryShardMerger::Out>();
         add<Optimizations::Sharded::needsPrimaryShardMerger::Project>();

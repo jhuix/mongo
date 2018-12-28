@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -70,37 +72,32 @@ struct QueryPlannerParams {
         // Set this if you want to turn on index intersection.
         INDEX_INTERSECTION = 1 << 4,
 
-        // Set this if you want to try to keep documents deleted or mutated during the execution
-        // of the query in the query results.
-        KEEP_MUTATIONS = 1 << 5,
-
         // Indicate to the planner that the caller is requesting a count operation, possibly through
         // a count command, or as part of an aggregation pipeline.
-        IS_COUNT = 1 << 6,
+        IS_COUNT = 1 << 5,
 
         // Set this if you want to handle batchSize properly with sort(). If limits on SORT
         // stages are always actually limits, then this should be left off. If they are
         // sometimes to be interpreted as batchSize, then this should be turned on.
-        SPLIT_LIMITED_SORT = 1 << 7,
-
-        // Set this to prevent the planner from generating plans which answer a predicate
-        // implicitly via exact index bounds for index intersection solutions.
-        CANNOT_TRIM_IXISECT = 1 << 8,
-
-        // Set this if snapshot() should scan the _id index rather than performing a
-        // collection scan. The MMAPv1 storage engine sets this option since it cannot
-        // guarantee that a collection scan won't miss documents or return duplicates.
-        SNAPSHOT_USE_ID = 1 << 9,
+        SPLIT_LIMITED_SORT = 1 << 6,
 
         // Set this if you don't want any plans with a non-covered projection stage. All projections
         // must be provided/covered by an index.
-        NO_UNCOVERED_PROJECTIONS = 1 << 10,
+        NO_UNCOVERED_PROJECTIONS = 1 << 7,
 
         // Set this to generate covered whole IXSCAN plans.
-        GENERATE_COVERED_IXSCANS = 1 << 11,
+        GENERATE_COVERED_IXSCANS = 1 << 8,
 
         // Set this to track the most recent timestamp seen by this cursor while scanning the oplog.
-        TRACK_LATEST_OPLOG_TS = 1 << 12,
+        TRACK_LATEST_OPLOG_TS = 1 << 9,
+
+        // Set this so that collection scans on the oplog wait for visibility before reading.
+        OPLOG_SCAN_WAIT_FOR_VISIBLE = 1 << 10,
+
+        // Set this so that getExecutorDistinct() will only use a plan that _guarantees_ it will
+        // return exactly one document per value of the distinct field. See the comments above the
+        // declaration of getExecutorDistinct() for more detail.
+        STRICT_DISTINCT_ONLY = 1 << 11,
     };
 
     // See Options enum above.

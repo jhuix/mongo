@@ -24,6 +24,7 @@ Async
 AsyncOp
 Athanassoulis
 Athlon
+Axxx
 BBBBB
 BBBBBB
 BBBBBBBBBB
@@ -46,6 +47,7 @@ Brueckner
 Bsearch
 Btree
 Buf
+Bxxx
 Bzip
 CAS
 CCCCCCCCCCCCCCCCCC
@@ -75,6 +77,7 @@ Checksum
 Checksums
 CityHash
 CloseHandle
+Cmvxz
 Cmvz
 Collet
 Comparator
@@ -93,6 +96,7 @@ DIRECTIO
 DNE
 DOI
 DONTNEED
+DSK
 DUPLICATEV
 DataSet
 DbCursor
@@ -138,6 +142,7 @@ FULLFSYNC
 Facebook
 FindClose
 FindFirstFile
+FindNextFileW
 Fixup
 Fk
 FlushFileBuffers
@@ -145,6 +150,7 @@ Fprintf
 FreeBSD
 FreeBSD's
 FreeLibrary
+Fsync
 Fuerst
 GCC
 GIDs
@@ -162,6 +168,7 @@ HFS
 HHHH
 HHHHLL
 HHHLL
+HILQr
 Hendrik
 HyperLevelDB
 ID's
@@ -174,6 +181,7 @@ INCR
 INIT
 INITIALIZER
 INMEM
+INPROGRESS
 INSN
 INTL
 INULL
@@ -203,13 +211,14 @@ LLLLLLL
 LOGREC
 LOGSCAN
 LOOKASIDE
+LRSVv
 LRU
-LRVv
 LSB
 LSM
 LSN
 LSNs
 LTE
+LWN
 LZ
 LZO
 LeafGreen
@@ -217,6 +226,7 @@ LevelDB
 Levyx
 Llqr
 Llqrt
+LmT
 LoadLoad
 LockFile
 Lookaside
@@ -256,6 +266,7 @@ NEEDVALUE
 NOLL
 NOLOCK
 NONINFRINGEMENT
+NOOP
 NOTFOUND
 NOTREACHED
 NOVALUE
@@ -268,6 +279,7 @@ Noll
 Nul
 OOB
 OPLOG
+OPTRACK
 OPTYPE
 OUTBUFF
 OVFL
@@ -289,6 +301,7 @@ Pandis
 Phong
 PlatformSDK
 Posix
+PostgreSQL
 PowerPC
 Pre
 Preload
@@ -366,6 +379,7 @@ ThreadList
 ThreadListWrapper
 Timespec
 Timestamp
+Timestamps
 TryCV
 TxnID
 UDF
@@ -386,10 +400,12 @@ UnmapViewOfFile
 Unmarshall
 Unordered
 Uryyb
+VALGRIND
 VARCHAR
 VLDB
 VMSG
 VR
+VRFY
 VX
 Vc
 Vfprintf
@@ -436,6 +452,7 @@ Zlib's
 Zstandard
 Zstd
 Zstd's
+aaa
 abcdef
 abcdefghijklmnopqrstuvwxyz
 addl
@@ -467,9 +484,11 @@ autocommit
 autoconf
 automake
 bInheritHandle
+backoff
 bal
 basecfg
 basho
+bbb
 bcr
 bdb
 beginthreadex
@@ -488,6 +507,7 @@ bool
 boolean
 br
 breakpoint
+bs
 bswap
 bt
 btcur
@@ -512,16 +532,18 @@ bzDecompressInit
 bzalloc
 bzfree
 bzip
+calc
 call's
 calloc
 cas
 catfmt
 cb
+ccc
 ccr
 cd
 centric
 cfg
-cfkos
+cfko
 change's
 changelog
 chdir
@@ -601,6 +623,7 @@ curtable
 cust
 customp
 cv
+cval
 cx
 cxa
 dT
@@ -613,6 +636,7 @@ datastore
 dbc
 dbs
 dcalloc
+ddd
 decile
 deciles
 decl
@@ -643,6 +667,7 @@ dhandle
 dhandles
 difftime
 dir
+directio
 dirlist
 disjunction
 disjunctions
@@ -668,6 +693,7 @@ dsync
 dumpcmp
 dumpfile
 dup
+eee
 eg
 egrep
 emp
@@ -679,8 +705,10 @@ endian
 english
 enqueue
 enqueued
+enum
 env
 eof
+epi
 eq
 equalp
 errhandler
@@ -708,6 +736,7 @@ fdatasync
 fdopen
 fextend
 ffc
+fff
 fflush
 ffs
 fgetc
@@ -736,9 +765,11 @@ fopen
 formatmessage
 fp
 fprintf
+fread
 free'd
 fs
 fscanf
+fseek
 fstat
 fstream
 fsync
@@ -746,7 +777,9 @@ fsyncLock
 fsyncs
 ftruncate
 func
+funcid
 fvisibility
+fwrite
 gcc
 gdb
 ge
@@ -761,6 +794,7 @@ getraw
 gettime
 gettimeofday
 getv
+ggg
 github
 gitignore
 gobare
@@ -774,7 +808,9 @@ handlep
 hashval
 havesize
 hdr
+hhh
 highjack
+hilq
 hotbackup
 hselasky
 html
@@ -789,6 +825,7 @@ idlems
 idx
 ifdef
 ifdef's
+iflag
 iiSii
 iiiS
 iiii
@@ -847,6 +884,7 @@ iszero
 iter
 iteratively
 iters
+jjj
 jnr
 jrx
 json
@@ -920,6 +958,7 @@ marshalled
 maxCLevel
 maxcpu
 maxdbs
+maxdiff
 mbll
 mbss
 mem
@@ -941,6 +980,7 @@ mkdir
 mmap
 mmrand
 mnt
+movemask
 msecs
 msg
 msvc
@@ -966,9 +1006,11 @@ needkey
 needvalue
 negint
 nentries
+nentriesp
 newbar
 newfile
 newuri
+newv
 nextprev
 nfilename
 nhex
@@ -986,15 +1028,18 @@ notsup
 notused
 novalue
 nowait
+nsec
 nset
 nsnap
 nul
 nullptr
 nuls
+num
 numSymbols
 numbare
 offpage
 ok
+oldv
 ondisk
 onint
 online
@@ -1006,6 +1051,7 @@ openfile
 oplist
 oplog
 optimizations
+optrack
 optype
 ori
 os
@@ -1014,6 +1060,7 @@ other's
 ovfl
 ownp
 pR
+pS
 packv
 pagesize
 parens
@@ -1078,6 +1125,7 @@ rbrace
 rbracket
 rcursor
 rdonly
+rdtsc
 rduppo
 readlock
 readonly
@@ -1120,6 +1168,7 @@ rwlock
 sH
 sHQ
 sT
+sanitizers
 scalability
 sched
 scr
@@ -1165,6 +1214,7 @@ strget
 strlen
 strncpy
 strndup
+strnlen
 strtok
 strtoll
 strtouq
@@ -1176,6 +1226,8 @@ subgetraw
 subgets
 subinit
 sublicense
+subone
+suboptimal
 subtest
 subtree
 sunique
@@ -1186,16 +1238,19 @@ sx
 sy
 sys
 syscall
+sysinfo
 sz
 t's
 tV
 tablename
 tcbench
 td
+teardown
 tempdir
 testutil
 th
 tid
+timedwait
 timestamp
 timestamps
 tmp
@@ -1215,6 +1270,7 @@ trk
 trk's
 trunc
 trylock
+tsc
 tupdate
 tvalue
 txn
@@ -1234,6 +1290,7 @@ unbuffered
 uncompressing
 uncompresssed
 undef
+underflowed
 unencrypted
 unesc
 unescape
@@ -1294,6 +1351,7 @@ vtype
 vunpack
 vw
 vxr
+vxz
 vz
 waitpid
 waker
@@ -1337,3 +1395,4 @@ zstd
 zstd's
 zu
 zyxwvutsrqponmlkjihgfedcba
+zzz

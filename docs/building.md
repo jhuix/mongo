@@ -7,9 +7,13 @@ To build MongoDB, you will need:
     * GCC 5.4.0 or newer
     * Clang 3.8 (or Apple XCode 8.3.2 Clang) or newer
     * Visual Studio 2015 Update 3 or newer (See Windows section below for details)
+* On Linux and macOS, the libcurl library and header is required. MacOS includes libcurl.
+    * Fedora/RHEL - `dnf install libcurl-devel`
+    * Ubuntu/Debian - `apt-get install libcurl-dev`
 * Python 2.7.x and Pip modules:
   * pyyaml
   * typing
+  * cheetah
 
 MongoDB supports the following architectures: arm64, ppc64le, s390x, and x86-64.
 More detailed platform instructions can be found below.
@@ -29,7 +33,7 @@ Python Prerequisites
 In order to build MongoDB, Python 2.7.x is required, and several Python modules. To install
 the required Python modules, run:
 
-    $ pip2 install -r buildscripts/requirements.txt
+    $ pip2 install -r etc/pip/compile-requirements.txt
 
 Note: If the `pip2` command is not available, `pip` without a suffix may be the pip command
 associated with Python 2.7.x.
@@ -45,7 +49,11 @@ If you want to build everything (mongod, mongo, tests, etc):
 
 If you only want to build the database:
 
-    $ python2 buildscripts/scons.py scons
+    $ python2 buildscripts/scons.py mongod
+
+***Note***: For C++ compilers that are newer than the supported version, the compiler may issue new warnings that cause MongoDB to fail to build since the build system treats compiler warnings as errors. To ignore the warnings, pass the switch --disable-warnings-as-errors to scons.
+
+    $ python2 buildscripts/scons.py mongod --disable-warnings-as-errors
 
 To install
 

@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -45,9 +47,10 @@ namespace mongo {
  * Queries separate collection for equality matches with documents in the pipeline collection.
  * Adds matching documents to a new array field in the input document.
  */
-class DocumentSourceLookUp final : public DocumentSourceNeedsMongoProcessInterface,
-                                   public SplittableDocumentSource {
+class DocumentSourceLookUp final : public DocumentSource, public NeedsMergerDocumentSource {
 public:
+    static constexpr size_t kMaxSubPipelineDepth = 20;
+
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
         static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
@@ -95,27 +98,13 @@ public:
      */
     GetModPathsReturn getModifiedPaths() const final;
 
-    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        const bool mayUseDisk = wasConstructedWithPipelineSyntax() &&
-            std::any_of(_parsedIntrospectionPipeline->getSources().begin(),
-                        _parsedIntrospectionPipeline->getSources().end(),
-                        [](const auto& source) {
-                            return source->constraints().diskRequirement ==
-                                DiskUseRequirement::kWritesTmpData;
-                        });
+    /**
+     * Reports the StageConstraints of this $lookup instance. A $lookup constructed with pipeline
+     * syntax will inherit certain constraints from the stages in its pipeline.
+     */
+    StageConstraints constraints(Pipeline::SplitState) const final;
 
-        StageConstraints constraints(StreamType::kStreaming,
-                                     PositionRequirement::kNone,
-                                     HostTypeRequirement::kPrimaryShard,
-                                     mayUseDisk ? DiskUseRequirement::kWritesTmpData
-                                                : DiskUseRequirement::kNoDiskUse,
-                                     FacetRequirement::kAllowed);
-
-        constraints.canSwapWithMatch = true;
-        return constraints;
-    }
-
-    GetDepsReturn getDependencies(DepsTracker* deps) const final;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
     BSONObjSet getOutputSorts() final {
         return DocumentSource::truncateSortSet(pSource->getOutputSorts(), {_as.fullPath()});
@@ -125,7 +114,7 @@ public:
         return nullptr;
     }
 
-    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final {
+    MergingLogic mergingLogic() final {
         return {this};
     }
 
@@ -133,9 +122,11 @@ public:
         collections->push_back(_fromNs);
     }
 
-    void doDetachFromOperationContext() final;
+    void detachFromOperationContext() final;
 
-    void doReattachToOperationContext(OperationContext* opCtx) final;
+    void reattachToOperationContext(OperationContext* opCtx) final;
+
+    bool usedDisk() final;
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
@@ -181,7 +172,7 @@ public:
         return _variablesParseState;
     }
 
-    std::unique_ptr<Pipeline, Pipeline::Deleter> getSubPipeline_forTest(const Document& inputDoc) {
+    std::unique_ptr<Pipeline, PipelineDeleter> getSubPipeline_forTest(const Document& inputDoc) {
         return buildPipeline(inputDoc);
     }
 
@@ -249,7 +240,6 @@ private:
     static void copyVariablesToExpCtx(const Variables& vars,
                                       const VariablesParseState& vps,
                                       ExpressionContext* expCtx);
-
     /**
      * Resolves let defined variables against 'localDoc' and stores the results in 'variables'.
      */
@@ -265,7 +255,7 @@ private:
      * Builds the $lookup pipeline and resolves any variables using the passed 'inputDoc', adding a
      * cursor and/or cache source as appropriate.
      */
-    std::unique_ptr<Pipeline, Pipeline::Deleter> buildPipeline(const Document& inputDoc);
+    std::unique_ptr<Pipeline, PipelineDeleter> buildPipeline(const Document& inputDoc);
 
     /**
      * The pipeline supplied via the $lookup 'pipeline' argument. This may differ from pipeline that
@@ -284,6 +274,7 @@ private:
         _cache.emplace(maxCacheSizeBytes);
     }
 
+    bool _usedDisk = false;
     NamespaceString _fromNs;
     NamespaceString _resolvedNs;
     FieldPath _as;
@@ -317,7 +308,7 @@ private:
     std::vector<BSONObj> _userPipeline;
     // A pipeline parsed from _resolvedPipeline at creation time, intended to support introspective
     // functions. If sub-$lookup stages are present, their pipelines are constructed recursively.
-    std::unique_ptr<Pipeline, Pipeline::Deleter> _parsedIntrospectionPipeline;
+    std::unique_ptr<Pipeline, PipelineDeleter> _parsedIntrospectionPipeline;
 
     std::vector<LetVariable> _letVariables;
 
@@ -327,7 +318,7 @@ private:
     // The following members are used to hold onto state across getNext() calls when '_unwindSrc' is
     // not null.
     long long _cursorIndex = 0;
-    std::unique_ptr<Pipeline, Pipeline::Deleter> _pipeline;
+    std::unique_ptr<Pipeline, PipelineDeleter> _pipeline;
     boost::optional<Document> _input;
     boost::optional<Document> _nextValue;
 };

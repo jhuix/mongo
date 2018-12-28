@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -7,9 +7,6 @@
  */
 
 #include "wt_internal.h"
-
-static void __btree_verbose_lookaside_read(
-		WT_SESSION_IMPL *, uint32_t, uint64_t);
 
 /*
  * __col_instantiate --
@@ -70,33 +67,86 @@ __row_instantiate(WT_SESSION_IMPL *session,
 }
 
 /*
+ * __las_page_instantiate_verbose --
+ *	Create a verbose message to display at most once per checkpoint when
+ *	performing a lookaside table read.
+ */
+static void
+__las_page_instantiate_verbose(WT_SESSION_IMPL *session, uint64_t las_pageid)
+{
+	WT_CACHE *cache;
+	uint64_t ckpt_gen_current, ckpt_gen_last;
+
+	if (!WT_VERBOSE_ISSET(session,
+	    WT_VERB_LOOKASIDE | WT_VERB_LOOKASIDE_ACTIVITY))
+		return;
+
+	cache = S2C(session)->cache;
+	ckpt_gen_current = __wt_gen(session, WT_GEN_CHECKPOINT);
+	ckpt_gen_last = cache->las_verb_gen_read;
+
+	/*
+	 * This message is throttled to one per checkpoint. To do this we
+	 * track the generation of the last checkpoint for which the message
+	 * was printed and check against the current checkpoint generation.
+	 */
+	if (WT_VERBOSE_ISSET(session, WT_VERB_LOOKASIDE) ||
+	    ckpt_gen_current > ckpt_gen_last) {
+		/*
+		 * Attempt to atomically replace the last checkpoint generation
+		 * for which this message was printed. If the atomic swap fails
+		 * we have raced and the winning thread will print the message.
+		 */
+		if (__wt_atomic_casv64(&cache->las_verb_gen_read,
+			ckpt_gen_last, ckpt_gen_current)) {
+			__wt_verbose(session,
+			    WT_VERB_LOOKASIDE | WT_VERB_LOOKASIDE_ACTIVITY,
+			    "Read from lookaside file triggered for "
+			    "file ID %" PRIu32 ", page ID %" PRIu64,
+			    S2BT(session)->id, las_pageid);
+		}
+	}
+}
+
+/*
  * __las_page_instantiate --
  *	Instantiate lookaside update records in a recently read page.
  */
 static int
-__las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t btree_id)
+__las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref)
 {
+	WT_CACHE *cache;
 	WT_CURSOR *cursor;
 	WT_CURSOR_BTREE cbt;
 	WT_DECL_ITEM(current_key);
 	WT_DECL_RET;
-	WT_ITEM las_key, las_timestamp, las_value;
+	WT_ITEM las_key, las_value;
 	WT_PAGE *page;
 	WT_UPDATE *first_upd, *last_upd, *upd;
+	wt_timestamp_t las_timestamp;
 	size_t incr, total_incr;
 	uint64_t current_recno, las_counter, las_pageid, las_txnid, recno;
 	uint32_t las_id, session_flags;
 	const uint8_t *p;
-	uint8_t upd_type;
-	int exact;
+	uint8_t prepare_state, upd_type;
+	bool locked;
 
 	cursor = NULL;
 	page = ref->page;
 	first_upd = last_upd = upd = NULL;
+	locked = false;
 	total_incr = 0;
 	current_recno = recno = WT_RECNO_OOB;
+	las_pageid = ref->page_las->las_pageid;
 	session_flags = 0;		/* [-Werror=maybe-uninitialized] */
 	WT_CLEAR(las_key);
+
+	cache = S2C(session)->cache;
+	__las_page_instantiate_verbose(session, las_pageid);
+	WT_STAT_CONN_INCR(session, cache_read_lookaside);
+	WT_STAT_DATA_INCR(session, cache_read_lookaside);
+	if (WT_SESSION_IS_CHECKPOINT(session))
+		WT_STAT_CONN_INCR(session, cache_read_lookaside_checkpoint);
 
 	__wt_btcur_init(session, &cbt);
 	__wt_btcur_open(&cbt);
@@ -112,37 +162,34 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t btree_id)
 	 * in-order updates for a subsequent key. We process all of the updates
 	 * for a key and then insert those updates into the page, then all the
 	 * updates for the next key, and so on.
-	 *
-	 * Search for the block's unique prefix, stepping through any matching
-	 * records.
 	 */
-	cursor->set_key(cursor,
-	    btree_id, ref->page_las->las_pageid, (uint64_t)0, &las_key);
-	if ((ret = cursor->search_near(cursor, &exact)) == 0 && exact < 0)
-		ret = cursor->next(cursor);
-	for (; ret == 0; ret = cursor->next(cursor)) {
+	WT_PUBLISH(cache->las_reader, true);
+	__wt_readlock(session, &cache->las_sweepwalk_lock);
+	WT_PUBLISH(cache->las_reader, false);
+	locked = true;
+	for (ret = __wt_las_cursor_position(cursor, las_pageid);
+	    ret == 0;
+	    ret = cursor->next(cursor)) {
 		WT_ERR(cursor->get_key(cursor,
-		    &las_id, &las_pageid, &las_counter, &las_key));
+		    &las_pageid, &las_id, &las_counter, &las_key));
 
 		/*
 		 * Confirm the search using the unique prefix; if not a match,
 		 * we're done searching for records for this page.
 		 */
-		if (las_id != btree_id ||
-		    las_pageid != ref->page_las->las_pageid)
+		if (las_pageid != ref->page_las->las_pageid)
 			break;
 
 		/* Allocate the WT_UPDATE structure. */
-		WT_ERR(cursor->get_value(cursor,
-		    &las_txnid, &las_timestamp, &upd_type, &las_value));
+		WT_ERR(cursor->get_value(
+		    cursor, &las_txnid, &las_timestamp,
+		    &prepare_state, &upd_type, &las_value));
 		WT_ERR(__wt_update_alloc(
 		    session, &las_value, &upd, &incr, upd_type));
 		total_incr += incr;
 		upd->txnid = las_txnid;
-#ifdef HAVE_TIMESTAMPS
-		WT_ASSERT(session, las_timestamp.size == WT_TIMESTAMP_SIZE);
-		memcpy(&upd->timestamp, las_timestamp.data, las_timestamp.size);
-#endif
+		upd->timestamp = las_timestamp;
+		upd->prepare_state = prepare_state;
 
 		switch (page->type) {
 		case WT_PAGE_COL_FIX:
@@ -174,7 +221,7 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t btree_id)
 			WT_ERR(__wt_buf_set(session,
 			    current_key, las_key.data, las_key.size));
 			break;
-		WT_ILLEGAL_VALUE_ERR(session);
+		WT_ILLEGAL_VALUE_ERR(session, page->type);
 		}
 
 		/* Append the latest update to the list. */
@@ -186,6 +233,8 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t btree_id)
 		}
 		upd = NULL;
 	}
+	__wt_readunlock(session, &cache->las_sweepwalk_lock);
+	locked = false;
 	WT_ERR_NOTFOUND_OK(ret);
 
 	/* Insert the last set of updates, if any. */
@@ -202,7 +251,7 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t btree_id)
 			    current_key, ref, &cbt, first_upd));
 			first_upd = NULL;
 			break;
-		WT_ILLEGAL_VALUE_ERR(session);
+		WT_ILLEGAL_VALUE_ERR(session, page->type);
 		}
 
 	/* Discard the cursor. */
@@ -211,11 +260,39 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t btree_id)
 	if (total_incr != 0) {
 		__wt_cache_page_inmem_incr(session, page, total_incr);
 
-		/* Make sure the page is included in the next checkpoint. */
+		/*
+		 * If the updates in lookaside are newer than the versions on
+		 * the page, it must be included in the next checkpoint.
+		 *
+		 * Otherwise, the page image contained the newest versions of
+		 * data so the updates are all older and we could consider
+		 * marking it clean (i.e., the next checkpoint can use the
+		 * version already on disk).
+		 *
+		 * This needs care because (a) it creates pages with history
+		 * that can't be evicted until they are marked dirty again, and
+		 * (b) checkpoints may need to visit these pages to resolve
+		 * changes evicted while a checkpoint is running.
+		 */
 		page->modify->first_dirty_txn = WT_TXN_FIRST;
+
+		FLD_SET(page->modify->restore_state, WT_PAGE_RS_LOOKASIDE);
+
+		if (ref->page_las->skew_newest &&
+		    !ref->page_las->has_prepares &&
+		    !S2C(session)->txn_global.has_stable_timestamp &&
+		    __wt_txn_visible_all(session, ref->page_las->unstable_txn,
+		    ref->page_las->unstable_timestamp)) {
+			page->modify->rec_max_txn = ref->page_las->max_txn;
+			page->modify->rec_max_timestamp =
+			    ref->page_las->max_timestamp;
+			__wt_page_modify_clear(session, page);
+		}
 	}
 
-err:	WT_TRET(__wt_las_cursor_close(session, &cursor, session_flags));
+err:	if (locked)
+		__wt_readunlock(session, &cache->las_sweepwalk_lock);
+	WT_TRET(__wt_las_cursor_close(session, &cursor, session_flags));
 	WT_TRET(__wt_btcur_close(&cbt, true));
 
 	/*
@@ -251,7 +328,7 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_REF *ref)
 	 * It's hard to imagine a page with a huge memory footprint that has
 	 * never been modified, but check to be sure.
 	 */
-	if (page->modify == NULL)
+	if (__wt_page_evict_clean(page))
 		return (false);
 
 	/* Pages are usually small enough, check that first. */
@@ -280,8 +357,7 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_REF *ref)
 	 * skipping the page indefinitely or large records can lead to
 	 * extremely large memory footprints.
 	 */
-	if (page->modify->update_restored &&
-	    page->modify->last_eviction_id == __wt_txn_oldest_id(session))
+	if (!__wt_page_evict_retry(session, page))
 		return (false);
 
 	/* Trigger eviction on the next page release. */
@@ -292,25 +368,59 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_REF *ref)
 }
 
 /*
+ * __page_read_lookaside --
+ *	Figure out whether to instantiate content from lookaside on
+ *	page access.
+ */
+static inline int
+__page_read_lookaside(WT_SESSION_IMPL *session, WT_REF *ref,
+    uint32_t previous_state, uint32_t *final_statep)
+{
+	/*
+	 * Reading a lookaside ref for the first time, and not requiring the
+	 * history triggers a transition to WT_REF_LIMBO, if we are already
+	 * in limbo and still don't need the history - we are done.
+	 */
+	if (__wt_las_page_skip_locked(session, ref)) {
+		if (previous_state == WT_REF_LOOKASIDE) {
+			WT_STAT_CONN_INCR(
+			    session, cache_read_lookaside_skipped);
+			ref->page_las->eviction_to_lookaside = true;
+		}
+		*final_statep = WT_REF_LIMBO;
+		return (0);
+	}
+
+	/* Instantiate updates from the database's lookaside table. */
+	if (previous_state == WT_REF_LIMBO) {
+		WT_STAT_CONN_INCR(session, cache_read_lookaside_delay);
+		if (WT_SESSION_IS_CHECKPOINT(session))
+			WT_STAT_CONN_INCR(session,
+			    cache_read_lookaside_delay_checkpoint);
+	}
+
+	WT_RET(__las_page_instantiate(session, ref));
+	ref->page_las->eviction_to_lookaside = false;
+	return (0);
+}
+
+/*
  * __page_read --
  *	Read a page from the file.
  */
 static int
-__page_read(WT_SESSION_IMPL *session, WT_REF *ref)
+__page_read(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 {
-	struct timespec start, stop;
-	WT_BTREE *btree;
-	WT_CURSOR *las_cursor;
 	WT_DECL_RET;
 	WT_ITEM tmp;
-	WT_PAGE *page;
+	WT_PAGE *notused;
 	size_t addr_size;
-	uint32_t new_state, previous_state, session_flags;
+	uint64_t time_diff, time_start, time_stop;
+	uint32_t page_flags, final_state, new_state, previous_state;
 	const uint8_t *addr;
 	bool timer;
 
-	btree = S2BT(session);
-	page = NULL;
+	time_start = time_stop = 0;
 
 	/*
 	 * Don't pass an allocated buffer to the underlying block read function,
@@ -321,6 +431,11 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref)
 	/*
 	 * Attempt to set the state to WT_REF_READING for normal reads, or
 	 * WT_REF_LOCKED, for deleted pages or pages with lookaside entries.
+	 * The difference is that checkpoints can skip over clean pages that
+	 * are being read into cache, but need to wait for deletes or lookaside
+	 * updates to be resolved (in order for checkpoint to write the correct
+	 * version of the page).
+	 *
 	 * If successful, we've won the race, read the page.
 	 */
 	switch (previous_state = ref->state) {
@@ -328,6 +443,7 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref)
 		new_state = WT_REF_READING;
 		break;
 	case WT_REF_DELETED:
+	case WT_REF_LIMBO:
 	case WT_REF_LOOKASIDE:
 		new_state = WT_REF_LOCKED;
 		break;
@@ -336,6 +452,12 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref)
 	}
 	if (!__wt_atomic_casv32(&ref->state, previous_state, new_state))
 		return (0);
+
+	final_state = WT_REF_MEM;
+
+	/* If we already have the page image, just instantiate the history. */
+	if (previous_state == WT_REF_LIMBO)
+		goto skip_read;
 
 	/*
 	 * Get the address: if there is no address, the page was deleted or had
@@ -346,11 +468,8 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref)
 	if (addr == NULL) {
 		WT_ASSERT(session, previous_state != WT_REF_DISK);
 
-		WT_ERR(__wt_btree_new_leaf_page(session, &page));
-		ref->page = page;
-		if (previous_state == WT_REF_LOOKASIDE)
-			goto skip_read;
-		goto done;
+		WT_ERR(__wt_btree_new_leaf_page(session, &ref->page));
+		goto skip_read;
 	}
 
 	/*
@@ -359,67 +478,86 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref)
 	 */
 	timer = !F_ISSET(session, WT_SESSION_INTERNAL);
 	if (timer)
-		__wt_epoch(session, &start);
+		time_start = __wt_clock(session);
 	WT_ERR(__wt_bt_read(session, &tmp, addr, addr_size));
 	if (timer) {
-		__wt_epoch(session, &stop);
+		time_stop = __wt_clock(session);
+		time_diff = WT_CLOCKDIFF_US(time_stop, time_start);
 		WT_STAT_CONN_INCR(session, cache_read_app_count);
-		WT_STAT_CONN_INCRV(session, cache_read_app_time,
-		    WT_TIMEDIFF_US(stop, start));
+		WT_STAT_CONN_INCRV(session, cache_read_app_time, time_diff);
+		WT_STAT_SESSION_INCRV(session, read_time, time_diff);
 	}
 
 	/*
 	 * Build the in-memory version of the page. Clear our local reference to
 	 * the allocated copy of the disk image on return, the in-memory object
 	 * steals it.
+	 *
+	 * If a page is read with eviction disabled, we don't count evicting it
+	 * as progress. Since disabling eviction allows pages to be read even
+	 * when the cache is full, we want to avoid workloads repeatedly reading
+	 * a page with eviction disabled (e.g., a metadata page), then evicting
+	 * that page and deciding that is a sign that eviction is unstuck.
 	 */
-	WT_ERR(__wt_page_inmem(session, ref, tmp.data,
-	    WT_DATA_IN_ITEM(&tmp) ?
-	    WT_PAGE_DISK_ALLOC : WT_PAGE_DISK_MAPPED, &page));
+	page_flags =
+	    WT_DATA_IN_ITEM(&tmp) ? WT_PAGE_DISK_ALLOC : WT_PAGE_DISK_MAPPED;
+	if (LF_ISSET(WT_READ_IGNORE_CACHE_SIZE))
+		FLD_SET(page_flags, WT_PAGE_EVICT_NO_PROGRESS);
+	WT_ERR(__wt_page_inmem(session, ref, tmp.data, page_flags, &notused));
 	tmp.mem = NULL;
 
+	/*
+	 * The WT_REF lookaside state should match the page-header state of
+	 * any page we read.
+	 */
+	WT_ASSERT(session,
+	    (previous_state != WT_REF_LIMBO &&
+	    previous_state != WT_REF_LOOKASIDE) ||
+	    ref->page->dsk == NULL ||
+	    F_ISSET(ref->page->dsk, WT_PAGE_LAS_UPDATE));
+
 skip_read:
-	/*
-	 * If reading for a checkpoint, there's no additional work to do, the
-	 * page on disk is correct as written.
-	 */
-	if (session->dhandle->checkpoint != NULL)
-		goto done;
-
-	/* If the page was deleted, instantiate that information. */
-	if (previous_state == WT_REF_DELETED)
-		WT_ERR(__wt_delete_page_instantiate(session, ref));
-
-	/*
-	 * Instantiate updates from the database's lookaside table. The page
-	 * flag was set when the page was written, potentially a long time ago.
-	 * We only care if the lookaside table is currently active, check that
-	 * before doing any work.
-	 */
-	if (previous_state == WT_REF_LOOKASIDE) {
-		WT_ASSERT(session, (ref->page->dsk == NULL ||
-		    F_ISSET(ref->page->dsk, WT_PAGE_LAS_UPDATE)));
-
-		__btree_verbose_lookaside_read(
-		    session, btree->id, ref->page_las->las_pageid);
-		WT_STAT_CONN_INCR(session, cache_read_lookaside);
-		WT_STAT_DATA_INCR(session, cache_read_lookaside);
-		WT_ERR(__las_page_instantiate(session, ref, btree->id));
-
+	switch (previous_state) {
+	case WT_REF_DELETED:
 		/*
-		 * The page is instantiated so we no longer need the lookaside
-		 * entries.  Note that we are discarding updates so the page
-		 * must be marked available even if these operations fail.
+		 * A truncated page may also have lookaside information. The
+		 * delete happened after page eviction (writing the lookaside
+		 * information), first update based on the lookaside table and
+		 * then apply the delete.
 		 */
-		__wt_las_cursor(session, &las_cursor, &session_flags);
-		WT_TRET(__wt_las_remove_block(
-		    session, las_cursor, btree->id, ref->page_las->las_pageid));
-		__wt_free(session, ref->page_las);
-		WT_TRET(__wt_las_cursor_close(
-		    session, &las_cursor, session_flags));
+		if (ref->page_las != NULL) {
+			WT_ERR(__las_page_instantiate(session, ref));
+			ref->page_las->eviction_to_lookaside = false;
+		}
+
+		/* Move all records to a deleted state. */
+		WT_ERR(__wt_delete_page_instantiate(session, ref));
+		break;
+	case WT_REF_LIMBO:
+	case WT_REF_LOOKASIDE:
+		WT_ERR(__page_read_lookaside(
+		    session, ref, previous_state, &final_state));
+		break;
 	}
 
-done:	WT_PUBLISH(ref->state, WT_REF_MEM);
+	/*
+	 * Once the page is instantiated, we no longer need the history in
+	 * lookaside.  We leave the lookaside sweep thread to do most cleanup,
+	 * but it can only remove committed updates and keys that skew newest
+	 * (if there are entries in the lookaside newer than the page, they need
+	 * to be read back into cache or they will be lost).
+	 *
+	 * Prepared updates can not be removed by the lookaside sweep, remove
+	 * them as we read the page back in memory.
+	 *
+	 * Don't free WT_REF.page_las, there may be concurrent readers.
+	 */
+	if (final_state == WT_REF_MEM && ref->page_las != NULL &&
+	    (!ref->page_las->skew_newest || ref->page_las->has_prepares))
+		WT_ERR(__wt_las_remove_block(
+		    session, ref->page_las->las_pageid));
+
+	WT_REF_SET_STATE(ref, final_state);
 	return (ret);
 
 err:	/*
@@ -427,9 +565,9 @@ err:	/*
 	 * it discarded the page, but not the disk image.  Discard the page
 	 * and separately discard the disk image in all cases.
 	 */
-	if (ref->page != NULL)
+	if (ref->page != NULL && previous_state != WT_REF_LIMBO)
 		__wt_ref_out(session, ref);
-	WT_PUBLISH(ref->state, previous_state);
+	WT_REF_SET_STATE(ref, previous_state);
 
 	__wt_buf_free(session, &tmp);
 
@@ -444,18 +582,29 @@ err:	/*
 int
 __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 #ifdef HAVE_DIAGNOSTIC
-    , const char *file, int line
+    , const char *func, int line
 #endif
     )
 {
 	WT_BTREE *btree;
 	WT_DECL_RET;
 	WT_PAGE *page;
-	uint64_t sleep_cnt, wait_cnt;
+	uint64_t sleep_usecs, yield_cnt;
+	uint32_t current_state;
 	int force_attempts;
 	bool busy, cache_work, did_read, stalled, wont_need;
 
 	btree = S2BT(session);
+
+	if (F_ISSET(session, WT_SESSION_IGNORE_CACHE_SIZE))
+		LF_SET(WT_READ_IGNORE_CACHE_SIZE);
+
+	/* Sanity check flag combinations. */
+	WT_ASSERT(session, !LF_ISSET(
+	    WT_READ_DELETED_SKIP | WT_READ_NO_WAIT | WT_READ_LOOKASIDE) ||
+	    LF_ISSET(WT_READ_CACHE));
+	WT_ASSERT(session, !LF_ISSET(WT_READ_DELETED_CHECK) ||
+	    !LF_ISSET(WT_READ_DELETED_SKIP));
 
 	/*
 	 * Ignore reads of pages already known to be in cache, otherwise the
@@ -467,43 +616,46 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 	}
 
 	for (did_read = wont_need = stalled = false,
-	    force_attempts = 0, sleep_cnt = wait_cnt = 0;;) {
-		switch (ref->state) {
+	    force_attempts = 0, sleep_usecs = yield_cnt = 0;;) {
+		switch (current_state = ref->state) {
 		case WT_REF_DELETED:
-			if (LF_ISSET(WT_READ_NO_EMPTY) &&
+			if (LF_ISSET(WT_READ_DELETED_SKIP | WT_READ_NO_WAIT))
+				return (WT_NOTFOUND);
+			if (LF_ISSET(WT_READ_DELETED_CHECK) &&
 			    __wt_delete_page_skip(session, ref, false))
 				return (WT_NOTFOUND);
-			/* FALLTHROUGH */
-		case WT_REF_DISK:
+			goto read;
 		case WT_REF_LOOKASIDE:
 			if (LF_ISSET(WT_READ_CACHE)) {
-				if (ref->state != WT_REF_LOOKASIDE ||
-				    !LF_ISSET(WT_READ_LOOKASIDE))
+				if (!LF_ISSET(WT_READ_LOOKASIDE))
 					return (WT_NOTFOUND);
-#ifdef HAVE_TIMESTAMPS
 				/*
-				 * Skip lookaside pages if reading as of a
-				 * timestamp and all the updates are in the
-				 * future.
+				 * If we skip a lookaside page, the tree
+				 * cannot be left clean: lookaside entries
+				 * must be resolved before the tree can be
+				 * discarded.
 				 */
-				if (F_ISSET(
-				    &session->txn, WT_TXN_HAS_TS_READ) &&
-				    __wt_timestamp_cmp(
-				    &ref->page_las->min_timestamp,
-				    &session->txn.read_timestamp) > 0)
+				if (__wt_las_page_skip(session, ref)) {
+					__wt_tree_modify_set(session);
 					return (WT_NOTFOUND);
-#endif
+				}
 			}
+			goto read;
+		case WT_REF_DISK:
+			if (LF_ISSET(WT_READ_CACHE))
+				return (WT_NOTFOUND);
 
-			/*
-			 * The page isn't in memory, read it. If this thread is
-			 * allowed to do eviction work, check for space in the
+read:			/*
+			 * The page isn't in memory, read it. If this thread
+			 * respects the cache size, check for space in the
 			 * cache.
 			 */
-			if (!LF_ISSET(WT_READ_NO_EVICT))
+			if (!LF_ISSET(WT_READ_IGNORE_CACHE_SIZE))
 				WT_RET(__wt_cache_eviction_check(
-				    session, 1, NULL));
-			WT_RET(__page_read(session, ref));
+				    session, true,
+				    !F_ISSET(&session->txn, WT_TXN_HAS_ID),
+				    NULL));
+			WT_RET(__page_read(session, ref, flags));
 
 			/*
 			 * We just read a page, don't evict it before we have a
@@ -520,7 +672,7 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 			 * we "acquire" it.
 			 */
 			wont_need = LF_ISSET(WT_READ_WONT_NEED) ||
-			    F_ISSET(session, WT_SESSION_NO_CACHE);
+			    F_ISSET(session, WT_SESSION_READ_WONT_NEED);
 			continue;
 		case WT_REF_READING:
 			if (LF_ISSET(WT_READ_CACHE))
@@ -542,6 +694,7 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 			break;
 		case WT_REF_SPLIT:
 			return (WT_RESTART);
+		case WT_REF_LIMBO:
 		case WT_REF_MEM:
 			/*
 			 * The page is in memory.
@@ -559,7 +712,7 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 			 */
 #ifdef HAVE_DIAGNOSTIC
 			WT_RET(
-			    __wt_hazard_set(session, ref, &busy, file, line));
+			    __wt_hazard_set(session, ref, &busy, func, line));
 #else
 			WT_RET(__wt_hazard_set(session, ref, &busy));
 #endif
@@ -567,16 +720,37 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 				WT_STAT_CONN_INCR(session, page_busy_blocked);
 				break;
 			}
+			/*
+			 * If we are a limbo page check whether we need to
+			 * instantiate the history. By having a hazard pointer
+			 * we can use the locked version.
+			 */
+			if (current_state == WT_REF_LIMBO &&
+			    ((!LF_ISSET(WT_READ_CACHE) ||
+			    LF_ISSET(WT_READ_LOOKASIDE)) &&
+			    !__wt_las_page_skip_locked(session, ref))) {
+				WT_RET(__wt_hazard_clear(session, ref));
+				goto read;
+			}
+			if (current_state == WT_REF_LIMBO &&
+			    LF_ISSET(WT_READ_CACHE) &&
+			    LF_ISSET(WT_READ_LOOKASIDE))
+				__wt_tree_modify_set(session);
 
 			/*
-			 * If eviction is configured for this file, check to see
-			 * if the page qualifies for forced eviction and update
-			 * the page's generation number. If eviction isn't being
-			 * done on this file, we're done.
+			 * Check if the page requires forced eviction.
 			 */
-			if (did_read || LF_ISSET(WT_READ_NO_EVICT) ||
-			    F_ISSET(session, WT_SESSION_NO_EVICTION) ||
+			if (did_read || LF_ISSET(WT_READ_NO_SPLIT) ||
 			    btree->evict_disabled > 0 || btree->lsm_primary)
+				goto skip_evict;
+
+			/*
+			 * If reconciliation is disabled (e.g., when inserting
+			 * into the lookaside table), skip forced eviction if
+			 * the page can't split.
+			 */
+			if (F_ISSET(session, WT_SESSION_NO_RECONCILE) &&
+			    !__wt_leaf_page_can_split(session, ref->page))
 				goto skip_evict;
 
 			/*
@@ -588,7 +762,7 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 				ret = __wt_page_release_evict(session, ref);
 				/* If forced eviction fails, stall. */
 				if (ret == EBUSY) {
-					ret = 0;
+					WT_NOT_READ(ret, 0);
 					WT_STAT_CONN_INCR(session,
 					    page_forcible_evict_blocked);
 					stalled = true;
@@ -606,7 +780,7 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 				continue;
 			}
 
-			/*
+skip_evict:		/*
 			 * If we read the page and are configured to not trash
 			 * the cache, and no other thread has already used the
 			 * page, set the read generation so the page is evicted
@@ -625,15 +799,25 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 					__wt_cache_read_gen_new(session, page);
 			} else if (!LF_ISSET(WT_READ_NO_GEN))
 				__wt_cache_read_gen_bump(session, page);
-skip_evict:
+
 			/*
 			 * Check if we need an autocommit transaction.
 			 * Starting a transaction can trigger eviction, so skip
 			 * it if eviction isn't permitted.
+			 *
+			 * The logic here is a little weird: some code paths do
+			 * a blanket ban on checking the cache size in
+			 * sessions, but still require a transaction (e.g.,
+			 * when updating metadata or lookaside).  If
+			 * WT_READ_IGNORE_CACHE_SIZE was passed in explicitly,
+			 * we're done. If we set WT_READ_IGNORE_CACHE_SIZE
+			 * because it was set in the session then make sure we
+			 * start a transaction.
 			 */
-			return (LF_ISSET(WT_READ_NO_EVICT) ? 0 :
-			    __wt_txn_autocommit_check(session));
-		WT_ILLEGAL_VALUE(session);
+			return (LF_ISSET(WT_READ_IGNORE_CACHE_SIZE) &&
+			    !F_ISSET(session, WT_SESSION_IGNORE_CACHE_SIZE) ?
+			    0 : __wt_txn_autocommit_check(session));
+		WT_ILLEGAL_VALUE(session, current_state);
 		}
 
 		/*
@@ -641,11 +825,13 @@ skip_evict:
 		 * we've yielded enough times, start sleeping so we don't burn
 		 * CPU to no purpose.
 		 */
-		if (stalled)
-			wait_cnt += WT_THOUSAND;
-		else if (++wait_cnt < WT_THOUSAND) {
-			__wt_yield();
-			continue;
+		if (yield_cnt < WT_THOUSAND) {
+			if (!stalled) {
+				++yield_cnt;
+				__wt_yield();
+				continue;
+			}
+			yield_cnt = WT_THOUSAND;
 		}
 
 		/*
@@ -653,59 +839,15 @@ skip_evict:
 		 * check if the cache needs help. If we do work for the cache,
 		 * substitute that for a sleep.
 		 */
-		if (!LF_ISSET(WT_READ_NO_EVICT)) {
-			WT_RET(
-			    __wt_cache_eviction_check(session, 1, &cache_work));
+		if (!LF_ISSET(WT_READ_IGNORE_CACHE_SIZE)) {
+			WT_RET(__wt_cache_eviction_check(
+			    session, true,
+			    !F_ISSET(&session->txn, WT_TXN_HAS_ID),
+			    &cache_work));
 			if (cache_work)
 				continue;
 		}
-		__wt_ref_state_yield_sleep(&wait_cnt, &sleep_cnt);
-		WT_STAT_CONN_INCRV(session, page_sleep, sleep_cnt);
+		__wt_spin_backoff(&yield_cnt, &sleep_usecs);
+		WT_STAT_CONN_INCRV(session, page_sleep, sleep_usecs);
 	}
-}
-
-/*
- * __btree_verbose_lookaside_read --
- *	Create a verbose message to display at most once per checkpoint when
- *	performing a lookaside table read.
- */
-static void
-__btree_verbose_lookaside_read(
-    WT_SESSION_IMPL *session, uint32_t las_id, uint64_t las_pageid)
-{
-#ifdef HAVE_VERBOSE
-	WT_CONNECTION_IMPL *conn;
-	uint64_t ckpt_gen_current, ckpt_gen_last;
-
-	if (!WT_VERBOSE_ISSET(session, WT_VERB_LOOKASIDE))
-		return;
-
-	conn = S2C(session);
-	ckpt_gen_current = __wt_gen(session, WT_GEN_CHECKPOINT);
-	ckpt_gen_last = conn->las_verb_gen_read;
-
-	/*
-	 * This message is throttled to one per checkpoint. To do this we
-	 * track the generation of the last checkpoint for which the message
-	 * was printed and check against the current checkpoint generation.
-	 */
-	if (ckpt_gen_current > ckpt_gen_last) {
-		/*
-		 * Attempt to atomically replace the last checkpoint generation
-		 * for which this message was printed. If the atomic swap fails
-		 * we have raced and the winning thread will print the message.
-		 */
-		if (__wt_atomic_casv64(&conn->las_verb_gen_read,
-			ckpt_gen_last, ckpt_gen_current)) {
-			__wt_verbose(session, WT_VERB_LOOKASIDE,
-			    "Read from lookaside file triggered for "
-			    "file ID %" PRIu32 ", page ID %" PRIu64,
-			    las_id, las_pageid);
-		}
-	}
-#else
-	WT_UNUSED(session);
-	WT_UNUSED(las_id);
-	WT_UNUSED(las_pageid);
-#endif
 }

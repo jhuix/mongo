@@ -12,7 +12,6 @@
  *     name {string}: name for this test
  *     verbose {number}: the verbosity for the mongos
  *     chunkSize {number}: the chunk size to use as configuration for the cluster
- *     nopreallocj {boolean|number}:
  *
  *     mongos {number|Object|Array.<Object>}: number of mongos or mongos
  *       configuration object(s)(*). @see MongoRunner.runMongos
@@ -54,10 +53,11 @@
  *          options take precedence.
  *
  *     other: {
- *       nopreallocj: same as above
  *       rs: same as above
  *       chunkSize: same as above
  *       keyFile {string}: the location of the keyFile
+ *       shardAsReplicaSet {boolean}: if true, start shards as 2 node replica sets. default
+ *          is true.
  *
  *       shardOptions {Object}: same as the shards property above.
  *          Can be used to specify options that are common all shards.
@@ -376,12 +376,16 @@ var ShardingTest = function(params) {
         }
     };
 
-    this.stop = function(opts) {
-        this.checkUUIDsConsistentAcrossCluster();
-
+    this.stopAllMongos = function(opts) {
         for (var i = 0; i < this._mongos.length; i++) {
             this.stopMongos(i, opts);
         }
+    };
+
+    this.stop = function(opts) {
+        this.checkUUIDsConsistentAcrossCluster();
+
+        this.stopAllMongos(opts);
 
         for (var i = 0; i < this._connections.length; i++) {
             if (this._rs[i]) {
@@ -400,8 +404,11 @@ var ShardingTest = function(params) {
             }
         }
 
-        for (var i = 0; i < _alldbpaths.length; i++) {
-            resetDbpath(MongoRunner.dataPath + _alldbpaths[i]);
+        if (!opts || !opts.noCleanData) {
+            print("ShardingTest stop deleting all dbpaths");
+            for (var i = 0; i < _alldbpaths.length; i++) {
+                resetDbpath(MongoRunner.dataPath + _alldbpaths[i]);
+            }
         }
 
         var timeMillis = new Date().getTime() - _startTime.getTime();
@@ -422,6 +429,12 @@ var ShardingTest = function(params) {
             return true;
 
         throw _getErrorWithCode(res, "command " + tojson(cmd) + " failed: " + tojson(res));
+    };
+
+    this.forEachConnection = function(fn) {
+        this._connections.forEach(function(conn) {
+            fn(conn);
+        });
     };
 
     this.printChangeLog = function() {
@@ -667,24 +680,16 @@ var ShardingTest = function(params) {
         }
 
         if (!_isSharded(dbName)) {
-            this.s.adminCommand({enableSharding: dbName});
+            assert.commandWorked(this.s.adminCommand({enableSharding: dbName}));
         }
 
-        var result = this.s.adminCommand({shardcollection: c, key: key});
-        if (!result.ok) {
-            printjson(result);
-            assert(false);
-        }
+        var result = assert.commandWorked(this.s.adminCommand({shardcollection: c, key: key}));
 
         if (split == false) {
             return;
         }
 
-        result = this.s.adminCommand({split: c, middle: split});
-        if (!result.ok) {
-            printjson(result);
-            assert(false);
-        }
+        result = assert.commandWorked(this.s.adminCommand({split: c, middle: split}));
 
         if (move == false) {
             return;
@@ -701,8 +706,7 @@ var ShardingTest = function(params) {
             sleep(5 * 1000);
         }
 
-        printjson(result);
-        assert(result.ok);
+        assert.commandWorked(result);
     };
 
     /**
@@ -823,7 +827,6 @@ var ShardingTest = function(params) {
      */
     this.restartMongod = function(n, opts, beforeRestartCallback) {
         var mongod;
-
         if (otherParams.useBridge) {
             mongod = unbridgedConnections[n];
         } else {
@@ -877,9 +880,31 @@ var ShardingTest = function(params) {
     };
 
     /**
+     * Restarts each node in a particular shard replica set using the shard's original startup
+     * options by default.
+     *
+     * Option { startClean : true } forces clearing the data directory.
+     * Option { auth : Object } object that contains the auth details for admin credentials.
+     *   Should contain the fields 'user' and 'pwd'
+     *
+     *
+     * @param {int} shard server number (0, 1, 2, ...) to be restarted
+     */
+    this.restartShardRS = function(n, options, signal, wait) {
+        for (let i = 0; i < this["rs" + n].nodeList().length; i++) {
+            this["rs" + n].restart(i);
+        }
+
+        this["rs" + n].awaitSecondaryNodes();
+        this._connections[n] = new Mongo(this["rs" + n].getURL());
+        this["shard" + n] = this._connections[n];
+    };
+
+    /**
      * Stops and restarts a config server mongod process.
      *
-     * If opts is specified, the new mongod is started using those options. Otherwise, it is started
+     * If opts is specified, the new mongod is started using those options. Otherwise, it is
+     * started
      * with its previous parameters.
      *
      * Warning: Overwrites the old cn/confign member variables.
@@ -1028,6 +1053,8 @@ var ShardingTest = function(params) {
     var mongosVerboseLevel = otherParams.hasOwnProperty('verbose') ? otherParams.verbose : 1;
     var numMongos = otherParams.hasOwnProperty('mongos') ? otherParams.mongos : 1;
     var numConfigs = otherParams.hasOwnProperty('config') ? otherParams.config : 3;
+    var startShardsAsRS =
+        otherParams.hasOwnProperty('shardAsReplicaSet') ? otherParams.shardAsReplicaSet : true;
 
     // Default enableBalancer to false.
     otherParams.enableBalancer =
@@ -1039,8 +1066,8 @@ var ShardingTest = function(params) {
     }
 
     // Allow specifying mixed-type options like this:
-    // { mongos : [ { noprealloc : "" } ],
-    //   config : [ { smallfiles : "" } ],
+    // { mongos : [ { bind_ip : "localhost" } ],
+    //   config : [ { nojournal : "" } ],
     //   shards : { rs : true, d : true } }
     if (Array.isArray(numShards)) {
         for (var i = 0; i < numShards.length; i++) {
@@ -1052,6 +1079,7 @@ var ShardingTest = function(params) {
         var tempCount = 0;
         for (var i in numShards) {
             otherParams[i] = numShards[i];
+
             tempCount++;
         }
 
@@ -1108,43 +1136,116 @@ var ShardingTest = function(params) {
 
     var pathOpts = {testName: testName};
 
-    for (var k in otherParams) {
-        if (k.startsWith("rs") && otherParams[k] != undefined) {
-            break;
-        }
-    }
-
     this._connections = [];
     this._rs = [];
     this._rsObjects = [];
 
+    let unbridgedConnections;
+    let unbridgedConfigServers;
+    let unbridgedMongos;
+    let _makeAllocatePortFn;
+    let _allocatePortForMongos;
+    let _allocatePortForBridgeForMongos;
+    let _allocatePortForShard;
+    let _allocatePortForBridgeForShard;
+
     if (otherParams.useBridge) {
-        var unbridgedConnections = [];
-        var unbridgedConfigServers = [];
-        var unbridgedMongos = [];
+        unbridgedConnections = [];
+        unbridgedConfigServers = [];
+        unbridgedMongos = [];
+
+        _makeAllocatePortFn = (preallocatedPorts, errorMessage) => {
+            let idxNextNodePort = 0;
+
+            return function() {
+                if (idxNextNodePort >= preallocatedPorts.length) {
+                    throw new Error(errorMessage(preallocatedPorts.length));
+                }
+
+                const nextPort = preallocatedPorts[idxNextNodePort];
+                ++idxNextNodePort;
+                return nextPort;
+            };
+        };
+
+        let errorMessage = (length) =>
+            "Cannot use more than " + length + " mongos processes when useBridge=true";
+        _allocatePortForBridgeForMongos =
+            _makeAllocatePortFn(allocatePorts(MongoBridge.kBridgeOffset), errorMessage);
+        _allocatePortForMongos =
+            _makeAllocatePortFn(allocatePorts(MongoBridge.kBridgeOffset), errorMessage);
+
+        errorMessage = (length) =>
+            "Cannot use more than " + length + " stand-alone shards when useBridge=true";
+        _allocatePortForBridgeForShard =
+            _makeAllocatePortFn(allocatePorts(MongoBridge.kBridgeOffset), errorMessage);
+        _allocatePortForShard =
+            _makeAllocatePortFn(allocatePorts(MongoBridge.kBridgeOffset), errorMessage);
+    } else {
+        _allocatePortForBridgeForShard = _allocatePortForBridgeForMongos = function() {
+            throw new Error("Using mongobridge isn't enabled for this sharded cluster");
+        };
+        _allocatePortForShard = _allocatePortForMongos = allocatePort;
     }
 
     // Start the MongoD servers (shards)
     for (var i = 0; i < numShards; i++) {
-        if (otherParams.rs || otherParams["rs" + i]) {
+        if (otherParams.rs || otherParams["rs" + i] || startShardsAsRS) {
             var setName = testName + "-rs" + i;
 
             var rsDefaults = {
                 useHostname: otherParams.useHostname,
-                noJournalPrealloc: otherParams.nopreallocj,
                 oplogSize: 16,
                 shardsvr: '',
                 pathOpts: Object.merge(pathOpts, {shard: i}),
             };
 
-            rsDefaults = Object.merge(rsDefaults, otherParams.rs);
-            rsDefaults = Object.merge(rsDefaults, otherParams.rsOptions);
-            rsDefaults = Object.merge(rsDefaults, otherParams["rs" + i]);
-            rsDefaults.nodes = rsDefaults.nodes || otherParams.numReplicas;
+            if (otherParams.rs || otherParams["rs" + i]) {
+                if (otherParams.rs) {
+                    rsDefaults = Object.merge(rsDefaults, otherParams.rs);
+                }
+                if (otherParams["rs" + i]) {
+                    rsDefaults = Object.merge(rsDefaults, otherParams["rs" + i]);
+                }
+                rsDefaults = Object.merge(rsDefaults, otherParams.rsOptions);
+                rsDefaults.nodes = rsDefaults.nodes || otherParams.numReplicas;
+            }
+
+            if (startShardsAsRS && !(otherParams.rs || otherParams["rs" + i])) {
+                if (jsTestOptions().shardMixedBinVersions) {
+                    if (!otherParams.shardOptions) {
+                        otherParams.shardOptions = {};
+                    }
+                    // If the test doesn't depend on specific shard binVersions, create a mixed
+                    // version
+                    // shard cluster that randomly assigns shard binVersions, half "latest" and half
+                    // "last-stable".
+                    if (!otherParams.shardOptions.binVersion) {
+                        Random.setRandomSeed();
+                        otherParams.shardOptions.binVersion =
+                            MongoRunner.versionIterator(["latest", "last-stable"], true);
+                    }
+                }
+
+                if (otherParams.shardOptions && otherParams.shardOptions.binVersion) {
+                    otherParams.shardOptions.binVersion =
+                        MongoRunner.versionIterator(otherParams.shardOptions.binVersion);
+                }
+
+                rsDefaults = Object.merge(rsDefaults, otherParams["d" + i]);
+                rsDefaults = Object.merge(rsDefaults, otherParams.shardOptions);
+            }
+
             var rsSettings = rsDefaults.settings;
             delete rsDefaults.settings;
 
-            var numReplicas = rsDefaults.nodes || 3;
+            // If both rs and startShardsAsRS are specfied, the number of nodes
+            // in the rs field should take priority.
+            if (otherParams.rs || otherParams["rs" + i]) {
+                var numReplicas = rsDefaults.nodes || 3;
+            } else if (startShardsAsRS) {
+                var numReplicas = 1;
+            }
             delete rsDefaults.nodes;
 
             var protocolVersion = rsDefaults.protocolVersion;
@@ -1182,7 +1283,6 @@ var ShardingTest = function(params) {
         } else {
             var options = {
                 useHostname: otherParams.useHostname,
-                noJournalPrealloc: otherParams.nopreallocj,
                 pathOpts: Object.merge(pathOpts, {shard: i}),
                 dbpath: "$testName$shard",
                 shardsvr: '',
@@ -1211,13 +1311,14 @@ var ShardingTest = function(params) {
             options = Object.merge(options, otherParams.shardOptions);
             options = Object.merge(options, otherParams["d" + i]);
 
-            options.port = options.port || allocatePort();
+            options.port = options.port || _allocatePortForShard();
 
             if (otherParams.useBridge) {
                 var bridgeOptions =
                     Object.merge(otherParams.bridgeOptions, options.bridgeOptions || {});
                 bridgeOptions = Object.merge(bridgeOptions, {
                     hostName: otherParams.useHostname ? hostName : "localhost",
+                    port: _allocatePortForBridgeForShard(),
                     // The mongod processes identify themselves to mongobridge as host:port, where
                     // the host is the actual hostname of the machine and not localhost.
                     dest: hostName + ":" + options.port,
@@ -1250,7 +1351,7 @@ var ShardingTest = function(params) {
 
     // Do replication on replica sets if required
     for (var i = 0; i < numShards; i++) {
-        if (!otherParams.rs && !otherParams["rs" + i]) {
+        if (!otherParams.rs && !otherParams["rs" + i] && !startShardsAsRS) {
             continue;
         }
 
@@ -1291,7 +1392,6 @@ var ShardingTest = function(params) {
         // Ensure that journaling is always enabled for config servers.
         journal: "",
         configsvr: "",
-        noJournalPrealloc: otherParams.nopreallocj,
         storageEngine: "wiredTiger",
     };
 
@@ -1344,7 +1444,7 @@ var ShardingTest = function(params) {
         options = Object.merge(options, otherParams.mongosOptions);
         options = Object.merge(options, otherParams["s" + i]);
 
-        options.port = options.port || allocatePort();
+        options.port = options.port || _allocatePortForMongos();
 
         mongosOptions.push(options);
     }
@@ -1352,7 +1452,7 @@ var ShardingTest = function(params) {
     const configRS = this.configRS;
     if (_hasNewFeatureCompatibilityVersion() && _isMixedVersionCluster()) {
         function setFeatureCompatibilityVersion() {
-            assert.commandWorked(csrsPrimary.adminCommand({setFeatureCompatibilityVersion: '3.4'}));
+            assert.commandWorked(csrsPrimary.adminCommand({setFeatureCompatibilityVersion: '4.0'}));
 
             // Wait for the new featureCompatibilityVersion to propagate to all nodes in the CSRS
             // to ensure that older versions of mongos can successfully connect.
@@ -1411,6 +1511,7 @@ var ShardingTest = function(params) {
                 Object.merge(otherParams.bridgeOptions, options.bridgeOptions || {});
             bridgeOptions = Object.merge(bridgeOptions, {
                 hostName: otherParams.useHostname ? hostName : "localhost",
+                port: _allocatePortForBridgeForMongos(),
                 // The mongos processes identify themselves to mongobridge as host:port, where the
                 // host is the actual hostname of the machine and not localhost.
                 dest: hostName + ":" + options.port,
@@ -1424,7 +1525,7 @@ var ShardingTest = function(params) {
             throw new Error("Failed to start mongos " + i);
         }
 
-        if (options.causallyConsistent) {
+        if (otherParams.causallyConsistent) {
             conn.setCausalConsistency(true);
         }
 

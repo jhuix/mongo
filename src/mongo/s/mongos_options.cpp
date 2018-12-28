@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -41,12 +43,11 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_options_helpers.h"
+#include "mongo/db/server_options_server_helpers.h"
 #include "mongo/s/version_mongos.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
-#include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/stringutils.h"
@@ -72,15 +73,6 @@ Status addMongosOptions(moe::OptionSection* options) {
     }
 #endif
 
-#ifdef MONGO_CONFIG_SSL
-    moe::OptionSection ssl_options("SSL options");
-
-    ret = addSSLServerOptions(&ssl_options);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
-
     moe::OptionSection sharding_options("Sharding options");
 
     sharding_options.addOptionChaining("sharding.configDB",
@@ -98,10 +90,26 @@ Status addMongosOptions(moe::OptionSection* options) {
     sharding_options.addOptionChaining("test", "test", moe::Switch, "just run unit tests")
         .setSources(moe::SourceAllLegacy);
 
+    /** Javascript Options
+     *  As a general rule, js enable/disable options are ignored for mongos.
+     *  However, we define and hide these options so that if someone
+     *  were to use these args in a set of options meant for both
+     *  mongos and mongod runs, the mongos won't fail on an unknown argument.
+     *
+     *  These options have no affect on how the mongos runs.
+     *  Setting either or both to *any* value will provoke a warning message
+     *  and nothing more.
+     */
     sharding_options
         .addOptionChaining("noscripting", "noscripting", moe::Switch, "disable scripting engine")
+        .hidden()
         .setSources(moe::SourceAllLegacy);
 
+    general_options
+        .addOptionChaining(
+            "security.javascriptEnabled", "", moe::Bool, "Enable javascript execution")
+        .hidden()
+        .setSources(moe::SourceYAMLConfig);
 
     options->addSection(general_options).transitional_ignore();
 
@@ -110,10 +118,6 @@ Status addMongosOptions(moe::OptionSection* options) {
 #endif
 
     options->addSection(sharding_options).transitional_ignore();
-
-#ifdef MONGO_CONFIG_SSL
-    options->addSection(ssl_options).transitional_ignore();
-#endif
 
     return Status::OK();
 }
@@ -157,13 +161,6 @@ Status canonicalizeMongosOptions(moe::Environment* params) {
         return ret;
     }
 
-#ifdef MONGO_CONFIG_SSL
-    ret = canonicalizeSSLServerOptions(params);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
-
     return Status::OK();
 }
 
@@ -185,8 +182,9 @@ Status storeMongosOptions(const moe::Environment& params) {
             params["replication.localPingThresholdMs"].as<int>();
     }
 
-    if (params.count("noscripting")) {
-        // This option currently has no effect for mongos
+    if (params.count("noscripting") || params.count("security.javascriptEnabled")) {
+        warning() << "The Javascript enabled/disabled options are not supported for mongos. "
+                     "(\"noscripting\" and/or \"security.javascriptEnabled\" are set.)";
     }
 
     if (!params.count("sharding.configDB")) {

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,20 +37,25 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/callback_completion_guard.h"
 #include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
+#include "mongo/db/repl/database_cloner.h"
 #include "mongo/db/repl/multiapplier.h"
+#include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/rollback_checker.h"
 #include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/net/hostandport.h"
 
@@ -57,17 +64,17 @@ namespace repl {
 
 // TODO: Remove forward declares once we remove rs_initialsync.cpp and other dependents.
 // Failpoint which fails initial sync and leaves an oplog entry in the buffer.
-MONGO_FP_FORWARD_DECLARE(failInitSyncWithBufferedEntriesLeft);
+MONGO_FAIL_POINT_DECLARE(failInitSyncWithBufferedEntriesLeft);
 
 // Failpoint which causes the initial sync function to hang before copying databases.
-MONGO_FP_FORWARD_DECLARE(initialSyncHangBeforeCopyingDatabases);
+MONGO_FAIL_POINT_DECLARE(initialSyncHangBeforeCopyingDatabases);
 
 // Failpoint which causes the initial sync function to hang before calling shouldRetry on a failed
 // operation.
-MONGO_FP_FORWARD_DECLARE(initialSyncHangBeforeGettingMissingDocument);
+MONGO_FAIL_POINT_DECLARE(initialSyncHangBeforeGettingMissingDocument);
 
 // Failpoint which stops the applier.
-MONGO_FP_FORWARD_DECLARE(rsSyncApplyStop);
+MONGO_FAIL_POINT_DECLARE(rsSyncApplyStop);
 
 struct InitialSyncState;
 struct MemberState;
@@ -79,16 +86,14 @@ struct InitialSyncerOptions {
     using GetMyLastOptimeFn = stdx::function<OpTime()>;
 
     /** Function to update optime of last operation applied on this node */
-    using SetMyLastOptimeFn = stdx::function<void(const OpTime&)>;
+    using SetMyLastOptimeFn =
+        stdx::function<void(const OpTime&, ReplicationCoordinator::DataConsistency consistency)>;
 
     /** Function to reset all optimes on this node (e.g. applied & durable). */
     using ResetOptimesFn = stdx::function<void()>;
 
     /** Function to sets this node into a specific follower mode. */
     using SetFollowerModeFn = stdx::function<bool(const MemberState&)>;
-
-    /** Function to get this node's slaveDelay. */
-    using GetSlaveDelayFn = stdx::function<Seconds()>;
 
     // Error and retry values
     Milliseconds syncSourceRetryWait{1000};
@@ -102,10 +107,6 @@ struct InitialSyncerOptions {
     // SyncTail::tryPopAndWaitForMore().
     Milliseconds getApplierBatchCallbackRetryWait{1000};
 
-    // Batching settings.
-    std::uint32_t replBatchLimitBytes = 512 * 1024 * 1024;
-    std::uint32_t replBatchLimitOperations = 5000;
-
     // Replication settings
     NamespaceString localOplogNS = NamespaceString("local.oplog.rs");
     NamespaceString remoteOplogNS = NamespaceString("local.oplog.rs");
@@ -113,7 +114,6 @@ struct InitialSyncerOptions {
     GetMyLastOptimeFn getMyLastOptime;
     SetMyLastOptimeFn setMyLastOptime;
     ResetOptimesFn resetOptimes;
-    GetSlaveDelayFn getSlaveDelay;
 
     SyncSourceSelector* syncSourceSelector = nullptr;
 
@@ -153,6 +153,8 @@ public:
      */
     using OnCompletionGuard = CallbackCompletionGuard<StatusWith<OpTimeWithHash>>;
 
+    using StartCollectionClonerFn = DatabaseCloner::StartCollectionClonerFn;
+
     struct InitialSyncAttemptInfo {
         int durationMillis;
         Status status;
@@ -177,6 +179,7 @@ public:
 
     InitialSyncer(InitialSyncerOptions opts,
                   std::unique_ptr<DataReplicatorExternalState> dataReplicatorExternalState,
+                  ThreadPool* writerPool,
                   StorageInterface* storage,
                   ReplicationProcess* replicationProcess,
                   const OnCompletionFn& onCompletion);
@@ -219,7 +222,14 @@ public:
      *
      * For testing only.
      */
-    void setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
+    void setScheduleDbWorkFn_forTest(const DatabaseCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
+
+    /**
+     * Overrides how executor starts a collection cloner.
+     *
+     * For testing only.
+     */
+    void setStartCollectionClonerFn(const StartCollectionClonerFn& startCollectionCloner);
 
     // State transitions:
     // PreStart --> Running --> ShuttingDown --> Complete
@@ -287,6 +297,10 @@ private:
      *         |
      *         V
      *    _lastOplogEntryFetcherCallbackForBeginTimestamp()
+     *         |
+     *         |
+     *         V
+     *    _fcvFetcherCallback()
      *         |
      *         |
      *         +------------------------------+
@@ -389,6 +403,15 @@ private:
         const StatusWith<Fetcher::QueryResponse>& result,
         std::shared_ptr<OnCompletionGuard> onCompletionGuard);
 
+
+    /**
+     * Callback for the '_fCVFetcher'. A successful response lets us check if the remote node
+     * is in a currently acceptable fCV and if it has a 'targetVersion' set.
+     */
+    void _fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>& result,
+                             std::shared_ptr<OnCompletionGuard> onCompletionGuard,
+                             const OpTimeWithHash& lastOpTimeWithHash);
+
     /**
      * Callback for oplog fetcher.
      */
@@ -427,7 +450,7 @@ private:
     /**
      * Callback for third '_lastOplogEntryFetcher' callback. This is scheduled after MultiApplier
      * completed successfully and missing documents were fetched from the sync source while
-     * DataReplicatorExternalState::_multiInitialSyncApply() was processing operations.
+     * DataReplicatorExternalState::_multiApply() was processing operations.
      * This callback will update InitialSyncState::stopTimestamp on success.
      */
     void _lastOplogEntryFetcherCallbackAfterFetchingMissingDocuments(
@@ -468,6 +491,7 @@ private:
                              Fetcher::Documents::const_iterator end,
                              const OplogFetcher::DocumentsInfo& info);
 
+    void _appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob) const;
     BSONObj _getInitialSyncProgress_inlock() const;
 
     StatusWith<MultiApplier::Operations> _getNextApplierBatch_inlock();
@@ -516,11 +540,11 @@ private:
      * Saves handle if work was successfully scheduled.
      * Returns scheduleWork status (without the handle).
      */
-    Status _scheduleWorkAndSaveHandle_inlock(const executor::TaskExecutor::CallbackFn& work,
+    Status _scheduleWorkAndSaveHandle_inlock(executor::TaskExecutor::CallbackFn work,
                                              executor::TaskExecutor::CallbackHandle* handle,
                                              const std::string& name);
     Status _scheduleWorkAtAndSaveHandle_inlock(Date_t when,
-                                               const executor::TaskExecutor::CallbackFn& work,
+                                               executor::TaskExecutor::CallbackFn work,
                                                executor::TaskExecutor::CallbackHandle* handle,
                                                const std::string& name);
 
@@ -561,6 +585,7 @@ private:
     const InitialSyncerOptions _opts;                                           // (R)
     std::unique_ptr<DataReplicatorExternalState> _dataReplicatorExternalState;  // (R)
     executor::TaskExecutor* _exec;                                              // (R)
+    ThreadPool* _writerPool;                                                    // (R)
     StorageInterface* _storage;                                                 // (R)
     ReplicationProcess* _replicationProcess;                                    // (S)
 
@@ -592,11 +617,14 @@ private:
     std::unique_ptr<InitialSyncState> _initialSyncState;  // (M)
     std::unique_ptr<OplogFetcher> _oplogFetcher;          // (S)
     std::unique_ptr<Fetcher> _lastOplogEntryFetcher;      // (S)
+    std::unique_ptr<Fetcher> _fCVFetcher;                 // (S)
     std::unique_ptr<MultiApplier> _applier;               // (M)
     HostAndPort _syncSource;                              // (M)
     OpTimeWithHash _lastFetched;                          // (MX)
     OpTimeWithHash _lastApplied;                          // (MX)
     std::unique_ptr<OplogBuffer> _oplogBuffer;            // (M)
+    std::unique_ptr<OplogApplier::Observer> _observer;    // (S)
+    std::unique_ptr<OplogApplier> _oplogApplier;          // (M)
 
     // Used to signal changes in _state.
     mutable stdx::condition_variable _stateCondition;
@@ -605,7 +633,8 @@ private:
     State _state = State::kPreStart;  // (M)
 
     // Passed to CollectionCloner via DatabasesCloner.
-    CollectionCloner::ScheduleDbWorkFn _scheduleDbWorkFn;  // (M)
+    DatabaseCloner::ScheduleDbWorkFn _scheduleDbWorkFn;  // (M)
+    StartCollectionClonerFn _startCollectionClonerFn;    // (M)
 
     // Contains stats on the current initial sync request (includes all attempts).
     // To access these stats in a user-readable format, use getInitialSyncProgress().

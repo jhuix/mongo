@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -49,6 +51,9 @@ using NetworkGuard = executor::NetworkInterfaceMock::InNetworkGuard;
 HostAndPort source("localhost:12345");
 NamespaceString nss("local.oplog.rs");
 
+// For testing. Should match the value used in the AbstractOplogFetcher.
+const Milliseconds kNetworkTimeoutBufferMS{5000};
+
 /**
  * This class is the minimal implementation of an oplog fetcher. It has the simplest `find` command
  * possible, no metadata, and the _onSuccessfulBatch function simply returns a `getMore` command
@@ -63,12 +68,28 @@ public:
                               std::size_t maxFetcherRestarts,
                               OnShutdownCallbackFn onShutdownCallbackFn);
 
+    void setInitialFindMaxTime(Milliseconds findMaxTime) {
+        _initialFindMaxTime = findMaxTime;
+    }
+
+    void setRetriedFindMaxTime(Milliseconds findMaxTime) {
+        _retriedFindMaxTime = findMaxTime;
+    }
+
 private:
     BSONObj _makeFindCommandObject(const NamespaceString& nss,
-                                   OpTime lastOpTimeFetched) const override;
+                                   OpTime lastOpTimeFetched,
+                                   Milliseconds findMaxTime) const override;
     BSONObj _makeMetadataObject() const override;
 
     StatusWith<BSONObj> _onSuccessfulBatch(const Fetcher::QueryResponse& queryResponse) override;
+
+    Milliseconds _getInitialFindMaxTime() const override;
+
+    Milliseconds _getRetriedFindMaxTime() const override;
+
+    Milliseconds _initialFindMaxTime{60000};
+    Milliseconds _retriedFindMaxTime{2000};
 };
 
 MockOplogFetcher::MockOplogFetcher(executor::TaskExecutor* executor,
@@ -85,11 +106,21 @@ MockOplogFetcher::MockOplogFetcher(executor::TaskExecutor* executor,
                            onShutdownCallbackFn,
                            "mock oplog fetcher") {}
 
+Milliseconds MockOplogFetcher::_getInitialFindMaxTime() const {
+    return _initialFindMaxTime;
+}
+
+Milliseconds MockOplogFetcher::_getRetriedFindMaxTime() const {
+    return _retriedFindMaxTime;
+}
+
 BSONObj MockOplogFetcher::_makeFindCommandObject(const NamespaceString& nss,
-                                                 OpTime lastOpTimeFetched) const {
+                                                 OpTime lastOpTimeFetched,
+                                                 Milliseconds findMaxTime) const {
     BSONObjBuilder cmdBob;
     cmdBob.append("find", nss.coll());
     cmdBob.append("filter", BSON("ts" << BSON("$gte" << lastOpTimeFetched.getTimestamp())));
+    cmdBob.append("maxTimeMS", durationCount<Milliseconds>(findMaxTime));
     return cmdBob.obj();
 }
 
@@ -345,8 +376,10 @@ public:
                                                    ShouldFailRequestFn shouldFailRequest)
         : unittest::TaskExecutorProxy(executor), _shouldFailRequest(shouldFailRequest) {}
 
-    StatusWith<CallbackHandle> scheduleRemoteCommand(const executor::RemoteCommandRequest& request,
-                                                     const RemoteCommandCallbackFn& cb) override {
+    StatusWith<CallbackHandle> scheduleRemoteCommand(
+        const executor::RemoteCommandRequest& request,
+        const RemoteCommandCallbackFn& cb,
+        const transport::BatonHandle& baton = nullptr) override {
         if (_shouldFailRequest(request)) {
             return Status(ErrorCodes::OperationFailed, "failed to schedule remote command");
         }
@@ -392,6 +425,94 @@ TEST_F(AbstractOplogFetcherTest,
     // Status in shutdown callback should match error for dead cursor instead of error from failed
     // schedule request.
     ASSERT_EQUALS(ErrorCodes::CappedPositionLost, shutdownState->getStatus());
+}
+
+TEST_F(AbstractOplogFetcherTest, OplogFetcherTimesOutCorrectlyOnInitialFindRequests) {
+    auto ops = _generateOplogEntries(2U);
+    std::size_t maxFetcherRestarts = 0U;
+    auto shutdownState = stdx::make_unique<ShutdownState>();
+    MockOplogFetcher oplogFetcher(&getExecutor(),
+                                  _getOpTimeWithHash(ops[0]),
+                                  source,
+                                  nss,
+                                  maxFetcherRestarts,
+                                  stdx::ref(*shutdownState));
+
+    // Set a finite network timeout for the initial find request.
+    auto initialFindMaxTime = Milliseconds(10000);
+    oplogFetcher.setInitialFindMaxTime(initialFindMaxTime);
+
+    ON_BLOCK_EXIT([this] { getExecutor().shutdown(); });
+
+    ASSERT_OK(oplogFetcher.startup());
+    ASSERT_TRUE(oplogFetcher.isActive());
+
+    auto net = getNet();
+
+    // Schedule a response at a time that would exceed the initial find request network timeout.
+    net->enterNetwork();
+    auto when = net->now() + initialFindMaxTime + kNetworkTimeoutBufferMS + Milliseconds(10);
+    auto noi = getNet()->getNextReadyRequest();
+    RemoteCommandResponse response = {{makeCursorResponse(1, {ops[0], ops[1]})}, Milliseconds(0)};
+    auto request = net->scheduleSuccessfulResponse(noi, when, response);
+    net->runUntil(when);
+    net->runReadyNetworkOperations();
+    net->exitNetwork();
+
+    oplogFetcher.join();
+
+    // The fetcher should have shut down after its last request timed out.
+    ASSERT_TRUE(ErrorCodes::isExceededTimeLimitError(shutdownState->getStatus().code()));
+}
+
+TEST_F(AbstractOplogFetcherTest, OplogFetcherTimesOutCorrectlyOnRetriedFindRequests) {
+    auto ops = _generateOplogEntries(2U);
+    std::size_t maxFetcherRestarts = 1U;
+    auto shutdownState = stdx::make_unique<ShutdownState>();
+    MockOplogFetcher oplogFetcher(&getExecutor(),
+                                  _getOpTimeWithHash(ops[0]),
+                                  source,
+                                  nss,
+                                  maxFetcherRestarts,
+                                  stdx::ref(*shutdownState));
+
+    // Set finite network timeouts for the initial and retried find requests.
+    auto initialFindMaxTime = Milliseconds(10000);
+    auto retriedFindMaxTime = Milliseconds(1000);
+    oplogFetcher.setInitialFindMaxTime(initialFindMaxTime);
+    oplogFetcher.setRetriedFindMaxTime(retriedFindMaxTime);
+
+    ON_BLOCK_EXIT([this] { getExecutor().shutdown(); });
+
+    ASSERT_OK(oplogFetcher.startup());
+    ASSERT_TRUE(oplogFetcher.isActive());
+
+    auto net = getNet();
+
+    // Schedule a response at a time that would exceed the initial find request network timeout.
+    net->enterNetwork();
+    auto when = net->now() + initialFindMaxTime + kNetworkTimeoutBufferMS + Milliseconds(10);
+    auto noi = getNet()->getNextReadyRequest();
+    RemoteCommandResponse response = {{makeCursorResponse(1, {ops[0], ops[1]})}, Milliseconds(0)};
+    auto request = net->scheduleSuccessfulResponse(noi, when, response);
+    net->runUntil(when);
+    net->runReadyNetworkOperations();
+    net->exitNetwork();
+
+    // Schedule a response at a time that would exceed the retried find request network timeout.
+    net->enterNetwork();
+    when = net->now() + retriedFindMaxTime + kNetworkTimeoutBufferMS + Milliseconds(10);
+    noi = getNet()->getNextReadyRequest();
+    response = {{makeCursorResponse(1, {ops[0], ops[1]})}, Milliseconds(0)};
+    request = net->scheduleSuccessfulResponse(noi, when, response);
+    net->runUntil(when);
+    net->runReadyNetworkOperations();
+    net->exitNetwork();
+
+    oplogFetcher.join();
+
+    // The fetcher should have shut down after its last request timed out.
+    ASSERT_TRUE(ErrorCodes::isExceededTimeLimitError(shutdownState->getStatus().code()));
 }
 
 bool sharedCallbackStateDestroyed = false;

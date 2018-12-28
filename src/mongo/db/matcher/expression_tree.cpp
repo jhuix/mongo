@@ -1,25 +1,27 @@
 // expression_tree.cpp
 
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,8 +40,9 @@
 namespace mongo {
 
 ListOfMatchExpression::~ListOfMatchExpression() {
-    for (unsigned i = 0; i < _expressions.size(); i++)
+    for (unsigned i = 0; i < _expressions.size(); i++) {
         delete _expressions[i];
+    }
     _expressions.clear();
 }
 
@@ -70,7 +73,12 @@ MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() c
         for (auto& childExpression : children) {
             // Since 'childExpression' is a reference to a member of the ListOfMatchExpression's
             // child array, this assignment replaces the original child with the optimized child.
+            // We must set this child's entry in '_expressions' to null after assigning ownership to
+            // 'childExpressionPtr'. Otherwise, if the call to optimize() throws we will attempt to
+            // free twice.
             std::unique_ptr<MatchExpression> childExpressionPtr(childExpression);
+            childExpression = nullptr;
+
             auto optimizedExpression = MatchExpression::optimize(std::move(childExpressionPtr));
             childExpression = optimizedExpression.release();
         }
@@ -85,7 +93,7 @@ MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() c
                     // Move this child out of the children array.
                     std::unique_ptr<ListOfMatchExpression> childExpressionPtr(
                         static_cast<ListOfMatchExpression*>(childExpression));
-                    childExpression = nullptr;  // NULL out this child's entry in _expressions, so
+                    childExpression = nullptr;  // Null out this child's entry in _expressions, so
                                                 // that it will be deleted by the erase call below.
 
                     // Move all of the grandchildren from the child expression to
@@ -107,6 +115,32 @@ MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() c
             children.insert(children.end(), absorbedExpressions.begin(), absorbedExpressions.end());
         }
 
+        // Remove all children of AND that are $alwaysTrue and all children of OR that are
+        // $alwaysFalse.
+        if (matchType == AND || matchType == OR) {
+            for (MatchExpression*& childExpression : children) {
+                if ((childExpression->isTriviallyTrue() && matchType == MatchExpression::AND) ||
+                    (childExpression->isTriviallyFalse() && matchType == MatchExpression::OR)) {
+                    std::unique_ptr<MatchExpression> childPtr(childExpression);
+                    childExpression = nullptr;
+                }
+            }
+
+            // We replaced each destroyed child expression with nullptr. Now we remove those
+            // nullptrs from the vector.
+            children.erase(std::remove(children.begin(), children.end(), nullptr), children.end());
+        }
+
+        // Check if the above optimizations eliminated all children. An OR with no children is
+        // always false.
+        // TODO SERVER-34759 It is correct to replace this empty AND with an $alwaysTrue, but we
+        // need to make enhancements to the planner to make it understand an $alwaysTrue and an
+        // empty AND as the same thing. The planner can create inferior plans for $alwaysTrue which
+        // it would not produce for an AND with no children.
+        if (children.empty() && matchType == MatchExpression::OR) {
+            return stdx::make_unique<AlwaysFalseMatchExpression>();
+        }
+
         if (children.size() == 1) {
             if ((matchType == AND || matchType == OR || matchType == INTERNAL_SCHEMA_XOR)) {
                 // Simplify AND/OR/XOR with exactly one operand to an expression consisting of just
@@ -116,10 +150,25 @@ MatchExpression::ExpressionOptimizerFunc ListOfMatchExpression::getOptimizer() c
                 return std::unique_ptr<MatchExpression>(simplifiedExpression);
             } else if (matchType == NOR) {
                 // Simplify NOR of exactly one operand to NOT of that operand.
-                auto simplifiedExpression = stdx::make_unique<NotMatchExpression>();
-                invariantOK(simplifiedExpression->init(children.front()));
+                auto simplifiedExpression = stdx::make_unique<NotMatchExpression>(children.front());
                 children.clear();
                 return std::move(simplifiedExpression);
+            }
+        }
+
+        if (matchType == MatchExpression::AND || matchType == MatchExpression::OR) {
+            for (auto& childExpression : children) {
+                // An AND containing an expression that always evaluates to false can be
+                // optimized to a single $alwaysFalse expression.
+                if (childExpression->isTriviallyFalse() && matchType == MatchExpression::AND) {
+                    return stdx::make_unique<AlwaysFalseMatchExpression>();
+                }
+
+                // Likewise, an OR containing an expression that always evaluates to true can be
+                // optimized to a single $alwaysTrue expression.
+                if (childExpression->isTriviallyTrue() && matchType == MatchExpression::OR) {
+                    return stdx::make_unique<AlwaysTrueMatchExpression>();
+                }
             }
         }
 
@@ -185,6 +234,10 @@ void AndMatchExpression::serialize(BSONObjBuilder* out) const {
     arrBob.doneFast();
 }
 
+bool AndMatchExpression::isTriviallyTrue() const {
+    return numChildren() == 0;
+}
+
 // -----
 
 bool OrMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
@@ -214,11 +267,18 @@ void OrMatchExpression::debugString(StringBuilder& debug, int level) const {
 
 void OrMatchExpression::serialize(BSONObjBuilder* out) const {
     if (!numChildren()) {
+        // It is possible for an OrMatchExpression to have no children, resulting in the serialized
+        // expression {$or: []}, which is not a valid query object. An empty $or is logically
+        // equivalent to {$alwaysFalse: 1}.
         out->append(AlwaysFalseMatchExpression::kName, 1);
         return;
     }
     BSONArrayBuilder arrBob(out->subarrayStart("$or"));
     _listToBSON(&arrBob);
+}
+
+bool OrMatchExpression::isTriviallyFalse() const {
+    return numChildren() == 0;
 }
 
 // ----

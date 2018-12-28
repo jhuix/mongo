@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -32,15 +34,16 @@
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/repl/replication_process.h"
+#include "mongo/db/s/active_migrations_registry.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
 #include "mongo/db/s/migration_source_manager.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/write_concern.h"
 
 /**
@@ -59,9 +62,7 @@ class AutoGetActiveCloner {
 
 public:
     AutoGetActiveCloner(OperationContext* opCtx, const MigrationSessionId& migrationSessionId) {
-        ShardingState* const gss = ShardingState::get(opCtx);
-
-        const auto nss = gss->getActiveDonateChunkNss();
+        const auto nss = ActiveMigrationsRegistry::get(opCtx).getActiveDonateChunkNss();
         uassert(ErrorCodes::NotYetInitialized, "No active migrations were found", nss);
 
         // Once the collection is locked, the migration status cannot change
@@ -71,15 +72,16 @@ public:
                 str::stream() << "Collection " << nss->ns() << " does not exist",
                 _autoColl->getCollection());
 
-        auto css = CollectionShardingState::get(opCtx, *nss);
-        uassert(ErrorCodes::IllegalOperation,
-                str::stream() << "No active migrations were found for collection " << nss->ns(),
-                css && css->getMigrationSourceManager());
+        if (auto msm = MigrationSourceManager::get(CollectionShardingRuntime::get(opCtx, *nss))) {
+            // It is now safe to access the cloner
+            _chunkCloner = dynamic_cast<MigrationChunkClonerSourceLegacy*>(msm->getCloner());
+            invariant(_chunkCloner);
 
-        // It is now safe to access the cloner
-        _chunkCloner = dynamic_cast<MigrationChunkClonerSourceLegacy*>(
-            css->getMigrationSourceManager()->getCloner());
-        invariant(_chunkCloner);
+        } else {
+            uasserted(ErrorCodes::IllegalOperation,
+                      str::stream() << "No active migrations were found for collection "
+                                    << nss->ns());
+        }
 
         // Ensure the session ids are correct
         uassert(ErrorCodes::IllegalOperation,
@@ -116,16 +118,16 @@ class InitialCloneCommand : public BasicCommand {
 public:
     InitialCloneCommand() : BasicCommand("_migrateClone") {}
 
-    void help(std::stringstream& h) const {
-        h << "internal";
+    std::string help() const override {
+        return "internal";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     virtual bool adminOnly() const {
@@ -134,7 +136,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::internal);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -178,16 +180,16 @@ class TransferModsCommand : public BasicCommand {
 public:
     TransferModsCommand() : BasicCommand("_transferMods") {}
 
-    void help(std::stringstream& h) const {
-        h << "internal";
+    std::string help() const override {
+        return "internal";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     virtual bool adminOnly() const {
@@ -196,7 +198,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::internal);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -227,16 +229,16 @@ class MigrateSessionCommand : public BasicCommand {
 public:
     MigrateSessionCommand() : BasicCommand("_getNextSessionMods") {}
 
-    void help(std::stringstream& h) const {
-        h << "internal";
+    std::string help() const override {
+        return "internal";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     virtual bool adminOnly() const {
@@ -245,7 +247,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::internal);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -260,17 +262,42 @@ public:
 
         BSONArrayBuilder arrBuilder;
 
-        repl::OpTime opTime;
+        boost::optional<repl::OpTime> opTime;
 
-        {
-            AutoGetActiveCloner autoCloner(opCtx, migrationSessionId);
-            opTime = autoCloner.getCloner()->nextSessionMigrationBatch(opCtx, &arrBuilder);
+        writeConflictRetry(opCtx,
+                           "Fetching session related oplogs for migration",
+                           NamespaceString::kRsOplogNamespace.ns(),
+                           [&]() {
+                               AutoGetActiveCloner autoCloner(opCtx, migrationSessionId);
+                               opTime = autoCloner.getCloner()->nextSessionMigrationBatch(
+                                   opCtx, &arrBuilder);
+                           });
+
+        // If the batch returns something, we wait for write concern to ensure that all the entries
+        // in the batch have been majority committed. We then need to check that the rollback id
+        // hasn't changed since we started migration, because a change would indicate that some data
+        // in this batch may have been rolled back. In this case, we abort the migration.
+        if (opTime) {
+            WriteConcernResult wcResult;
+            WriteConcernOptions majorityWC(
+                WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, 0);
+            uassertStatusOK(waitForWriteConcern(opCtx, opTime.get(), majorityWC, &wcResult));
+
+            auto rollbackIdAtMigrationInit = [&]() {
+                AutoGetActiveCloner autoCloner(opCtx, migrationSessionId);
+                return autoCloner.getCloner()->getRollbackIdAtInit();
+            }();
+
+            // The check for rollback id must be done after having waited for majority in order to
+            // ensure that whatever was waited on didn't get rolled back.
+            auto rollbackId = repl::ReplicationProcess::get(opCtx)->getRollbackID();
+            uassert(50881,
+                    str::stream() << "rollback detected, rollbackId was "
+                                  << rollbackIdAtMigrationInit
+                                  << " but is now "
+                                  << rollbackId,
+                    rollbackId == rollbackIdAtMigrationInit);
         }
-
-        WriteConcernResult wcResult;
-        WriteConcernOptions majorityWC(
-            WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, 0);
-        uassertStatusOK(waitForWriteConcern(opCtx, opTime, majorityWC, &wcResult));
 
         result.appendArray("oplog", arrBuilder.arr());
         return true;

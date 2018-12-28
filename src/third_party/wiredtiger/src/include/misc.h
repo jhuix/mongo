@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -11,6 +11,10 @@
  * and unused function return values.
  */
 #define	WT_UNUSED(var)		(void)(var)
+#define	WT_NOT_READ(v, val) do {					\
+	(v) = (val);							\
+	(void)(v);							\
+} while (0);
 #define	WT_IGNORE_RET(call) do {					\
 	int __ignored_ret;						\
 	__ignored_ret = (call);						\
@@ -23,6 +27,8 @@
 #define	WT_THOUSAND	(1000)
 #define	WT_MILLION	(1000000)
 #define	WT_BILLION	(1000000000)
+
+#define	WT_MINUTE	(60)
 
 #define	WT_KILOBYTE	(1024)
 #define	WT_MEGABYTE	(1048576)
@@ -74,6 +80,12 @@
  * block or logging subsystems pad.  Constant value.
  */
 #define	WT_ENCRYPT_LEN_SIZE	sizeof(uint32_t)
+
+/*
+ * Default hash table size; we don't need a prime number of buckets
+ * because we always use a good hash function.
+ */
+#define	WT_HASH_ARRAY_SIZE	512
 
 /*
  * __wt_calloc_def, __wt_calloc_one --
@@ -132,15 +144,13 @@
  * hex constant might be a negative integer), and to ensure the hex constant is
  * the correct size before applying the bitwise not operator.
  */
-#define	FLD_CLR(field, mask)	        ((void)((field) &= ~(uint32_t)(mask)))
-#define	FLD_MASK(field, mask)	        ((field) & (uint32_t)(mask))
+#define	FLD_CLR(field, mask)	        ((void)((field) &= ~(mask)))
+#define	FLD_MASK(field, mask)	        ((field) & (mask))
 #define	FLD_ISSET(field, mask)	        (FLD_MASK(field, mask) != 0)
-#define	FLD64_ISSET(field, mask)	(((field) & (uint64_t)(mask)) != 0)
-#define	FLD_SET(field, mask)	        ((void)((field) |= (uint32_t)(mask)))
+#define	FLD_SET(field, mask)	        ((void)((field) |= (mask)))
 
 #define	F_CLR(p, mask)		        FLD_CLR((p)->flags, mask)
 #define	F_ISSET(p, mask)	        FLD_ISSET((p)->flags, mask)
-#define	F_ISSET_ALL(p, mask)	        (FLD_MASK((p)->flags, mask) == (mask))
 #define	F_MASK(p, mask)	                FLD_MASK((p)->flags, mask)
 #define	F_SET(p, mask)		        FLD_SET((p)->flags, mask)
 
@@ -177,6 +187,15 @@
 } while (0)
 
 /*
+ * Some C compiler address sanitizers complain if qsort is passed a NULL base
+ * reference, even if there are no elements to compare (note zero elements is
+ * allowed by the IEEE Std 1003.1-2017 standard). Avoid the complaint.
+ */
+#define	__wt_qsort(base, nmemb, size, compar)				\
+	if ((nmemb) != 0)						\
+		qsort(base, nmemb, size, compar)
+
+/*
  * Binary search for an integer key.
  */
 #define	WT_BINARY_SEARCH(key, arrayp, n, found) do {			\
@@ -195,12 +214,8 @@
 } while (0)
 
 /* Verbose messages. */
-#ifdef HAVE_VERBOSE
 #define	WT_VERBOSE_ISSET(session, f)					\
 	(FLD_ISSET(S2C(session)->verbose, f))
-#else
-#define	WT_VERBOSE_ISSET(session, f)	0
-#endif
 
 #define	WT_CLEAR(s)							\
 	memset(&(s), 0, sizeof(s))
@@ -221,9 +236,12 @@
 } while (0)
 
 /*
- * Check if a variable string equals a constant string.  Inline the common
- * case for WiredTiger of a single byte string.  This is required because not
- * all compilers optimize this case in strcmp (e.g., clang).
+ * Check if a variable string equals a constant string. Inline the common case
+ * for WiredTiger of a single byte string. This is required because not all
+ * compilers optimize this case in strcmp (e.g., clang). While this macro works
+ * in the case of comparing two pointers (a sizeof operator on a pointer won't
+ * equal 2 and the extra code will be discarded at compile time), that's not its
+ * purpose.
  */
 #define	WT_STREQ(s, cs)							\
 	(sizeof(cs) == 2 ? (s)[0] == (cs)[0] && (s)[1] == '\0' :	\
@@ -255,30 +273,6 @@
 	(dst).size = (src).size;					\
 } while (0)
 
-/* Timestamp type and helper macros. */
-#if WT_TIMESTAMP_SIZE > 0
-#define	HAVE_TIMESTAMPS
-#else
-#undef	HAVE_TIMESTAMPS
-#endif
-
-#ifdef HAVE_TIMESTAMPS
-struct __wt_timestamp_t {
-#if WT_TIMESTAMP_SIZE == 8
-	uint64_t val;
-#else
-	uint8_t ts[WT_TIMESTAMP_SIZE];
-#endif
-};
-typedef struct __wt_timestamp_t wt_timestamp_t;
-#define	WT_DECL_TIMESTAMP(x)	wt_timestamp_t x;
-#define	WT_TIMESTAMP_NULL(x)	(x)
-#else
-typedef void wt_timestamp_t;
-#define	WT_TIMESTAMP_NULL(x)	(NULL)
-#define	WT_DECL_TIMESTAMP(x)
-#endif
-
 /*
  * In diagnostic mode we track the locations from which hazard pointers and
  * scratch buffers were acquired.
@@ -298,10 +292,6 @@ typedef void wt_timestamp_t;
 #define	__wt_page_swap(session, held, want, flags)			\
 	__wt_page_swap_func(session, held, want, flags)
 #endif
-
-/* Called on unexpected code path: locate the failure. */
-#define	__wt_illegal_value(session, msg)				\
-	__wt_illegal_value_func(session, msg, __func__, __LINE__)
 
 /* Random number generator state. */
 union __wt_rand_state {
@@ -329,3 +319,50 @@ union __wt_rand_state {
 			continue;					\
 		}
 #define	WT_TAILQ_SAFE_REMOVE_END }
+
+/*
+ * WT_VA_ARGS_BUF_FORMAT --
+ *	Format into a scratch buffer, extending it as necessary. This is a
+ * macro because we need to repeatedly call va_start/va_end and there's no
+ * way to do that inside a function call.
+ */
+#define	WT_VA_ARGS_BUF_FORMAT(session, buf, fmt, concatenate) do {	\
+	size_t __len, __space;						\
+	va_list __ap;							\
+	int __ret_xx;		/* __ret already used by WT_RET */	\
+	char *__p;							\
+									\
+	/*								\
+	 * This macro is used to both initialize and concatenate into a	\
+	 * buffer. If not concatenating, clear the size so we don't use	\
+	 * any existing contents.					\
+	 */								\
+	if (!(concatenate))						\
+		(buf)->size = 0;					\
+	for (;;) {							\
+		WT_ASSERT(session, (buf)->memsize >= (buf)->size);	\
+		__p = (char *)((uint8_t *)(buf)->mem + (buf)->size);	\
+		__space = (buf)->memsize - (buf)->size;			\
+									\
+		/* Format into the buffer. */				\
+		va_start(__ap, fmt);					\
+		__ret_xx = __wt_vsnprintf_len_set(			\
+		    __p, __space, &__len, fmt, __ap);			\
+		va_end(__ap);						\
+		WT_RET(__ret_xx);					\
+									\
+		/* Check if there was enough space. */			\
+		if (__len < __space) {					\
+			(buf)->data = (buf)->mem;			\
+			(buf)->size += __len;				\
+			break;						\
+		}							\
+									\
+		/*							\
+		 * If not, double the size of the buffer: we're dealing	\
+		 * with strings, we don't expect the size to get huge.	\
+		 */							\
+		WT_RET(__wt_buf_extend(					\
+		    session, buf, (buf)->size + __len + 1));		\
+	}								\
+} while (0)

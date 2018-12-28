@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -35,14 +37,14 @@
 #include "mongo/base/status.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/concurrency/locker.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_process.h"
+#include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/s/start_chunk_clone_request.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/remote_command_request.h"
@@ -77,53 +79,30 @@ bool isInRange(const BSONObj& obj,
 
 BSONObj createRequestWithSessionId(StringData commandName,
                                    const NamespaceString& nss,
-                                   const MigrationSessionId& sessionId) {
+                                   const MigrationSessionId& sessionId,
+                                   bool waitForSteadyOrDone = false) {
     BSONObjBuilder builder;
     builder.append(commandName, nss.ns());
+    builder.append("waitForSteadyOrDone", waitForSteadyOrDone);
     sessionId.append(&builder);
     return builder.obj();
 }
 
-}  // namespace
-
-/**
- * Used to receive invalidation notifications from operations, which delete documents.
- */
-class DeleteNotificationStage final : public PlanStage {
-public:
-    DeleteNotificationStage(MigrationChunkClonerSourceLegacy* cloner, OperationContext* opCtx)
-        : PlanStage("SHARDING_NOTIFY_DELETE", opCtx), _cloner(cloner) {}
-
-    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) override {
-        if (type == INVALIDATION_DELETION) {
-            stdx::lock_guard<stdx::mutex> sl(_cloner->_mutex);
-            _cloner->_cloneLocs.erase(dl);
+bool shouldApplyOplogToSession(const repl::OplogEntry& oplog,
+                               const ChunkRange& range,
+                               const ShardKeyPattern& keyPattern) {
+    // Skip appending CRUD operations that don't pertain to the ChunkRange being migrated.
+    if (oplog.isCrudOpType()) {
+        auto shardKey = keyPattern.extractShardKeyFromDoc(oplog.getOperationToApply());
+        if (!range.containsKey(shardKey)) {
+            return false;
         }
     }
 
-    StageState doWork(WorkingSetID* out) override {
-        MONGO_UNREACHABLE;
-    }
+    return true;
+}
 
-    bool isEOF() override {
-        MONGO_UNREACHABLE;
-    }
-
-    std::unique_ptr<PlanStageStats> getStats() override {
-        MONGO_UNREACHABLE;
-    }
-
-    SpecificStats* getSpecificStats() const override {
-        MONGO_UNREACHABLE;
-    }
-
-    StageType stageType() const override {
-        return STAGE_NOTIFY_DELETE;
-    }
-
-private:
-    MigrationChunkClonerSourceLegacy* const _cloner;
-};
+}  // namespace
 
 /**
  * Used to commit work for LogOpForSharding. Used to keep track of changes in documents that are
@@ -145,7 +124,7 @@ public:
           _opTime(opTime),
           _prePostImageOpTime(prePostImageOpTime) {}
 
-    void commit() override {
+    void commit(boost::optional<Timestamp>) override {
         switch (_op) {
             case 'd': {
                 stdx::lock_guard<stdx::mutex> sl(_cloner->_mutex);
@@ -164,12 +143,14 @@ public:
                 MONGO_UNREACHABLE;
         }
 
-        if (!_prePostImageOpTime.isNull()) {
-            _cloner->_sessionCatalogSource.notifyNewWriteOpTime(_prePostImageOpTime);
-        }
+        if (auto sessionSource = _cloner->_sessionCatalogSource.get()) {
+            if (!_prePostImageOpTime.isNull()) {
+                sessionSource->notifyNewWriteOpTime(_prePostImageOpTime);
+            }
 
-        if (!_opTime.isNull()) {
-            _cloner->_sessionCatalogSource.notifyNewWriteOpTime(_opTime);
+            if (!_opTime.isNull()) {
+                sessionSource->notifyNewWriteOpTime(_opTime);
+            }
         }
     }
 
@@ -192,28 +173,30 @@ MigrationChunkClonerSourceLegacy::MigrationChunkClonerSourceLegacy(MoveChunkRequ
       _sessionId(MigrationSessionId::generate(_args.getFromShardId().toString(),
                                               _args.getToShardId().toString())),
       _donorConnStr(std::move(donorConnStr)),
-      _recipientHost(std::move(recipientHost)),
-      _sessionCatalogSource(_args.getNss()) {}
+      _recipientHost(std::move(recipientHost)) {}
 
 MigrationChunkClonerSourceLegacy::~MigrationChunkClonerSourceLegacy() {
     invariant(_state == kDone);
-    invariant(!_deleteNotifyExec);
 }
 
 Status MigrationChunkClonerSourceLegacy::startClone(OperationContext* opCtx) {
     invariant(_state == kNew);
     invariant(!opCtx->lockState()->isLocked());
 
-    _sessionCatalogSource.init(opCtx);
+    auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet) {
+        _sessionCatalogSource =
+            stdx::make_unique<SessionCatalogMigrationSource>(opCtx, _args.getNss());
+
+        // Prime up the session migration source if there are oplog entries to migrate.
+        _sessionCatalogSource->fetchNextOplog(opCtx);
+    }
 
     // Load the ids of the currently available documents
     auto storeCurrentLocsStatus = _storeCurrentLocs(opCtx);
     if (!storeCurrentLocsStatus.isOK()) {
         return storeCurrentLocsStatus;
     }
-
-    // Prime up the session migration source if there are oplog entries to migrate.
-    _sessionCatalogSource.fetchNextOplog(opCtx);
 
     // Tell the recipient shard to start cloning
     BSONObjBuilder cmdBuilder;
@@ -254,21 +237,19 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
 
     int iteration = 0;
     while ((Date_t::now() - startTime) < maxTimeToWait) {
-        // Exponential sleep backoff, up to 1024ms. Don't sleep much on the first few iterations,
-        // since we want empty chunk migrations to be fast.
-        sleepmillis(1LL << std::min(iteration, 10));
-        iteration++;
-
         auto responseStatus = _callRecipient(
-            createRequestWithSessionId(kRecvChunkStatus, _args.getNss(), _sessionId));
+            createRequestWithSessionId(kRecvChunkStatus, _args.getNss(), _sessionId, true));
         if (!responseStatus.isOK()) {
-            return {responseStatus.getStatus().code(),
-                    str::stream()
-                        << "Failed to contact recipient shard to monitor data transfer due to "
-                        << responseStatus.getStatus().toString()};
+            return responseStatus.getStatus().withContext(
+                "Failed to contact recipient shard to monitor data transfer");
         }
 
         const BSONObj& res = responseStatus.getValue();
+
+        if (!res["waited"].boolean()) {
+            sleepmillis(1LL << std::min(iteration, 10));
+        }
+        iteration++;
 
         stdx::lock_guard<stdx::mutex> sl(_mutex);
 
@@ -290,7 +271,8 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
         }
 
         if (res["state"].String() == "fail") {
-            return {ErrorCodes::OperationFailed, "Data transfer error"};
+            return {ErrorCodes::OperationFailed,
+                    str::stream() << "Data transfer error: " << res["errmsg"].str()};
         }
 
         auto migrationSessionIdStatus = MigrationSessionId::extractFromBSON(res);
@@ -301,9 +283,11 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
         }
 
         if (res["ns"].str() != _args.getNss().ns() ||
-            res["from"].str() != _donorConnStr.toString() || !res["min"].isABSONObj() ||
-            res["min"].Obj().woCompare(_args.getMinKey()) != 0 || !res["max"].isABSONObj() ||
-            res["max"].Obj().woCompare(_args.getMaxKey()) != 0 ||
+            (res.hasField("fromShardId")
+                 ? (res["fromShardId"].str() != _args.getFromShardId().toString())
+                 : (res["from"].str() != _donorConnStr.toString())) ||
+            !res["min"].isABSONObj() || res["min"].Obj().woCompare(_args.getMinKey()) != 0 ||
+            !res["max"].isABSONObj() || res["max"].Obj().woCompare(_args.getMaxKey()) != 0 ||
             !_sessionId.matches(migrationSessionIdStatus.getValue())) {
             // This can happen when the destination aborted the migration and received another
             // recvChunk before this thread sees the transition to the abort state. This is
@@ -329,21 +313,21 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
     return {ErrorCodes::ExceededTimeLimit, "Timed out waiting for the cloner to catch up"};
 }
 
-Status MigrationChunkClonerSourceLegacy::commitClone(OperationContext* opCtx) {
+StatusWith<BSONObj> MigrationChunkClonerSourceLegacy::commitClone(OperationContext* opCtx) {
     invariant(_state == kCloning);
     invariant(!opCtx->lockState()->isLocked());
-
     auto responseStatus =
         _callRecipient(createRequestWithSessionId(kRecvChunkCommit, _args.getNss(), _sessionId));
     if (responseStatus.isOK()) {
         _cleanup(opCtx);
 
-        if (_sessionCatalogSource.hasMoreOplog()) {
+        if (_sessionCatalogSource && _sessionCatalogSource->hasMoreOplog()) {
             return {ErrorCodes::SessionTransferIncomplete,
                     "destination shard finished committing but there are still some session "
                     "metadata that needs to be transferred"};
         }
-        return Status::OK();
+
+        return responseStatus;
     }
 
     cancelClone(opCtx);
@@ -356,9 +340,14 @@ void MigrationChunkClonerSourceLegacy::cancelClone(OperationContext* opCtx) {
     switch (_state) {
         case kDone:
             break;
-        case kCloning:
-            _callRecipient(createRequestWithSessionId(kRecvChunkAbort, _args.getNss(), _sessionId))
-                .status_with_transitional_ignore();
+        case kCloning: {
+            const auto status = _callRecipient(createRequestWithSessionId(
+                                                   kRecvChunkAbort, _args.getNss(), _sessionId))
+                                    .getStatus();
+            if (!status.isOK()) {
+                LOG(0) << "Failed to cancel migration " << causedBy(redact(status));
+            }
+        }
         // Intentional fall through
         case kNew:
             _cleanup(opCtx);
@@ -482,19 +471,11 @@ Status MigrationChunkClonerSourceLegacy::nextCloneBatch(OperationContext* opCtx,
             }
 
             arrBuilder->append(doc.value());
+            ShardingStatistics::get(opCtx).countDocsClonedOnDonor.addAndFetch(1);
         }
     }
 
     _cloneLocs.erase(_cloneLocs.begin(), it);
-
-    // If we have drained all the cloned data, there is no need to keep the delete notify executor
-    // around
-    if (_cloneLocs.empty() && _deleteNotifyExec) {
-        // We have a different OperationContext than when we created the PlanExecutor, so need to
-        // manually destroy it ourselves.
-        _deleteNotifyExec->dispose(opCtx, collection->getCursorManager());
-        _deleteNotifyExec.reset();
-    }
 
     return Status::OK();
 }
@@ -520,27 +501,17 @@ Status MigrationChunkClonerSourceLegacy::nextModsBatch(OperationContext* opCtx,
 }
 
 void MigrationChunkClonerSourceLegacy::_cleanup(OperationContext* opCtx) {
-    {
-        stdx::lock_guard<stdx::mutex> sl(_mutex);
-        _state = kDone;
-        _reload.clear();
-        _deleted.clear();
-    }
-
-    if (_deleteNotifyExec) {
-        AutoGetCollection autoColl(opCtx, _args.getNss(), MODE_IS);
-        const auto cursorManager =
-            autoColl.getCollection() ? autoColl.getCollection()->getCursorManager() : nullptr;
-        _deleteNotifyExec->dispose(opCtx, cursorManager);
-        _deleteNotifyExec.reset();
-    }
+    stdx::lock_guard<stdx::mutex> sl(_mutex);
+    _state = kDone;
+    _reload.clear();
+    _deleted.clear();
 }
 
 StatusWith<BSONObj> MigrationChunkClonerSourceLegacy::_callRecipient(const BSONObj& cmdObj) {
     executor::RemoteCommandResponse responseStatus(
         Status{ErrorCodes::InternalError, "Uninitialized value"});
 
-    auto executor = grid.getExecutorPool()->getFixedExecutor();
+    auto executor = Grid::get(getGlobalServiceContext())->getExecutorPool()->getFixedExecutor();
     auto scheduleStatus = executor->scheduleRemoteCommand(
         executor::RemoteCommandRequest(_recipientHost, "admin", cmdObj, nullptr),
         [&responseStatus](const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {
@@ -577,7 +548,7 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* opC
 
     // Allow multiKey based on the invariant that shard keys must be single-valued. Therefore, any
     // multi-key index prefixed by shard key cannot be multikey over the shard key fields.
-    IndexDescriptor* const idx =
+    const IndexDescriptor* idx =
         collection->getIndexCatalog()->findShardKeyPrefixedIndex(opCtx,
                                                                  _shardKeyPattern.toBSON(),
                                                                  false);  // requireSingleKey
@@ -587,19 +558,6 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* opC
                               << " in storeCurrentLocs for "
                               << _args.getNss().ns()};
     }
-
-    // Install the stage, which will listen for notifications on the collection
-    auto statusWithDeleteNotificationPlanExecutor =
-        PlanExecutor::make(opCtx,
-                           stdx::make_unique<WorkingSet>(),
-                           stdx::make_unique<DeleteNotificationStage>(this, opCtx),
-                           collection,
-                           PlanExecutor::YIELD_MANUAL);
-    if (!statusWithDeleteNotificationPlanExecutor.isOK()) {
-        return statusWithDeleteNotificationPlanExecutor.getStatus();
-    }
-
-    _deleteNotifyExec = std::move(statusWithDeleteNotificationPlanExecutor.getValue());
 
     // Assume both min and max non-empty, append MinKey's to make them fit chosen index
     const KeyPattern kp(idx->keyPattern());
@@ -627,8 +585,7 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* opC
     if (totalRecs > 0) {
         avgRecSize = collection->dataSize(opCtx) / totalRecs;
         maxRecsWhenFull = _args.getMaxChunkSizeBytes() / avgRecSize;
-        maxRecsWhenFull = std::min((unsigned long long)(kMaxObjectPerChunk + 1),
-                                   130 * maxRecsWhenFull / 100 /* slack */);
+        maxRecsWhenFull = 130 * maxRecsWhenFull / 100;  // pad some slack
     } else {
         avgRecSize = 0;
         maxRecsWhenFull = kMaxObjectPerChunk + 1;
@@ -661,9 +618,8 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* opC
     }
 
     if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
-        return {ErrorCodes::InternalError,
-                str::stream() << "Executor error while scanning for documents belonging to chunk: "
-                              << WorkingSetCommon::toStatusString(obj)};
+        return WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+            "Executor error while scanning for documents belonging to chunk");
     }
 
     const uint64_t collectionAverageObjectSize = collection->averageObjectSize(opCtx);
@@ -731,30 +687,25 @@ void MigrationChunkClonerSourceLegacy::_xfer(OperationContext* opCtx,
     arr.done();
 }
 
-repl::OpTime MigrationChunkClonerSourceLegacy::nextSessionMigrationBatch(
+boost::optional<repl::OpTime> MigrationChunkClonerSourceLegacy::nextSessionMigrationBatch(
     OperationContext* opCtx, BSONArrayBuilder* arrBuilder) {
-    repl::OpTime opTimeToWait;
-    auto seenOpTimeTerm = repl::OpTime::kUninitializedTerm;
+    if (!_sessionCatalogSource) {
+        return boost::none;
+    }
 
-    while (_sessionCatalogSource.hasMoreOplog()) {
-        auto result = _sessionCatalogSource.getLastFetchedOplog();
+    repl::OpTime opTimeToWaitIfWaitingForMajority;
+    const ChunkRange range(_args.getMinKey(), _args.getMaxKey());
 
-        if (!result.oplog) {
-            // Last fetched turned out empty, try to see if there are more
-            _sessionCatalogSource.fetchNextOplog(opCtx);
+    while (_sessionCatalogSource->hasMoreOplog()) {
+        auto result = _sessionCatalogSource->getLastFetchedOplog();
+
+        if (!result.oplog ||
+            !shouldApplyOplogToSession(result.oplog.get(), range, _shardKeyPattern)) {
+            _sessionCatalogSource->fetchNextOplog(opCtx);
             continue;
         }
 
         auto newOpTime = result.oplog->getOpTime();
-        if (seenOpTimeTerm == repl::OpTime::kUninitializedTerm) {
-            seenOpTimeTerm = newOpTime.getTerm();
-        } else {
-            uassert(40650,
-                    str::stream() << "detected change of term from " << seenOpTimeTerm << " to "
-                                  << newOpTime.getTerm(),
-                    seenOpTimeTerm == newOpTime.getTerm());
-        }
-
         auto oplogDoc = result.oplog->toBSON();
 
         // Use the builder size instead of accumulating the document sizes directly so that we
@@ -765,16 +716,17 @@ repl::OpTime MigrationChunkClonerSourceLegacy::nextSessionMigrationBatch(
         }
 
         arrBuilder->append(oplogDoc);
-        _sessionCatalogSource.fetchNextOplog(opCtx);
+
+        _sessionCatalogSource->fetchNextOplog(opCtx);
 
         if (result.shouldWaitForMajority) {
-            if (opTimeToWait < newOpTime) {
-                opTimeToWait = newOpTime;
+            if (opTimeToWaitIfWaitingForMajority < newOpTime) {
+                opTimeToWaitIfWaitingForMajority = newOpTime;
             }
         }
     }
 
-    return opTimeToWait;
+    return boost::make_optional(opTimeToWaitIfWaitingForMajority);
 }
 
 }  // namespace mongo

@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
@@ -49,25 +51,25 @@ namespace repl {
 
 namespace {
 
+
+const Milliseconds maximumKeepAliveIntervalMS(30 * 1000);
+
+// The network timeout used for replSetUpdatePosition requests made to a node's sync source.
+const Seconds syncSourceFeedbackNetworkTimeoutSecs(30);
+
 /**
- * Calculates the keep alive interval based on the current configuration in the replication
- * coordinator.
+ * Calculates the keep alive interval based on the given ReplSetConfig.
  */
-Milliseconds calculateKeepAliveInterval(OperationContext* opCtx, stdx::mutex& mtx) {
-    stdx::lock_guard<stdx::mutex> lock(mtx);
-    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    auto rsConfig = replCoord->getConfig();
-    auto keepAliveInterval = rsConfig.getElectionTimeoutPeriod() / 2;
-    return keepAliveInterval;
+Milliseconds calculateKeepAliveInterval(const ReplSetConfig& rsConfig) {
+    return std::min((rsConfig.getElectionTimeoutPeriod() / 2), maximumKeepAliveIntervalMS);
 }
 
 /**
  * Returns function to prepare update command
  */
 Reporter::PrepareReplSetUpdatePositionCommandFn makePrepareReplSetUpdatePositionCommandFn(
-    OperationContext* opCtx, const HostAndPort& syncTarget, BackgroundSync* bgsync) {
-    return [syncTarget, opCtx, bgsync](ReplicationCoordinator::ReplSetUpdatePositionCommandStyle
-                                           commandStyle) -> StatusWith<BSONObj> {
+    ReplicationCoordinator* replCoord, const HostAndPort& syncTarget, BackgroundSync* bgsync) {
+    return [syncTarget, replCoord, bgsync]() -> StatusWith<BSONObj> {
         auto currentSyncTarget = bgsync->getSyncTarget();
         if (currentSyncTarget != syncTarget) {
             if (currentSyncTarget.empty()) {
@@ -83,14 +85,13 @@ Reporter::PrepareReplSetUpdatePositionCommandFn makePrepareReplSetUpdatePosition
             }
         }
 
-        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         if (replCoord->getMemberState().primary()) {
             // Primary has no one to send updates to.
             return Status(ErrorCodes::InvalidSyncSource,
                           "Currently primary - no one to send updates to");
         }
 
-        return replCoord->prepareReplSetUpdatePositionCommand(commandStyle);
+        return replCoord->prepareReplSetUpdatePositionCommand();
     };
 }
 
@@ -141,7 +142,9 @@ void SyncSourceFeedback::shutdown() {
     _cond.notify_all();
 }
 
-void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* bgsync) {
+void SyncSourceFeedback::run(executor::TaskExecutor* executor,
+                             BackgroundSync* bgsync,
+                             ReplicationCoordinator* replCoord) {
     Client::initThread("SyncSourceFeedback");
 
     HostAndPort syncTarget;
@@ -150,10 +153,9 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* b
     Milliseconds keepAliveInterval(0);
 
     while (true) {  // breaks once _shutdownSignaled is true
-        auto opCtx = cc().makeOperationContext();
 
         if (keepAliveInterval == Milliseconds(0)) {
-            keepAliveInterval = calculateKeepAliveInterval(opCtx.get(), _mtx);
+            keepAliveInterval = calculateKeepAliveInterval(replCoord->getConfig());
         }
 
         {
@@ -169,7 +171,7 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* b
                         continue;
                     }
                 }
-                MemberState state = ReplicationCoordinator::get(opCtx.get())->getMemberState();
+                MemberState state = replCoord->getMemberState();
                 if (!(state.primary() || state.startup())) {
                     break;
                 }
@@ -184,7 +186,7 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* b
 
         {
             stdx::lock_guard<stdx::mutex> lock(_mtx);
-            MemberState state = ReplicationCoordinator::get(opCtx.get())->getMemberState();
+            MemberState state = replCoord->getMemberState();
             if (state.primary() || state.startup()) {
                 continue;
             }
@@ -206,18 +208,18 @@ void SyncSourceFeedback::run(executor::TaskExecutor* executor, BackgroundSync* b
 
             // Update keepalive value from config.
             auto oldKeepAliveInterval = keepAliveInterval;
-            keepAliveInterval = calculateKeepAliveInterval(opCtx.get(), _mtx);
+            keepAliveInterval = calculateKeepAliveInterval(replCoord->getConfig());
             if (oldKeepAliveInterval != keepAliveInterval) {
                 LOG(1) << "new syncSourceFeedback keep alive duration = " << keepAliveInterval
                        << " (previously " << oldKeepAliveInterval << ")";
             }
         }
 
-        Reporter reporter(
-            executor,
-            makePrepareReplSetUpdatePositionCommandFn(opCtx.get(), syncTarget, bgsync),
-            syncTarget,
-            keepAliveInterval);
+        Reporter reporter(executor,
+                          makePrepareReplSetUpdatePositionCommandFn(replCoord, syncTarget, bgsync),
+                          syncTarget,
+                          keepAliveInterval,
+                          syncSourceFeedbackNetworkTimeoutSecs);
         {
             stdx::lock_guard<stdx::mutex> lock(_mtx);
             if (_shutdownSignaled) {

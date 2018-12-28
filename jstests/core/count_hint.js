@@ -4,6 +4,8 @@
  *   - A bad argument to the hint() method should raise an error.
  *   - The hint() method should support both the name of the index, and the object spec of the
  *     index.
+ *
+ * @tags: [requires_fastcount]
  */
 (function() {
     "use strict";
@@ -52,10 +54,9 @@
         coll.find({i: 1}).hint("BAD HINT").count();
     });
 
-    // Test that a bad hint fails with the correct error code. Also verify that the error message
-    // mentions a bad hint.
+    // Test that a bad hint fails with the correct error code.
     let cmdRes = db.runCommand({count: coll.getName(), hint: {bad: 1, hint: 1}});
     assert.commandFailedWithCode(cmdRes, ErrorCodes.BadValue, tojson(cmdRes));
-    var regex = new RegExp("bad hint");
+    var regex = new RegExp("hint provided does not correspond to an existing index");
     assert(regex.test(cmdRes.errmsg));
 })();

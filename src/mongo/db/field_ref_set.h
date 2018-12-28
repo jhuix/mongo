@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -58,8 +60,8 @@ class FieldRefSet {
     typedef std::set<const FieldRef*, FieldRefPtrLessThan> FieldSet;
 
 public:
-    typedef FieldSet::iterator iterator;
-    typedef FieldSet::const_iterator const_iterator;
+    using iterator = FieldSet::iterator;
+    using const_iterator = FieldSet::const_iterator;
 
     FieldRefSet();
 
@@ -106,7 +108,7 @@ public:
     void fillFrom(const std::vector<FieldRef*>& fields);
 
     /**
-     * Replace any existing conflicting FieldRef with the shortest (closest to root) one
+     * Replace any existing conflicting FieldRef with the shortest (closest to root) one.
      */
     void keepShortest(const FieldRef* toInsert);
 
@@ -122,6 +124,10 @@ public:
         _fieldSet.clear();
     }
 
+    void erase(const FieldRef* item) {
+        _fieldSet.erase(item);
+    }
+
     /**
      * A debug/log-able string
      */
@@ -130,6 +136,42 @@ public:
 private:
     // A set of field_ref pointers, none of which is owned here.
     FieldSet _fieldSet;
+};
+
+/**
+ * A wrapper class for FieldRefSet which owns the storage of the underlying FieldRef objects.
+ */
+class FieldRefSetWithStorage {
+public:
+    /**
+     * Inserts the given FieldRef into the set. In the case of a conflict with an existing element,
+     * only the shortest path is kept in the set.
+     */
+    void keepShortest(const FieldRef& toInsert) {
+        const FieldRef* inserted = &(*_ownedFieldRefs.insert(toInsert).first);
+        _fieldRefSet.keepShortest(inserted);
+    }
+
+    bool empty() const {
+        return _fieldRefSet.empty();
+    }
+
+    void clear() {
+        _ownedFieldRefs.clear();
+        _fieldRefSet.clear();
+    }
+
+    std::string toString() const {
+        return _fieldRefSet.toString();
+    }
+
+private:
+    // Holds the storage for FieldRef's inserted into the set. This may become out of sync with
+    // '_fieldRefSet' since we don't attempt to remove conflicts from the backing set, which can
+    // leave '_ownedFieldRefs' holding storage for a superset of the field refs that are actually
+    // contained in '_fieldRefSet'.
+    std::set<FieldRef> _ownedFieldRefs;
+    FieldRefSet _fieldRefSet;
 };
 
 }  // namespace mongo

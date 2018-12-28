@@ -141,7 +141,7 @@ struct linenoiseCompletions {
     vector<Utf32String> completionStrings;
 };
 
-#define LINENOISE_DEFAULT_HISTORY_MAX_LEN 100
+#define LINENOISE_DEFAULT_HISTORY_MAX_LEN 1000
 #define LINENOISE_MAX_LINE 4096
 
 // make control-characters more readable
@@ -2815,6 +2815,11 @@ mongo::Status linenoiseHistorySave(const char* filename) {
 mongo::Status linenoiseHistoryLoad(const char* filename) {
     FILE* fp = fopen(filename, "rt");
     if (fp == NULL) {
+        if (errno == ENOENT) {
+            // Not having a history file isn't an error condition.
+            // For example, it's always the case when the shell is run for the first time.
+            return mongo::Status::OK();
+        }
         return linenoiseFileError(mongo::ErrorCodes::FileOpenFailed, "fopen()", filename);
     }
 

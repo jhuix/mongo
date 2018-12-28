@@ -1,41 +1,44 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include "mongo/db/logical_clock.h"
-#include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/update/update_node.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
-class UpdateNodeTest : public mongo::unittest::Test {
+class UpdateNodeTest : public ServiceContextTest {
 public:
     ~UpdateNodeTest() override = default;
 
@@ -61,6 +64,7 @@ protected:
         _indexData.reset();
         _logDoc.reset();
         _logBuilder = stdx::make_unique<LogBuilder>(_logDoc.root());
+        _modifiedPaths.clear();
     }
 
     UpdateNode::ApplyParams getApplyParams(mutablebson::Element element) {
@@ -73,6 +77,7 @@ protected:
         applyParams.validateForStorage = _validateForStorage;
         applyParams.indexData = _indexData.get();
         applyParams.logBuilder = _logBuilder.get();
+        applyParams.modifiedPaths = &_modifiedPaths;
         return applyParams;
     }
 
@@ -112,7 +117,7 @@ protected:
         if (!_indexData) {
             _indexData = stdx::make_unique<UpdateIndexData>();
         }
-        _indexData->addPath(path);
+        _indexData->addPath(FieldRef(path));
     }
 
     void setLogBuilderToNull() {
@@ -121,6 +126,10 @@ protected:
 
     const mutablebson::Document& getLogDoc() {
         return _logDoc;
+    }
+
+    std::string getModifiedPaths() {
+        return _modifiedPaths.toString();
     }
 
 private:
@@ -135,6 +144,7 @@ private:
     std::unique_ptr<UpdateIndexData> _indexData;
     mutablebson::Document _logDoc;
     std::unique_ptr<LogBuilder> _logBuilder;
+    FieldRefSetWithStorage _modifiedPaths;
 };
 
 }  // namespace mongo

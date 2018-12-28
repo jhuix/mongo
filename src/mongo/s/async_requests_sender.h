@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,10 +41,9 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/shard_id.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/util/concurrency/notification.h"
-#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/interruptible.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/producer_consumer_queue.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -124,7 +125,7 @@ public:
      */
     AsyncRequestsSender(OperationContext* opCtx,
                         executor::TaskExecutor* executor,
-                        const std::string db,
+                        StringData dbName,
                         const std::vector<AsyncRequestsSender::Request>& requests,
                         const ReadPreferenceSetting& readPreference,
                         Shard::RetryPolicy retryPolicy);
@@ -173,7 +174,8 @@ private:
         /**
          * Given a read preference, selects a host on which the command should be run.
          */
-        Status resolveShardIdToHostAndPort(const ReadPreferenceSetting& readPref);
+        Status resolveShardIdToHostAndPort(AsyncRequestsSender* ars,
+                                           const ReadPreferenceSetting& readPref);
 
         /**
          * Returns the Shard object associated with this remote.
@@ -205,13 +207,52 @@ private:
     };
 
     /**
+     * Job for _makeProgress. We use a producer consumer queue to coordinate with TaskExecutors
+     * off thread, and this wraps up the arguments for that call.
+     */
+    struct Job {
+        executor::TaskExecutor::RemoteCommandCallbackArgs cbData;
+        size_t remoteIndex;
+    };
+
+    /**
+     * We have to make sure to detach the baton if we throw in construction.  We also need a baton
+     * that lives longer than this type (because it can end up in callbacks that won't actually
+     * modify it).
+     *
+     * TODO: work out actual lifetime semantics for a baton.  For now, leaving this as a wort in ARS
+     */
+    class BatonDetacher {
+    public:
+        explicit BatonDetacher(OperationContext* opCtx);
+        ~BatonDetacher();
+
+        transport::Baton& operator*() const {
+            return *_baton;
+        }
+
+        transport::Baton* operator->() const noexcept {
+            return _baton.get();
+        }
+
+        operator transport::BatonHandle() const {
+            return _baton;
+        }
+
+        explicit operator bool() const noexcept {
+            return static_cast<bool>(_baton);
+        }
+
+    private:
+        transport::BatonHandle _baton;
+    };
+
+    /**
      * Cancels all outstanding requests on the TaskExecutor and sets the _stopRetrying flag.
      */
     void _cancelPendingRequests();
 
     /**
-     * Replaces _notification with a new notification.
-     *
      * If _stopRetrying is false, schedules retries for remotes that have had a retriable error.
      *
      * If any remote has successfully received a response, returns a Response for it.
@@ -226,9 +267,9 @@ private:
      *
      * For each remote without a response or pending request, schedules the remote request.
      *
-     * On failure to schedule a request, signals the notification.
+     * On failure to schedule a request, pushes a noop job to the response queue.
      */
-    void _scheduleRequests(WithLock);
+    void _scheduleRequests();
 
     /**
      * Helper to schedule a command to a remote.
@@ -238,22 +279,19 @@ private:
      *
      * Returns success if the command was scheduled successfully.
      */
-    Status _scheduleRequest(WithLock, size_t remoteIndex);
+    Status _scheduleRequest(size_t remoteIndex);
 
     /**
-     * The callback for a remote command.
+     * Waits for forward progress in gathering responses from a remote.
      *
-     * 'remoteIndex' is the position of the relevant remote node in '_remotes', and therefore
-     * indicates which node the response came from and where the response should be buffered.
-     *
-     * Stores the response or error in the remote and signals the notification.
+     * Stores the response or error in the remote.
      */
-    void _handleResponse(const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData,
-                         size_t remoteIndex);
+    void _makeProgress();
 
     OperationContext* _opCtx;
 
     executor::TaskExecutor* _executor;
+    BatonDetacher _baton;
 
     // The metadata obj to pass along with the command remote. Used to indicate that the command is
     // ok to run on secondaries.
@@ -276,15 +314,13 @@ private:
     // is CallbackCanceled, we promote the response status to the _interruptStatus.
     Status _interruptStatus = Status::OK();
 
-    // Must be acquired before accessing the below data members.
-    stdx::mutex _mutex;
-
     // Data tracking the state of our communication with each of the remote nodes.
     std::vector<RemoteData> _remotes;
 
-    // A notification that gets signaled when a remote is ready for processing (i.e., we failed to
-    // schedule a request to it or received a response from it).
-    boost::optional<Notification<void>> _notification;
+    // Thread safe queue which collects responses from the task executor for execution in next()
+    //
+    // The queue supports unset jobs for a signal to wake up and check for failure
+    MultiProducerSingleConsumerQueue<boost::optional<Job>>::Pipe _responseQueue;
 
     // Used to determine if the ARS should attempt to retry any requests. Is set to true when
     // stopRetrying() or cancelPendingRequests() is called.

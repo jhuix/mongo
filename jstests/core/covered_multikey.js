@@ -9,10 +9,6 @@
 (function() {
     "use strict";
 
-    // The MMAP storage engine does not store path-level multikey metadata, so it cannot participate
-    // in related query planning optimizations.
-    const isMMAPv1 = jsTest.options().storageEngine === "mmapv1";
-
     // For making assertions about explain output.
     load("jstests/libs/analyze_plan.js");
 
@@ -25,12 +21,8 @@
     assert.eq(1, coll.find({a: 1, b: 2}, {_id: 0, a: 1}).itcount());
     assert.eq({a: 1}, coll.findOne({a: 1, b: 2}, {_id: 0, a: 1}));
     let explainRes = coll.explain("queryPlanner").find({a: 1, b: 2}, {_id: 0, a: 1}).finish();
-    assert(isIxscan(explainRes.queryPlanner.winningPlan));
-    if (isMMAPv1) {
-        assert(planHasStage(explainRes.queryPlanner.winningPlan, "FETCH"));
-    } else {
-        assert(!planHasStage(explainRes.queryPlanner.winningPlan, "FETCH"));
-    }
+    assert(isIxscan(db, explainRes.queryPlanner.winningPlan));
+    assert(!planHasStage(db, explainRes.queryPlanner.winningPlan, "FETCH"));
 
     coll.drop();
     assert.writeOK(coll.insert({a: 1, b: [1, 2, 3], c: 3, d: 5}));
@@ -45,11 +37,7 @@
                      .find({a: 1, b: 1}, {_id: 0, c: 1, d: 1})
                      .sort({c: -1, d: -1})
                      .finish();
-    if (isMMAPv1) {
-        assert(planHasStage(explainRes.queryPlanner.winningPlan, "FETCH"));
-    } else {
-        assert(!planHasStage(explainRes.queryPlanner.winningPlan, "FETCH"));
-    }
+    assert(!planHasStage(db, explainRes.queryPlanner.winningPlan, "FETCH"));
 
     // Verify that a query cannot be covered over a path which is multikey due to an empty array.
     coll.drop();
@@ -57,8 +45,8 @@
     assert.commandWorked(coll.createIndex({a: 1}));
     assert.eq({a: []}, coll.findOne({a: []}, {_id: 0, a: 1}));
     explainRes = coll.explain("queryPlanner").find({a: []}, {_id: 0, a: 1}).finish();
-    assert(planHasStage(explainRes.queryPlanner.winningPlan, "IXSCAN"));
-    assert(planHasStage(explainRes.queryPlanner.winningPlan, "FETCH"));
+    assert(planHasStage(db, explainRes.queryPlanner.winningPlan, "IXSCAN"));
+    assert(planHasStage(db, explainRes.queryPlanner.winningPlan, "FETCH"));
     let ixscanStage = getPlanStage(explainRes.queryPlanner.winningPlan, "IXSCAN");
     assert.eq(true, ixscanStage.isMultiKey);
 
@@ -69,8 +57,8 @@
     assert.commandWorked(coll.createIndex({a: 1}));
     assert.eq({a: [2]}, coll.findOne({a: 2}, {_id: 0, a: 1}));
     explainRes = coll.explain("queryPlanner").find({a: 2}, {_id: 0, a: 1}).finish();
-    assert(planHasStage(explainRes.queryPlanner.winningPlan, "IXSCAN"));
-    assert(planHasStage(explainRes.queryPlanner.winningPlan, "FETCH"));
+    assert(planHasStage(db, explainRes.queryPlanner.winningPlan, "IXSCAN"));
+    assert(planHasStage(db, explainRes.queryPlanner.winningPlan, "FETCH"));
     ixscanStage = getPlanStage(explainRes.queryPlanner.winningPlan, "IXSCAN");
     assert.eq(true, ixscanStage.isMultiKey);
 
@@ -82,8 +70,8 @@
     assert.writeOK(coll.update({}, {$set: {a: [2]}}));
     assert.eq({a: [2]}, coll.findOne({a: 2}, {_id: 0, a: 1}));
     explainRes = coll.explain("queryPlanner").find({a: 2}, {_id: 0, a: 1}).finish();
-    assert(planHasStage(explainRes.queryPlanner.winningPlan, "IXSCAN"));
-    assert(planHasStage(explainRes.queryPlanner.winningPlan, "FETCH"));
+    assert(planHasStage(db, explainRes.queryPlanner.winningPlan, "IXSCAN"));
+    assert(planHasStage(db, explainRes.queryPlanner.winningPlan, "FETCH"));
     ixscanStage = getPlanStage(explainRes.queryPlanner.winningPlan, "IXSCAN");
     assert.eq(true, ixscanStage.isMultiKey);
 

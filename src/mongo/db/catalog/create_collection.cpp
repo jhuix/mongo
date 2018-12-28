@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,6 +28,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/create_collection.h"
@@ -33,6 +37,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -40,7 +45,9 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/insert.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/logger/redaction.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -68,8 +75,12 @@ Status createCollection(OperationContext* opCtx,
     BSONObjBuilder optionsBuilder;
     while (it.more()) {
         const auto elem = it.next();
-        if (!Command::isGenericArgument(elem.fieldNameStringData()))
+        if (!isGenericArgument(elem.fieldNameStringData()))
             optionsBuilder.append(elem);
+        if (elem.fieldNameStringData() == "viewOn") {
+            // Views don't have UUIDs so it should always be parsed for command.
+            kind = CollectionOptions::parseForCommand;
+        }
     }
 
     BSONObj options = optionsBuilder.obj();
@@ -78,22 +89,38 @@ Status createCollection(OperationContext* opCtx,
             !options["capped"].trueValue() || options["size"].isNumber() ||
                 options.hasField("$nExtents"));
 
+    CollectionOptions collectionOptions;
+    {
+        Status status = collectionOptions.parse(options, kind);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
     return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
         Lock::DBLock dbXLock(opCtx, nss.db(), MODE_X);
-        OldClientContext ctx(opCtx, nss.ns());
+        const bool shardVersionCheck = true;
+        OldClientContext ctx(opCtx, nss.ns(), shardVersionCheck);
         if (opCtx->writesAreReplicated() &&
-            !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, nss)) {
+            !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
             return Status(ErrorCodes::NotMaster,
                           str::stream() << "Not primary while creating collection " << nss.ns());
+        }
+
+        if (collectionOptions.isView()) {
+            // If the `system.views` collection does not exist, create it in a separate
+            // WriteUnitOfWork.
+            WriteUnitOfWork wuow(opCtx);
+            ctx.db()->getOrCreateCollection(opCtx, NamespaceString(ctx.db()->getSystemViewsName()));
+            wuow.commit();
         }
 
         WriteUnitOfWork wunit(opCtx);
 
         // Create collection.
         const bool createDefaultIndexes = true;
-        status =
-            userCreateNS(opCtx, ctx.db(), nss.ns(), options, kind, createDefaultIndexes, idIndex);
-
+        Status status = ctx.db()->userCreateNS(
+            opCtx, nss, std::move(collectionOptions), createDefaultIndexes, idIndex);
         if (!status.isOK()) {
             return status;
         }
@@ -110,7 +137,7 @@ Status createCollection(OperationContext* opCtx,
                         const BSONObj& cmdObj,
                         const BSONObj& idIndex) {
     return createCollection(opCtx,
-                            Command::parseNsCollectionRequired(dbName, cmdObj),
+                            CommandHelpers::parseNsCollectionRequired(dbName, cmdObj),
                             cmdObj,
                             idIndex,
                             CollectionOptions::parseForCommand);
@@ -122,9 +149,12 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                    const BSONObj& cmdObj,
                                    const BSONObj& idIndex) {
     invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
-    auto db = dbHolder().get(opCtx, dbName);
-    const NamespaceString newCollName(Command::parseNsCollectionRequired(dbName, cmdObj));
+
+    const NamespaceString newCollName(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
     auto newCmd = cmdObj;
+
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto* const db = databaseHolder->getDb(opCtx, dbName);
 
     // If a UUID is given, see if we need to rename a collection out of the way, and whether the
     // collection already exists under a different name. If so, rename it into place. As this is
@@ -146,10 +176,23 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                         uuid.isRFC4122v4());
 
                 auto& catalog = UUIDCatalog::get(opCtx);
-                auto currentName = catalog.lookupNSSByUUID(uuid);
-                OpObserver* opObserver = getGlobalServiceContext()->getOpObserver();
+                const auto currentName = catalog.lookupNSSByUUID(uuid);
+                auto serviceContext = opCtx->getServiceContext();
+                auto opObserver = serviceContext->getOpObserver();
                 if (currentName == newCollName)
                     return Result(Status::OK());
+
+                if (currentName.isDropPendingNamespace()) {
+                    log() << "CMD: create " << newCollName
+                          << " - existing collection with conflicting UUID " << uuid
+                          << " is in a drop-pending state: " << currentName;
+                    return Result(Status(ErrorCodes::NamespaceExists,
+                                         str::stream() << "existing collection "
+                                                       << currentName.toString()
+                                                       << " with conflicting UUID "
+                                                       << uuid.toString()
+                                                       << " is in a drop-pending state."));
+                }
 
                 // In the case of oplog replay, a future command may have created or renamed a
                 // collection with that same name. In that case, renaming this future collection to
@@ -161,17 +204,20 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                 // node.
                 const bool stayTemp = true;
                 if (auto futureColl = db ? db->getCollection(opCtx, newCollName) : nullptr) {
-                    auto tmpNameResult = db->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%");
+                    auto tmpNameResult =
+                        db->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.create");
                     if (!tmpNameResult.isOK()) {
-                        return Result(Status(tmpNameResult.getStatus().code(),
-                                             str::stream() << "Cannot generate temporary "
-                                                              "collection namespace for applyOps "
-                                                              "create command: collection: "
-                                                           << newCollName.ns()
-                                                           << ". error: "
-                                                           << tmpNameResult.getStatus().reason()));
+                        return Result(tmpNameResult.getStatus().withContext(
+                            str::stream() << "Cannot generate temporary "
+                                             "collection namespace for applyOps "
+                                             "create command: collection: "
+                                          << newCollName.ns()));
                     }
                     const auto& tmpName = tmpNameResult.getValue();
+                    // It is ok to log this because this doesn't happen very frequently.
+                    log() << "CMD: create " << newCollName
+                          << " - renaming existing collection with conflicting UUID " << uuid
+                          << " to temporary collection " << tmpName;
                     Status status =
                         db->renameCollection(opCtx, newCollName.ns(), tmpName.ns(), stayTemp);
                     if (!status.isOK())
@@ -180,7 +226,6 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                                    newCollName,
                                                    tmpName,
                                                    futureColl->uuid(),
-                                                   /*dropTarget*/ false,
                                                    /*dropTargetUUID*/ {},
                                                    stayTemp);
                 }
@@ -188,6 +233,11 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                 // If the collection with the requested UUID already exists, but with a different
                 // name, just rename it to 'newCollName'.
                 if (catalog.lookupCollectionByUUID(uuid)) {
+                    uassert(40655,
+                            str::stream() << "Invalid name " << redact(newCollName.ns())
+                                          << " for UUID "
+                                          << uuid.toString(),
+                            currentName.db() == newCollName.db());
                     Status status =
                         db->renameCollection(opCtx, currentName.ns(), newCollName.ns(), stayTemp);
                     if (!status.isOK())
@@ -196,7 +246,6 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                                    currentName,
                                                    newCollName,
                                                    uuid,
-                                                   /*dropTarget*/ false,
                                                    /*dropTargetUUID*/ {},
                                                    stayTemp);
 

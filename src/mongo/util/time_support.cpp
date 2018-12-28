@@ -1,28 +1,31 @@
-/*    Copyright 2010 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -41,11 +44,16 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
 
-#ifdef _WIN32
+#if defined(_WIN32)
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/system_tick_source.h"
 #include "mongo/util/timer.h"
-#include <boost/date_time/filetime_functions.hpp>
+#include <mmsystem.h>
+#elif defined(__linux__)
+#include <time.h>
+#elif defined(__APPLE__)
+#include <mach/clock.h>
+#include <mach/mach.h>
 #endif
 
 #ifdef __sun
@@ -198,10 +206,35 @@ void _dateToCtimeString(Date_t date, DateStringBuffer* result) {
     ctime_r(&t, result->data);
 #endif
     char* milliSecStr = result->data + ctimeSubstrLen;
-    snprintf(
-        milliSecStr, millisSubstrLen + 1, ".%03d", static_cast<int32_t>(date.asInt64() % 1000));
+    snprintf(milliSecStr,
+             millisSubstrLen + 1,
+             ".%03u",
+             static_cast<unsigned>(date.toMillisSinceEpoch() % 1000));
     result->size = ctimeSubstrLen + millisSubstrLen;
 }
+
+#if defined(_WIN32)
+
+uint64_t fileTimeToMicroseconds(FILETIME const ft) {
+    // Microseconds between 1601-01-01 00:00:00 UTC and 1970-01-01 00:00:00 UTC
+    constexpr uint64_t kEpochDifferenceMicros = 11644473600000000ull;
+
+    // Construct a 64 bit value that is the number of nanoseconds from the
+    // Windows epoch which is 1601-01-01 00:00:00 UTC
+    auto totalMicros = static_cast<uint64_t>(ft.dwHighDateTime) << 32;
+    totalMicros |= static_cast<uint64_t>(ft.dwLowDateTime);
+
+    // FILETIME is 100's of nanoseconds since Windows epoch
+    totalMicros /= 10;
+
+    // Move it from micros since the Windows epoch to micros since the Unix epoch
+    totalMicros -= kEpochDifferenceMicros;
+
+    return totalMicros;
+}
+
+#endif
+
 }  // namespace
 
 std::string dateToISOStringUTC(Date_t date) {
@@ -856,7 +889,7 @@ unsigned long long curTimeMicros64() {
     if (GetSystemTimePreciseAsFileTimeFunc != NULL) {
         FILETIME time;
         GetSystemTimePreciseAsFileTimeFunc(&time);
-        return boost::date_time::winapi::file_time_to_microseconds(time);
+        return fileTimeToMicroseconds(time);
     }
 
     // Get a current value for QueryPerformanceCounter; if it is not time to resync we will
@@ -887,9 +920,13 @@ unsigned long long curTimeMicros64() {
         ((perfCounter - basePerfCounter) * 10 * 1000 * 1000) /
             SystemTickSource::get()->getTicksPerSecond();
 
+    FILETIME fileTimeComputed;
+    fileTimeComputed.dwHighDateTime = computedTime >> 32;
+    fileTimeComputed.dwLowDateTime = computedTime;
+
     // Convert the computed FILETIME into microseconds since the Unix epoch (1/1/1970).
     //
-    return boost::date_time::winapi::file_time_to_microseconds(computedTime);
+    return fileTimeToMicroseconds(fileTimeComputed);
 }
 
 #else
@@ -906,5 +943,60 @@ unsigned long long curTimeMicros64() {
     return (((unsigned long long)tv.tv_sec) * 1000 * 1000) + tv.tv_usec;
 }
 #endif
+
+#if defined(__APPLE__)
+template <typename T>
+class MachPort {
+public:
+    MachPort(T port) : _port(std::move(port)) {}
+    ~MachPort() {
+        mach_port_deallocate(mach_task_self(), _port);
+    }
+    operator T&() {
+        return _port;
+    }
+
+private:
+    T _port;
+};
+#endif
+
+// Find minimum timer resolution of OS
+Nanoseconds getMinimumTimerResolution() {
+    Nanoseconds minTimerResolution;
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__EMSCRIPTEN__)
+    struct timespec tp;
+    clock_getres(CLOCK_REALTIME, &tp);
+    minTimerResolution = Nanoseconds{tp.tv_nsec};
+#elif defined(_WIN32)
+    // see https://msdn.microsoft.com/en-us/library/windows/desktop/dd743626(v=vs.85).aspx
+    TIMECAPS tc;
+    Milliseconds resMillis;
+    invariant(timeGetDevCaps(&tc, sizeof(tc)) == MMSYSERR_NOERROR);
+    resMillis = Milliseconds{static_cast<int64_t>(tc.wPeriodMin)};
+    minTimerResolution = duration_cast<Nanoseconds>(resMillis);
+#elif defined(__APPLE__)
+    // see "Mac OSX Internals: a Systems Approach" for functions and types
+    kern_return_t kr;
+    MachPort<host_name_port_t> myhost(mach_host_self());
+    MachPort<clock_serv_t> clk_system([&myhost] {
+        host_name_port_t clk;
+        invariant(host_get_clock_service(myhost, SYSTEM_CLOCK, &clk) == 0);
+        return clk;
+    }());
+    natural_t attribute[4];
+    mach_msg_type_number_t count;
+
+    count = sizeof(attribute) / sizeof(natural_t);
+    kr = clock_get_attributes(clk_system, CLOCK_GET_TIME_RES, (clock_attr_t)attribute, &count);
+    invariant(kr == 0);
+
+    minTimerResolution = Nanoseconds{attribute[0]};
+#else
+#error Dont know how to get the minimum timer resolution on this platform
+#endif
+    return minTimerResolution;
+}
+
 
 }  // namespace mongo

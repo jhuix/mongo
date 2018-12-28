@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -41,7 +43,7 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/util/log.h"
@@ -56,7 +58,9 @@ ShardLocal::ShardLocal(const ShardId& id) : Shard(id), _rsLocalClient() {
 }
 
 const ConnectionString ShardLocal::getConnString() const {
-    return repl::getGlobalReplicationCoordinator()->getConfig().getConnectionString();
+    return repl::ReplicationCoordinator::get(getGlobalServiceContext())
+        ->getConfig()
+        .getConnectionString();
 }
 
 std::shared_ptr<RemoteCommandTargeter> ShardLocal::getTargeter() const {
@@ -72,6 +76,14 @@ const ConnectionString ShardLocal::originalConnString() const {
 
 void ShardLocal::updateReplSetMonitor(const HostAndPort& remoteHost,
                                       const Status& remoteCommandStatus) {
+    MONGO_UNREACHABLE;
+}
+
+void ShardLocal::updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) {
+    MONGO_UNREACHABLE;
+}
+
+LogicalTime ShardLocal::getLastCommittedOpTime() const {
     MONGO_UNREACHABLE;
 }
 
@@ -98,6 +110,15 @@ StatusWith<Shard::CommandResponse> ShardLocal::_runCommand(OperationContext* opC
                                                            Milliseconds maxTimeMSOverrideUnused,
                                                            const BSONObj& cmdObj) {
     return _rsLocalClient.runCommandOnce(opCtx, dbName, cmdObj);
+}
+
+StatusWith<Shard::QueryResponse> ShardLocal::_runExhaustiveCursorCommand(
+    OperationContext* opCtx,
+    const ReadPreferenceSetting& readPref,
+    const std::string& dbName,
+    Milliseconds maxTimeMSOverride,
+    const BSONObj& cmdObj) {
+    MONGO_UNREACHABLE;
 }
 
 StatusWith<Shard::QueryResponse> ShardLocal::_exhaustiveFindOnConfig(
@@ -128,6 +149,13 @@ Status ShardLocal::createIndexOnConfig(OperationContext* opCtx,
     }
 
     return Status::OK();
+}
+
+void ShardLocal::runFireAndForgetCommand(OperationContext* opCtx,
+                                         const ReadPreferenceSetting& readPref,
+                                         const std::string& dbName,
+                                         const BSONObj& cmdObj) {
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace mongo

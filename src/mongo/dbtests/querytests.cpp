@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -31,7 +33,7 @@
 #include <boost/optional.hpp>
 #include <iostream>
 
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
@@ -46,7 +48,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/timer.h"
 
@@ -275,17 +276,17 @@ public:
         insert(ns, BSON("a" << 1));
         insert(ns, BSON("a" << 2));
         insert(ns, BSON("a" << 3));
-        unique_ptr<DBClientCursor> cursor = _client.query(ns, BSONObj(), 2);
+        unique_ptr<DBClientCursor> cursor = _client.query(NamespaceString(ns), BSONObj(), 2);
         long long cursorId = cursor->getCursorId();
         cursor->decouple();
         cursor.reset();
 
         {
             // Check internal server handoff to getmore.
-            OldClientWriteContext ctx(&_opCtx, ns);
+            dbtests::WriteContextForTests ctx(&_opCtx, ns);
             auto pinnedCursor = unittest::assertGet(
                 ctx.getCollection()->getCursorManager()->pinCursor(&_opCtx, cursorId));
-            ASSERT_EQUALS(2, pinnedCursor.getCursor()->pos());
+            ASSERT_EQUALS(std::uint64_t(2), pinnedCursor.getCursor()->nReturnedSoFar());
         }
 
         cursor = _client.getMore(ns, cursorId);
@@ -311,7 +312,7 @@ public:
         }
 
         // Create a cursor on the collection, with a batch size of 200.
-        unique_ptr<DBClientCursor> cursor = _client.query(ns, "", 0, 0, 0, 0, 200);
+        unique_ptr<DBClientCursor> cursor = _client.query(NamespaceString(ns), "", 0, 0, 0, 0, 200);
 
         // Count 500 results, spanning a few batches of documents.
         for (int i = 0; i < 500; ++i) {
@@ -354,7 +355,7 @@ public:
         }
 
         // Create a cursor on the collection, with a batch size of 200.
-        unique_ptr<DBClientCursor> cursor = _client.query(ns, "", 0, 0, 0, 0, 200);
+        unique_ptr<DBClientCursor> cursor = _client.query(NamespaceString(ns), "", 0, 0, 0, 0, 200);
         CursorId cursorId = cursor->getCursorId();
 
         // Count 500 results, spanning a few batches of documents.
@@ -398,19 +399,19 @@ public:
     }
 
     void testLimit(int limit) {
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), limit)->itcount(), limit);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), limit)->itcount(), limit);
     }
     void run() {
         for (int i = 0; i < 1000; i++)
             insert(ns, BSON(GENOID << "i" << i));
 
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 1)->itcount(), 1);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 10)->itcount(), 10);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 101)->itcount(), 101);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 999)->itcount(), 999);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 1000)->itcount(), 1000);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 1001)->itcount(), 1000);
-        ASSERT_EQUALS(_client.query(ns, BSONObj(), 0)->itcount(), 1000);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 1)->itcount(), 1);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 10)->itcount(), 10);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 101)->itcount(), 101);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 999)->itcount(), 999);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 1000)->itcount(), 1000);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 1001)->itcount(), 1000);
+        ASSERT_EQUALS(_client.query(NamespaceString(ns), BSONObj(), 0)->itcount(), 1000);
     }
 };
 
@@ -420,13 +421,22 @@ public:
         _client.dropCollection("unittests.querytests.TailNotAtEnd");
     }
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         const char* ns = "unittests.querytests.TailNotAtEnd";
         _client.createCollection(ns, 2047, true);
         insert(ns, BSON("a" << 0));
         insert(ns, BSON("a" << 1));
         insert(ns, BSON("a" << 2));
-        unique_ptr<DBClientCursor> c = _client.query(
-            ns, Query().hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns),
+                                                     Query().hint(BSON("$natural" << 1)),
+                                                     2,
+                                                     0,
+                                                     0,
+                                                     QueryOption_CursorTailable);
         ASSERT(0 != c->getCursorId());
         while (c->more())
             c->next();
@@ -446,15 +456,28 @@ public:
         _client.dropCollection("unittests.querytests.EmptyTail");
     }
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         const char* ns = "unittests.querytests.EmptyTail";
         _client.createCollection(ns, 1900, true);
-        unique_ptr<DBClientCursor> c = _client.query(
-            ns, Query().hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns),
+                                                     Query().hint(BSON("$natural" << 1)),
+                                                     2,
+                                                     0,
+                                                     0,
+                                                     QueryOption_CursorTailable);
         ASSERT_EQUALS(0, c->getCursorId());
         ASSERT(c->isDead());
         insert(ns, BSON("a" << 0));
-        c = _client.query(
-            ns, QUERY("a" << 1).hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        c = _client.query(NamespaceString(ns),
+                          QUERY("a" << 1).hint(BSON("$natural" << 1)),
+                          2,
+                          0,
+                          0,
+                          QueryOption_CursorTailable);
         ASSERT(0 != c->getCursorId());
         ASSERT(!c->isDead());
     }
@@ -466,12 +489,21 @@ public:
         _client.dropCollection("unittests.querytests.TailableDelete");
     }
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         const char* ns = "unittests.querytests.TailableDelete";
         _client.createCollection(ns, 8192, true, 2);
         insert(ns, BSON("a" << 0));
         insert(ns, BSON("a" << 1));
-        unique_ptr<DBClientCursor> c = _client.query(
-            ns, Query().hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns),
+                                                     Query().hint(BSON("$natural" << 1)),
+                                                     2,
+                                                     0,
+                                                     0,
+                                                     QueryOption_CursorTailable);
         c->next();
         c->next();
         ASSERT(!c->more());
@@ -489,12 +521,21 @@ public:
         _client.dropCollection("unittests.querytests.TailableDelete");
     }
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         const char* ns = "unittests.querytests.TailableDelete";
         _client.createCollection(ns, 8192, true, 2);
         insert(ns, BSON("a" << 0));
         insert(ns, BSON("a" << 1));
-        unique_ptr<DBClientCursor> c = _client.query(
-            ns, Query().hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns),
+                                                     Query().hint(BSON("$natural" << 1)),
+                                                     2,
+                                                     0,
+                                                     0,
+                                                     QueryOption_CursorTailable);
         c->next();
         c->next();
         ASSERT(!c->more());
@@ -514,12 +555,21 @@ public:
         _client.dropCollection("unittests.querytests.TailableInsertDelete");
     }
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         const char* ns = "unittests.querytests.TailableInsertDelete";
         _client.createCollection(ns, 1330, true);
         insert(ns, BSON("a" << 0));
         insert(ns, BSON("a" << 1));
-        unique_ptr<DBClientCursor> c = _client.query(
-            ns, Query().hint(BSON("$natural" << 1)), 2, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns),
+                                                     Query().hint(BSON("$natural" << 1)),
+                                                     2,
+                                                     0,
+                                                     0,
+                                                     QueryOption_CursorTailable);
         c->next();
         c->next();
         ASSERT(!c->more());
@@ -539,8 +589,9 @@ public:
     void run() {
         const char* ns = "unittests.querytests.TailCappedOnly";
         _client.insert(ns, BSONObj());
-        ASSERT_THROWS(_client.query(ns, BSONObj(), 0, 0, 0, QueryOption_CursorTailable),
-                      AssertionException);
+        ASSERT_THROWS(
+            _client.query(NamespaceString(ns), BSONObj(), 0, 0, 0, QueryOption_CursorTailable),
+            AssertionException);
     }
 };
 
@@ -559,6 +610,11 @@ public:
     }
 
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         const char* ns = "unittests.querytests.TailableQueryOnId";
         BSONObj info;
         _client.runCommand("unittests",
@@ -573,12 +629,12 @@ public:
                            info);
         insertA(ns, 0);
         insertA(ns, 1);
-        unique_ptr<DBClientCursor> c1 =
-            _client.query(ns, QUERY("a" << GT << -1), 0, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c1 = _client.query(
+            NamespaceString(ns), QUERY("a" << GT << -1), 0, 0, 0, QueryOption_CursorTailable);
         OID id;
         id.init("000000000000000000000000");
-        unique_ptr<DBClientCursor> c2 =
-            _client.query(ns, QUERY("value" << GT << id), 0, 0, 0, QueryOption_CursorTailable);
+        unique_ptr<DBClientCursor> c2 = _client.query(
+            NamespaceString(ns), QUERY("value" << GT << id), 0, 0, 0, QueryOption_CursorTailable);
         c1->next();
         c1->next();
         ASSERT(!c1->more());
@@ -602,88 +658,41 @@ public:
         _client.dropCollection("unittests.querytests.OplogReplayMode");
     }
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         const char* ns = "unittests.querytests.OplogReplayMode";
 
         // Create a capped collection of size 10.
         _client.dropCollection(ns);
         _client.createCollection(ns, 10, true);
 
-        insert(ns, BSON("ts" << 0));
-        insert(ns, BSON("ts" << 1));
-        insert(ns, BSON("ts" << 2));
+        insert(ns, BSON("ts" << Timestamp(1000, 0)));
+        insert(ns, BSON("ts" << Timestamp(1000, 1)));
+        insert(ns, BSON("ts" << Timestamp(1000, 2)));
         unique_ptr<DBClientCursor> c =
-            _client.query(ns,
-                          QUERY("ts" << GT << 1).hint(BSON("$natural" << 1)),
+            _client.query(NamespaceString(ns),
+                          QUERY("ts" << GT << Timestamp(1000, 1)).hint(BSON("$natural" << 1)),
                           0,
                           0,
                           0,
                           QueryOption_OplogReplay);
         ASSERT(c->more());
-        ASSERT_EQUALS(2, c->next().getIntField("ts"));
+        ASSERT_EQUALS(2u, c->next()["ts"].timestamp().getInc());
         ASSERT(!c->more());
 
-        insert(ns, BSON("ts" << 3));
-        c = _client.query(ns,
-                          QUERY("ts" << GT << 1).hint(BSON("$natural" << 1)),
+        insert(ns, BSON("ts" << Timestamp(1000, 3)));
+        c = _client.query(NamespaceString(ns),
+                          QUERY("ts" << GT << Timestamp(1000, 1)).hint(BSON("$natural" << 1)),
                           0,
                           0,
                           0,
                           QueryOption_OplogReplay);
         ASSERT(c->more());
-        ASSERT_EQUALS(2, c->next().getIntField("ts"));
+        ASSERT_EQUALS(2u, c->next()["ts"].timestamp().getInc());
         ASSERT(c->more());
-    }
-};
-
-class OplogReplaySlaveReadTill : public ClientBase {
-public:
-    ~OplogReplaySlaveReadTill() {
-        _client.dropCollection("unittests.querytests.OplogReplaySlaveReadTill");
-    }
-    void run() {
-        const char* ns = "unittests.querytests.OplogReplaySlaveReadTill";
-
-        // Create a capped collection of size 10.
-        _client.dropCollection(ns);
-        _client.createCollection(ns, 10, true);
-
-        Lock::DBLock lk(&_opCtx, "unittests", MODE_X);
-        OldClientContext ctx(&_opCtx, ns);
-
-        BSONObj info;
-        _client.runCommand("unittests",
-                           BSON("create"
-                                << "querytests.OplogReplaySlaveReadTill"
-                                << "capped"
-                                << true
-                                << "size"
-                                << 8192),
-                           info);
-
-        Date_t one = Date_t::fromMillisSinceEpoch(
-            LogicalClock::get(&_opCtx)->reserveTicks(1).asTimestamp().asLL());
-        Date_t two = Date_t::fromMillisSinceEpoch(
-            LogicalClock::get(&_opCtx)->reserveTicks(1).asTimestamp().asLL());
-        Date_t three = Date_t::fromMillisSinceEpoch(
-            LogicalClock::get(&_opCtx)->reserveTicks(1).asTimestamp().asLL());
-        insert(ns, BSON("ts" << one));
-        insert(ns, BSON("ts" << two));
-        insert(ns, BSON("ts" << three));
-        unique_ptr<DBClientCursor> c =
-            _client.query(ns,
-                          QUERY("ts" << GTE << two).hint(BSON("$natural" << 1)),
-                          0,
-                          0,
-                          0,
-                          QueryOption_OplogReplay | QueryOption_CursorTailable |
-                              DBClientCursor::QueryOptionLocal_forceOpQuery);
-        ASSERT(c->more());
-        ASSERT_EQUALS(two, c->next()["ts"].Date());
-        long long cursorId = c->getCursorId();
-
-        auto pinnedCursor = unittest::assertGet(
-            ctx.db()->getCollection(&_opCtx, ns)->getCursorManager()->pinCursor(&_opCtx, cursorId));
-        ASSERT_EQUALS(three.toULL(), pinnedCursor.getCursor()->getSlaveReadTill().asULL());
     }
 };
 
@@ -693,28 +702,33 @@ public:
         _client.dropCollection("unittests.querytests.OplogReplayExplain");
     }
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         const char* ns = "unittests.querytests.OplogReplayExplain";
 
         // Create a capped collection of size 10.
         _client.dropCollection(ns);
         _client.createCollection(ns, 10, true);
 
-        insert(ns, BSON("ts" << 0));
-        insert(ns, BSON("ts" << 1));
-        insert(ns, BSON("ts" << 2));
-        unique_ptr<DBClientCursor> c =
-            _client.query(ns,
-                          QUERY("ts" << GT << 1).hint(BSON("$natural" << 1)).explain(),
-                          0,
-                          0,
-                          0,
-                          QueryOption_OplogReplay);
+        insert(ns, BSON("ts" << Timestamp(1000, 0)));
+        insert(ns, BSON("ts" << Timestamp(1000, 1)));
+        insert(ns, BSON("ts" << Timestamp(1000, 2)));
+        unique_ptr<DBClientCursor> c = _client.query(
+            NamespaceString(ns),
+            QUERY("ts" << GT << Timestamp(1000, 1)).hint(BSON("$natural" << 1)).explain(),
+            0,
+            0,
+            0,
+            QueryOption_OplogReplay);
         ASSERT(c->more());
 
         // Check number of results and filterSet flag in explain.
         // filterSet is not available in oplog replay mode.
         BSONObj explainObj = c->next();
-        ASSERT(explainObj.hasField("executionStats"));
+        ASSERT(explainObj.hasField("executionStats")) << explainObj;
         BSONObj execStats = explainObj["executionStats"].Obj();
         ASSERT_EQUALS(1, execStats.getIntField("nReturned"));
 
@@ -891,9 +905,6 @@ public:
         _client.insert(ns, BSON("a" << 4 << "b" << 3));
         ASSERT_EQUALS(ErrorCodes::DuplicateKey,
                       dbtests::createIndex(&_opCtx, ns, BSON("a" << 1), true));
-        ASSERT_EQUALS(
-            0U,
-            _client.count("unittests.system.indexes", BSON("ns" << ns << "name" << NE << "_id_")));
     }
 };
 
@@ -919,7 +930,9 @@ public:
         const char* ns = "unittests.querytests.Size";
         _client.insert(ns, fromjson("{a:[1,2,3]}"));
         ASSERT_OK(dbtests::createIndex(&_opCtx, ns, BSON("a" << 1)));
-        ASSERT(_client.query(ns, QUERY("a" << mongo::BSIZE << 3).hint(BSON("a" << 1)))->more());
+        ASSERT(_client
+                   .query(NamespaceString(ns), QUERY("a" << mongo::BSIZE << 3).hint(BSON("a" << 1)))
+                   ->more());
     }
 };
 
@@ -931,10 +944,13 @@ public:
     void run() {
         const char* ns = "unittests.querytests.IndexedArray";
         _client.insert(ns, fromjson("{a:[1,2,3]}"));
-        ASSERT(_client.query(ns, Query("{a:[1,2,3]}"))->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{a:[1,2,3]}"))->more());
         ASSERT_OK(dbtests::createIndex(&_opCtx, ns, BSON("a" << 1)));
-        ASSERT(_client.query(ns, Query("{a:{$in:[1,[1,2,3]]}}").hint(BSON("a" << 1)))->more());
-        ASSERT(_client.query(ns, Query("{a:[1,2,3]}").hint(BSON("a" << 1)))->more());  // SERVER-146
+        ASSERT(
+            _client.query(NamespaceString(ns), Query("{a:{$in:[1,[1,2,3]]}}").hint(BSON("a" << 1)))
+                ->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{a:[1,2,3]}").hint(BSON("a" << 1)))
+                   ->more());  // SERVER-146
     }
 };
 
@@ -954,10 +970,14 @@ public:
 private:
     void check(const string& hintField) {
         const char* ns = "unittests.querytests.InsideArray";
-        ASSERT(_client.query(ns, Query("{a:[[1],2]}").hint(BSON(hintField << 1)))->more());
-        ASSERT(_client.query(ns, Query("{a:[1]}").hint(BSON(hintField << 1)))->more());
-        ASSERT(_client.query(ns, Query("{a:2}").hint(BSON(hintField << 1)))->more());
-        ASSERT(!_client.query(ns, Query("{a:1}").hint(BSON(hintField << 1)))->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{a:[[1],2]}").hint(BSON(hintField << 1)))
+                   ->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{a:[1]}").hint(BSON(hintField << 1)))
+                   ->more());
+        ASSERT(
+            _client.query(NamespaceString(ns), Query("{a:2}").hint(BSON(hintField << 1)))->more());
+        ASSERT(
+            !_client.query(NamespaceString(ns), Query("{a:1}").hint(BSON(hintField << 1)))->more());
     }
 };
 
@@ -971,8 +991,10 @@ public:
         _client.insert(ns, fromjson("{'_id':1,a:[1]}"));
         _client.insert(ns, fromjson("{'_id':2,a:[[1]]}"));
         ASSERT_OK(dbtests::createIndex(&_opCtx, ns, BSON("a" << 1)));
-        ASSERT_EQUALS(
-            1, _client.query(ns, Query("{a:[1]}").hint(BSON("a" << 1)))->next().getIntField("_id"));
+        ASSERT_EQUALS(1,
+                      _client.query(NamespaceString(ns), Query("{a:[1]}").hint(BSON("a" << 1)))
+                          ->next()
+                          .getIntField("_id"));
     }
 };
 
@@ -992,8 +1014,10 @@ public:
 private:
     void check(const string& hintField) {
         const char* ns = "unittests.querytests.SubobjArr";
-        ASSERT(_client.query(ns, Query("{'a.b':1}").hint(BSON(hintField << 1)))->more());
-        ASSERT(_client.query(ns, Query("{'a.b':[1]}").hint(BSON(hintField << 1)))->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{'a.b':1}").hint(BSON(hintField << 1)))
+                   ->more());
+        ASSERT(_client.query(NamespaceString(ns), Query("{'a.b':[1]}").hint(BSON(hintField << 1)))
+                   ->more());
     }
 };
 
@@ -1010,7 +1034,7 @@ public:
         _client.insert(ns, BSON("a" << 2 << "b" << 1));
         _client.insert(ns, BSON("a" << 2 << "b" << 2));
 
-        ASSERT_EQUALS(4, count(_client.query(ns, BSONObj())));
+        ASSERT_EQUALS(4, count(_client.query(NamespaceString(ns), BSONObj())));
         BSONObj hints[] = {BSONObj(), BSON("a" << 1 << "b" << 1)};
         for (int i = 0; i < 2; ++i) {
             check(0, 0, 3, 3, 4, hints[i]);
@@ -1035,7 +1059,7 @@ private:
         q = q.minKey(BSON("a" << minA << "b" << minB)).maxKey(BSON("a" << maxA << "b" << maxB));
         if (!hint.isEmpty())
             q.hint(hint);
-        return _client.query(ns, q);
+        return _client.query(NamespaceString(ns), q);
     }
     void check(
         int minA, int minB, int maxA, int maxB, int expectedCount, const BSONObj& hint = empty_) {
@@ -1174,7 +1198,7 @@ public:
         _client.dropCollection("unittests.querytests.DifferentNumbers");
     }
     void t(const char* ns) {
-        unique_ptr<DBClientCursor> cursor = _client.query(ns, Query().sort("7"));
+        unique_ptr<DBClientCursor> cursor = _client.query(NamespaceString(ns), Query().sort("7"));
         while (cursor->more()) {
             BSONObj o = cursor->next();
             verify(o.valid(BSONVersion::kLatest));
@@ -1291,20 +1315,24 @@ public:
         _n = 0;
     }
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         string err;
-        OldClientWriteContext ctx(&_opCtx, ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, ns());
 
         // note that extents are always at least 4KB now - so this will get rounded up
         // a bit.
         {
             WriteUnitOfWork wunit(&_opCtx);
-            ASSERT(userCreateNS(&_opCtx,
-                                ctx.db(),
-                                ns(),
-                                fromjson("{ capped : true, size : 2000, max: 10000 }"),
-                                CollectionOptions::parseForCommand,
-                                false)
-                       .isOK());
+            CollectionOptions collectionOptions;
+            ASSERT_OK(
+                collectionOptions.parse(fromjson("{ capped : true, size : 2000, max: 10000 }"),
+                                        CollectionOptions::parseForCommand));
+            NamespaceString nss(ns());
+            ASSERT(ctx.db()->userCreateNS(&_opCtx, nss, collectionOptions, false).isOK());
             wunit.commit();
         }
 
@@ -1316,7 +1344,7 @@ public:
         int a = count();
 
         unique_ptr<DBClientCursor> c =
-            _client.query(ns(),
+            _client.query(NamespaceString(ns()),
                           QUERY("i" << GT << 0).hint(BSON("$natural" << 1)),
                           0,
                           0,
@@ -1360,7 +1388,7 @@ public:
     HelperTest() : CollectionBase("helpertest") {}
 
     void run() {
-        OldClientWriteContext ctx(&_opCtx, ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, ns());
 
         for (int i = 0; i < 50; i++) {
             insert(ns(), BSON("_id" << i << "x" << i * 2));
@@ -1407,7 +1435,7 @@ public:
     HelperByIdTest() : CollectionBase("helpertestbyid") {}
 
     void run() {
-        OldClientWriteContext ctx(&_opCtx, ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, ns());
 
         for (int i = 0; i < 1000; i++) {
             insert(ns(), BSON("_id" << i << "x" << i * 2));
@@ -1428,7 +1456,7 @@ class ClientCursorTest : public CollectionBase {
     ClientCursorTest() : CollectionBase("clientcursortest") {}
 
     void run() {
-        OldClientWriteContext ctx(&_opCtx, ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, ns());
 
         for (int i = 0; i < 1000; i++) {
             insert(ns(), BSON("_id" << i << "x" << i * 2));
@@ -1439,10 +1467,19 @@ class ClientCursorTest : public CollectionBase {
 class FindingStart : public CollectionBase {
 public:
     FindingStart() : CollectionBase("findingstart") {}
+    static const char* ns() {
+        return "local.querytests.findingstart";
+    }
 
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         BSONObj info;
-        ASSERT(_client.runCommand("unittests",
+        // Must use local db so that the collection is not replicated, to allow autoIndexId:false.
+        ASSERT(_client.runCommand("local",
                                   BSON("create"
                                        << "querytests.findingstart"
                                        << "capped"
@@ -1453,12 +1490,12 @@ public:
                                        << false),
                                   info));
 
-        int i = 0;
+        unsigned i = 0;
         int max = 1;
 
         while (1) {
             int oldCount = count();
-            _client.insert(ns(), BSON("ts" << i++));
+            _client.insert(ns(), BSON("ts" << Timestamp(1000, i++)));
             int newCount = count();
             if (oldCount == newCount || newCount < max)
                 break;
@@ -1468,30 +1505,48 @@ public:
         }
 
         for (int k = 0; k < 5; ++k) {
-            _client.insert(ns(), BSON("ts" << i++));
-            int min =
-                _client.query(ns(), Query().sort(BSON("$natural" << 1)))->next()["ts"].numberInt();
-            for (int j = -1; j < i; ++j) {
+            _client.insert(ns(), BSON("ts" << Timestamp(1000, i++)));
+            unsigned min =
+                _client.query(NamespaceString(ns()), Query().sort(BSON("$natural" << 1)))
+                    ->next()["ts"]
+                    .timestamp()
+                    .getInc();
+            for (unsigned j = -1; j < i; ++j) {
                 unique_ptr<DBClientCursor> c =
-                    _client.query(ns(), QUERY("ts" << GTE << j), 0, 0, 0, QueryOption_OplogReplay);
+                    _client.query(NamespaceString(ns()),
+                                  QUERY("ts" << GTE << Timestamp(1000, j)),
+                                  0,
+                                  0,
+                                  0,
+                                  QueryOption_OplogReplay);
                 ASSERT(c->more());
                 BSONObj next = c->next();
                 ASSERT(!next["ts"].eoo());
-                ASSERT_EQUALS((j > min ? j : min), next["ts"].numberInt());
+                ASSERT_EQUALS((j > min ? j : min), next["ts"].timestamp().getInc());
             }
         }
+        ASSERT(_client.dropCollection(ns()));
     }
 };
 
 class FindingStartPartiallyFull : public CollectionBase {
 public:
     FindingStartPartiallyFull() : CollectionBase("findingstart") {}
+    static const char* ns() {
+        return "local.querytests.findingstart";
+    }
 
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         size_t startNumCursors = numCursorsOpen();
 
         BSONObj info;
-        ASSERT(_client.runCommand("unittests",
+        // Must use local db so that the collection is not replicated, to allow autoIndexId:false.
+        ASSERT(_client.runCommand("local",
                                   BSON("create"
                                        << "querytests.findingstart"
                                        << "capped"
@@ -1502,25 +1557,34 @@ public:
                                        << false),
                                   info));
 
-        int i = 0;
-        for (; i < 150; _client.insert(ns(), BSON("ts" << i++)))
+        unsigned i = 0;
+        for (; i < 150; _client.insert(ns(), BSON("ts" << Timestamp(1000, i++))))
             ;
 
         for (int k = 0; k < 5; ++k) {
-            _client.insert(ns(), BSON("ts" << i++));
-            int min =
-                _client.query(ns(), Query().sort(BSON("$natural" << 1)))->next()["ts"].numberInt();
-            for (int j = -1; j < i; ++j) {
+            _client.insert(ns(), BSON("ts" << Timestamp(1000, i++)));
+            unsigned min =
+                _client.query(NamespaceString(ns()), Query().sort(BSON("$natural" << 1)))
+                    ->next()["ts"]
+                    .timestamp()
+                    .getInc();
+            for (unsigned j = -1; j < i; ++j) {
                 unique_ptr<DBClientCursor> c =
-                    _client.query(ns(), QUERY("ts" << GTE << j), 0, 0, 0, QueryOption_OplogReplay);
+                    _client.query(NamespaceString(ns()),
+                                  QUERY("ts" << GTE << Timestamp(1000, j)),
+                                  0,
+                                  0,
+                                  0,
+                                  QueryOption_OplogReplay);
                 ASSERT(c->more());
                 BSONObj next = c->next();
                 ASSERT(!next["ts"].eoo());
-                ASSERT_EQUALS((j > min ? j : min), next["ts"].numberInt());
+                ASSERT_EQUALS((j > min ? j : min), next["ts"].timestamp().getInc());
             }
         }
 
         ASSERT_EQUALS(startNumCursors, numCursorsOpen());
+        ASSERT(_client.dropCollection(ns()));
     }
 };
 
@@ -1531,17 +1595,30 @@ public:
 class FindingStartStale : public CollectionBase {
 public:
     FindingStartStale() : CollectionBase("findingstart") {}
+    static const char* ns() {
+        return "local.querytests.findingstart";
+    }
 
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         size_t startNumCursors = numCursorsOpen();
 
         // Check OplogReplay mode with missing collection.
-        unique_ptr<DBClientCursor> c0 =
-            _client.query(ns(), QUERY("ts" << GTE << 50), 0, 0, 0, QueryOption_OplogReplay);
+        unique_ptr<DBClientCursor> c0 = _client.query(NamespaceString(ns()),
+                                                      QUERY("ts" << GTE << Timestamp(1000, 50)),
+                                                      0,
+                                                      0,
+                                                      0,
+                                                      QueryOption_OplogReplay);
         ASSERT(!c0->more());
 
         BSONObj info;
-        ASSERT(_client.runCommand("unittests",
+        // Must use local db so that the collection is not replicated, to allow autoIndexId:false.
+        ASSERT(_client.runCommand("local",
                                   BSON("create"
                                        << "querytests.findingstart"
                                        << "capped"
@@ -1553,19 +1630,30 @@ public:
                                   info));
 
         // Check OplogReplay mode with empty collection.
-        unique_ptr<DBClientCursor> c =
-            _client.query(ns(), QUERY("ts" << GTE << 50), 0, 0, 0, QueryOption_OplogReplay);
+        unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns()),
+                                                     QUERY("ts" << GTE << Timestamp(1000, 50)),
+                                                     0,
+                                                     0,
+                                                     0,
+                                                     QueryOption_OplogReplay);
         ASSERT(!c->more());
 
         // Check with some docs in the collection.
-        for (int i = 100; i < 150; _client.insert(ns(), BSON("ts" << i++)))
+        for (int i = 100; i < 150; _client.insert(ns(), BSON("ts" << Timestamp(1000, i++))))
             ;
-        c = _client.query(ns(), QUERY("ts" << GTE << 50), 0, 0, 0, QueryOption_OplogReplay);
+        c = _client.query(NamespaceString(ns()),
+                          QUERY("ts" << GTE << Timestamp(1000, 50)),
+                          0,
+                          0,
+                          0,
+                          QueryOption_OplogReplay);
         ASSERT(c->more());
-        ASSERT_EQUALS(100, c->next()["ts"].numberInt());
+        ASSERT_EQUALS(100u, c->next()["ts"].timestamp().getInc());
 
         // Check that no persistent cursors outlast our queries above.
         ASSERT_EQUALS(startNumCursors, numCursorsOpen());
+
+        ASSERT(_client.dropCollection(ns()));
     }
 };
 
@@ -1576,6 +1664,35 @@ public:
         BSONObj result;
         _client.runCommand("admin", BSON("whatsmyuri" << 1), result);
         ASSERT_EQUALS("", result["you"].str());
+    }
+};
+
+class QueryByUuid : public CollectionBase {
+public:
+    QueryByUuid() : CollectionBase("QueryByUuid") {}
+
+    void run() {
+        CollectionOptions coll_opts;
+        coll_opts.uuid = UUID::gen();
+        {
+            Lock::GlobalWrite lk(&_opCtx);
+            OldClientContext context(&_opCtx, ns());
+            WriteUnitOfWork wunit(&_opCtx);
+            context.db()->createCollection(&_opCtx, ns(), coll_opts, false);
+            wunit.commit();
+        }
+        insert(ns(), BSON("a" << 1));
+        insert(ns(), BSON("a" << 2));
+        insert(ns(), BSON("a" << 3));
+        unique_ptr<DBClientCursor> cursor =
+            _client.query(NamespaceStringOrUUID("unittests", *coll_opts.uuid), BSONObj());
+        ASSERT_EQUALS(string(ns()), cursor->getns());
+        for (int i = 1; i <= 3; ++i) {
+            ASSERT(cursor->more());
+            BSONObj obj(cursor->next());
+            ASSERT_EQUALS(obj["a"].Int(), i);
+        }
+        ASSERT(!cursor->more());
     }
 };
 
@@ -1593,6 +1710,11 @@ class Exhaust : public CollectionInternalBase {
 public:
     Exhaust() : CollectionInternalBase("exhaust") {}
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         BSONObj info;
         ASSERT(_client.runCommand("unittests",
                                   BSON("create"
@@ -1602,10 +1724,10 @@ public:
                                        << "size"
                                        << 8192),
                                   info));
-        _client.insert(ns(), BSON("ts" << 0));
+        _client.insert(ns(), BSON("ts" << Timestamp(1000, 0)));
         Message message;
         assembleQueryRequest(ns(),
-                             BSON("ts" << GTE << 0),
+                             BSON("ts" << GTE << Timestamp(1000, 0)),
                              0,
                              0,
                              0,
@@ -1631,7 +1753,7 @@ public:
         {
             // With five results and a batch size of 5, a cursor is created since we don't know
             // there are no more results.
-            std::unique_ptr<DBClientCursor> c = _client.query(ns(), Query(), 5);
+            std::unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns()), Query(), 5);
             ASSERT(c->more());
             ASSERT_NE(0, c->getCursorId());
             for (int i = 0; i < 5; ++i) {
@@ -1643,7 +1765,7 @@ public:
         {
             // With a batchsize of 6 we know there are no more results so we don't create a
             // cursor.
-            std::unique_ptr<DBClientCursor> c = _client.query(ns(), Query(), 6);
+            std::unique_ptr<DBClientCursor> c = _client.query(NamespaceString(ns()), Query(), 6);
             ASSERT(c->more());
             ASSERT_EQ(0, c->getCursorId());
         }
@@ -1709,7 +1831,6 @@ public:
         add<TailCappedOnly>();
         add<TailableQueryOnId>();
         add<OplogReplayMode>();
-        add<OplogReplaySlaveReadTill>();
         add<OplogReplayExplain>();
         add<ArrayId>();
         add<UnderscoreNs>();
@@ -1740,6 +1861,7 @@ public:
         add<FindingStartPartiallyFull>();
         add<FindingStartStale>();
         add<WhatsMyUri>();
+        add<QueryByUuid>();
         add<Exhaust>();
         add<QueryReadsAll>();
         add<queryobjecttests::names1>();

@@ -1,28 +1,31 @@
-/*    Copyright 2015 MongoDB Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -68,6 +71,10 @@ public:
     static const Decimal128 kNegativeInfinity;
     static const Decimal128 kPositiveNaN;
     static const Decimal128 kNegativeNaN;
+
+    static const Decimal128 kPi;
+    static const Decimal128 kPiOver180;
+    static const Decimal128 k180OverPi;
 
     static const uint32_t kMaxBiasedExponent = 6143 + 6144;
     // Biased exponent of a Decimal128 with least significant digit in the units place
@@ -123,6 +130,24 @@ public:
     }
 
     /**
+     * Returns true if a valid Decimal can be constructed from the given arguments.
+     */
+    static bool isValid(uint64_t sign,
+                        uint64_t exponent,
+                        uint64_t coefficientHigh,
+                        uint64_t coefficientLow) {
+        if (coefficientHigh >= 0x1ed09bead87c0 &&
+            (coefficientHigh != 0x1ed09bead87c0 || coefficientLow != 0x378d8e63ffffffff)) {
+            return false;
+        }
+        auto value =
+            Value{coefficientLow,
+                  (sign << kSignFieldPos) | (exponent << kExponentFieldPos) | coefficientHigh};
+
+        return Decimal128(value).getBiasedExponent() == exponent;
+    }
+
+    /**
      * Construct a 0E0 valued Decimal128.
      */
     Decimal128() : _value(kNormalizedZero._value) {}
@@ -142,9 +167,7 @@ public:
         : _value(
               Value{coefficientLow,
                     (sign << kSignFieldPos) | (exponent << kExponentFieldPos) | coefficientHigh}) {
-        dassert(coefficientHigh < 0x1ed09bead87c0 ||
-                (coefficientHigh == 0x1ed09bead87c0 && coefficientLow == 0x378d8e63ffffffff));
-        dassert(exponent == getBiasedExponent());
+        dassert(isValid(sign, exponent, coefficientHigh, coefficientLow));
     }
 
     explicit Decimal128(std::int32_t int32Value);
@@ -221,6 +244,90 @@ public:
      * Returns the absolute value of this.
      */
     Decimal128 toAbs() const;
+
+    /**
+     * Returns the acos value of this.
+     */
+    Decimal128 acos(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 acos(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the acosh value of this.
+     */
+    Decimal128 acosh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 acosh(std::uint32_t* signalingFlags,
+                     RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the asin value of this.
+     */
+    Decimal128 asin(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 asin(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the asinh value of this.
+     */
+    Decimal128 asinh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 asinh(std::uint32_t* signalingFlags,
+                     RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the atan value of this.
+     */
+    Decimal128 atan(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 atan(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the atan2(this, other) rather than atan2(other,this), which
+     * would produce different results.
+     */
+    Decimal128 atan2(const Decimal128& other, RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 atan2(const Decimal128& other,
+                     std::uint32_t* signalingFlags,
+                     RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the atanh value of this.
+     */
+    Decimal128 atanh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 atanh(std::uint32_t* signalingFlags,
+                     RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the cos value of this.
+     */
+    Decimal128 cos(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 cos(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the cosh value of this.
+     */
+    Decimal128 cosh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 cosh(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the sin value of this.
+     */
+    Decimal128 sin(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 sin(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the sinh value of this.
+     */
+    Decimal128 sinh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 sinh(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+    /**
+     * Returns the tan value of this.
+     */
+    Decimal128 tan(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 tan(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
+    /**
+     * Returns the tanh value of this.
+     */
+    Decimal128 tanh(RoundingMode roundMode = kRoundTiesToEven) const;
+    Decimal128 tanh(std::uint32_t* signalingFlags, RoundingMode roundMode = kRoundTiesToEven) const;
+
 
     /**
      * Returns `this` with inverted sign bit

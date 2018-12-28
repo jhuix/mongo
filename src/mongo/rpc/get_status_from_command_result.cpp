@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,6 +32,7 @@
 
 #include "mongo/rpc/get_status_from_command_result.h"
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
@@ -40,6 +43,7 @@ namespace mongo {
 
 namespace {
 const std::string kCmdResponseWriteConcernField = "writeConcernError";
+const std::string kCmdResponseWriteErrorsField = "writeErrors";
 }  // namespace
 
 Status getStatusFromCommandResult(const BSONObj& result) {
@@ -75,7 +79,7 @@ Status getStatusFromCommandResult(const BSONObj& result) {
         code = ErrorCodes::CommandNotFound;
     }
 
-    return Status(ErrorCodes::Error(code), errmsg);
+    return Status(ErrorCodes::Error(code), errmsg, result);
 }
 
 Status getWriteConcernStatusFromCommandResult(const BSONObj& obj) {
@@ -105,6 +109,48 @@ Status getWriteConcernStatusFromCommandResult(const BSONObj& obj) {
                                     << wcErrorInvalidMsg);
     }
     return wcError.toStatus();
+}
+
+Status getFirstWriteErrorStatusFromCommandResult(const BSONObj& cmdResponse) {
+    BSONElement writeErrorElem;
+    auto status = bsonExtractTypedField(
+        cmdResponse, kCmdResponseWriteErrorsField, BSONType::Array, &writeErrorElem);
+    if (!status.isOK()) {
+        if (status == ErrorCodes::NoSuchKey) {
+            return Status::OK();
+        } else {
+            return status;
+        }
+    }
+
+    auto firstWriteErrorElem = writeErrorElem.Obj().firstElement();
+    if (!firstWriteErrorElem) {
+        return Status::OK();
+    }
+
+    if (firstWriteErrorElem.type() != BSONType::Object) {
+        return Status(ErrorCodes::UnsupportedFormat,
+                      str::stream() << "writeErrors should be an array of objects, found "
+                                    << typeName(firstWriteErrorElem.type()));
+    }
+
+    auto firstWriteErrorObj = firstWriteErrorElem.Obj();
+
+    return Status(ErrorCodes::Error(firstWriteErrorObj["code"].Int()),
+                  firstWriteErrorObj["errmsg"].String(),
+                  firstWriteErrorObj);
+}
+
+Status getStatusFromWriteCommandReply(const BSONObj& cmdResponse) {
+    auto status = getStatusFromCommandResult(cmdResponse);
+    if (!status.isOK()) {
+        return status;
+    }
+    status = getFirstWriteErrorStatusFromCommandResult(cmdResponse);
+    if (!status.isOK()) {
+        return status;
+    }
+    return getWriteConcernStatusFromCommandResult(cmdResponse);
 }
 
 }  // namespace mongo

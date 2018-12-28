@@ -13,6 +13,7 @@ var waitForState;
 var reInitiateWithoutThrowingOnAbortedMember;
 var awaitRSClientHosts;
 var getLastOpTime;
+var setLogVerbosity;
 
 (function() {
     "use strict";
@@ -193,8 +194,20 @@ var getLastOpTime;
         var e;
         var master;
         try {
-            assert.commandWorked(admin.runCommand(
-                {replSetReconfig: rs._updateConfigIfNotDurable(config), force: force}));
+            var reconfigCommand = {
+                replSetReconfig: rs._updateConfigIfNotDurable(config),
+                force: force
+            };
+            var res = admin.runCommand(reconfigCommand);
+
+            // Retry reconfig if quorum check failed because not enough voting nodes responded.
+            if (!res.ok && res.code === ErrorCodes.NodeNotFound) {
+                print("Replset reconfig failed because quorum check failed. Retry reconfig once. " +
+                      "Error: " + tojson(res));
+                res = admin.runCommand(reconfigCommand);
+            }
+
+            assert.commandWorked(res);
         } catch (e) {
             if (!isNetworkError(e)) {
                 throw e;
@@ -306,17 +319,10 @@ var getLastOpTime;
      * @param options - The options passed to {@link ReplSetTest.startSet}
      */
     startSetIfSupportsReadMajority = function(replSetTest, options) {
-        try {
-            replSetTest.startSet(options);
-        } catch (e) {
-            var conn = MongoRunner.runMongod();
-            if (!conn.getDB("admin").serverStatus().storageEngine.supportsCommittedReads) {
-                MongoRunner.stopMongod(conn);
-                return false;
-            }
-            throw e;
-        }
-        return true;
+        replSetTest.startSet(options);
+        return replSetTest.nodes[0]
+            .adminCommand("serverStatus")
+            .storageEngine.supportsCommittedReads;
     };
 
     /**
@@ -440,4 +446,19 @@ var getLastOpTime;
         var connStatus = replSetStatus.members.filter(m => m.self)[0];
         return connStatus.optime;
     };
+
+    /**
+     * Set log verbosity on all given nodes.
+     * e.g. setLogVerbosity(replTest.nodes, { "replication": {"verbosity": 3} });
+     */
+    setLogVerbosity = function(nodes, logVerbosity) {
+        var verbosity = {
+            "setParameter": 1,
+            "logComponentVerbosity": logVerbosity,
+        };
+        nodes.forEach(function(node) {
+            assert.commandWorked(node.adminCommand(verbosity));
+        });
+    };
+
 }());

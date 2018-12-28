@@ -1,25 +1,27 @@
 // validate.cpp
 
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,6 +35,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
@@ -48,7 +51,7 @@ using std::endl;
 using std::string;
 using std::stringstream;
 
-MONGO_FP_DECLARE(validateCmdCollectionNotValid);
+MONGO_FAIL_POINT_DEFINE(validateCmdCollectionNotValid);
 
 namespace {
 
@@ -66,16 +69,16 @@ class ValidateCmd : public BasicCommand {
 public:
     ValidateCmd() : BasicCommand("validate") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
-    virtual void help(stringstream& h) const {
-        h << "Validate contents of a namespace by scanning its data structures for correctness.  "
-             "Slow.\n"
-             "Add full:true option to do a more thorough check\n"
-             "Add scandata:false to skip the scan of the collection data without skipping scans "
-             "of any indexes";
+    std::string help() const override {
+        return "Validate contents of a namespace by scanning its data structures for correctness.  "
+               "Slow.\n"
+               "Add full:true option to do a more thorough check\n"
+               "Add scandata:false to skip the scan of the collection data without skipping scans "
+               "of any indexes";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -83,7 +86,7 @@ public:
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::validate);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -99,7 +102,7 @@ public:
             return true;
         }
 
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
 
         const bool full = cmdObj["full"].trueValue();
         const bool scanData = cmdObj["scandata"].trueValue();
@@ -113,10 +116,8 @@ public:
         }
 
         if (!nss.isNormal() && full) {
-            appendCommandStatus(
-                result,
-                {ErrorCodes::CommandFailed, "Can only run full validate on a regular collection"});
-            return false;
+            uasserted(ErrorCodes::CommandFailed,
+                      "Can only run full validate on a regular collection");
         }
 
         if (!serverGlobalParams.quiet.load()) {
@@ -128,41 +129,11 @@ public:
         Collection* collection = ctx.getDb() ? ctx.getDb()->getCollection(opCtx, nss) : NULL;
         if (!collection) {
             if (ctx.getDb() && ctx.getDb()->getViewCatalog()->lookup(opCtx, nss.ns())) {
-                return appendCommandStatus(
-                    result, {ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view"});
+                uasserted(ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view");
             }
 
-            appendCommandStatus(result, {ErrorCodes::NamespaceNotFound, "ns not found"});
-            return false;
+            uasserted(ErrorCodes::NamespaceNotFound, "ns not found");
         }
-
-        // Omit background validation logic until it is fully implemented and vetted.
-        const bool background = false;
-        /*
-        bool isInRecordIdOrder = collection->getRecordStore()->isInRecordIdOrder();
-        if (isInRecordIdOrder && !full) {
-            background = true;
-        }
-
-        if (cmdObj.hasElement("background")) {
-            background = cmdObj["background"].trueValue();
-        }
-
-        if (!isInRecordIdOrder && background) {
-            appendCommandStatus(result,
-                                {ErrorCodes::CommandFailed,
-                                 "This storage engine does not support the background option, use "
-                                 "background:false"});
-            return false;
-        }
-
-        if (full && background) {
-            appendCommandStatus(result,
-                                {ErrorCodes::CommandFailed,
-                                 "A full validate cannot run in the background, use full:false"});
-            return false;
-        }
-        */
 
         result.append("ns", nss.ns());
 
@@ -174,7 +145,7 @@ public:
                     opCtx->waitForConditionOrInterrupt(_validationNotifier, lock);
                 }
             } catch (AssertionException& e) {
-                appendCommandStatus(
+                CommandHelpers::appendCommandStatusNoThrow(
                     result,
                     {ErrorCodes::CommandFailed,
                      str::stream() << "Exception during validation: " << e.toString()});
@@ -190,11 +161,24 @@ public:
             _validationNotifier.notify_all();
         });
 
+        // TODO SERVER-30357: Add support for background validation.
+        const bool background = false;
+
         ValidateResults results;
         Status status =
             collection->validate(opCtx, level, background, std::move(collLk), &results, &result);
         if (!status.isOK()) {
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatusNoThrow(result, status);
+        }
+
+        CollectionCatalogEntry* catalogEntry = collection->getCatalogEntry();
+        CollectionOptions opts = catalogEntry->getCollectionOptions(opCtx);
+
+        // All collections must have a UUID.
+        if (!opts.uuid) {
+            results.errors.push_back(str::stream() << "UUID missing on collection " << nss.ns()
+                                                   << " but SchemaVersion=3.6");
+            results.valid = false;
         }
 
         if (!full) {

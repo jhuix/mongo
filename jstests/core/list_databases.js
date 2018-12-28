@@ -89,4 +89,5 @@
         listDatabases: 1,
         filter: {a: {$nearSphere: {$geometry: {type: "Point", coordinates: [0, 0]}}}}
     }));
+
 }());

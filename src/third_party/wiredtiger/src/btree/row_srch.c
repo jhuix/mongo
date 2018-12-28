@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -23,9 +23,10 @@ __search_insert_append(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt,
 	WT_ITEM key;
 	int cmp, i;
 
+	*donep = 0;
+
 	btree = S2BT(session);
 	collator = btree->collator;
-	*donep = 0;
 
 	if ((ins = WT_SKIP_LAST(ins_head)) == NULL)
 		return (0);
@@ -218,7 +219,7 @@ __wt_row_search(WT_SESSION_IMPL *session,
 	WT_REF *current, *descent;
 	WT_ROW *rip;
 	size_t match, skiphigh, skiplow;
-	uint32_t base, indx, limit;
+	uint32_t base, indx, limit, read_flags;
 	int cmp, depth;
 	bool append_check, descend_right, done;
 
@@ -430,7 +431,10 @@ append:			if (__wt_split_descent_race(
 				goto restart;
 		}
 
-descend:	/*
+descend:	/* Encourage races. */
+		WT_DIAGNOSTIC_YIELD;
+
+		/*
 		 * Swap the current page for the child page. If the page splits
 		 * while we're retrieving it, restart the search at the root.
 		 * We cannot restart in the "current" page; for example, if a
@@ -442,8 +446,11 @@ descend:	/*
 		 * On other error, simply return, the swap call ensures we're
 		 * holding nothing on failure.
 		 */
-		if ((ret = __wt_page_swap(
-		    session, current, descent, WT_READ_RESTART_OK)) == 0) {
+		read_flags = WT_READ_RESTART_OK;
+		if (F_ISSET(cbt, WT_CBT_READ_ONCE))
+			FLD_SET(read_flags, WT_READ_WONT_NEED);
+		if ((ret = __wt_page_swap(session,
+		    current, descent, read_flags)) == 0) {
 			current = descent;
 			continue;
 		}

@@ -7,10 +7,14 @@
  * to request more documents from the collection. If the pipeline is wrapped in a $facet stage, all
  * results will be computed in the initial request and buffered in the results array, preventing the
  * pipeline from requesting more documents.
- * @tags: [do_not_wrap_aggregations_in_facets]
+ * @tags: [do_not_wrap_aggregations_in_facets, requires_capped]
  */
 (function() {
     'use strict';
+
+    // This test runs a getMore in a parallel shell, which will not inherit the implicit session of
+    // the cursor establishing command.
+    TestData.disableImplicitSessions = true;
 
     // The DocumentSourceCursor which wraps PlanExecutors will batch results internally. We use the
     // 'internalDocumentSourceCursorBatchSizeBytes' parameter to disable this behavior so that we
@@ -48,6 +52,24 @@
         }
     }
 
+    // Check that there are no cursors still open on the source collection. If any are found, the
+    // test will fail and print a list of idle cursors. This should be called each time we
+    // expect a cursor to have been destroyed.
+    function assertNoOpenCursorsOnSourceCollection() {
+        const cursors =
+            testDB.getSiblingDB("admin")
+                .aggregate([
+                    {"$currentOp": {"idleCursors": true}},
+                    {
+                      "$match": {ns: sourceCollection.getFullName(), "type": "idleCursor"}
+
+                    }
+                ])
+                .toArray();
+        assert.eq(
+            cursors.length, 0, "Did not expect to find any cursors, but found " + tojson(cursors));
+    }
+
     const defaultAggregateCmdSmallBatch = {
         aggregate: sourceCollection.getName(),
         pipeline: [],
@@ -71,10 +93,7 @@
         'expected getMore to fail because the source collection was dropped');
 
     // Make sure the cursors were cleaned up.
-    let serverStatus = assert.commandWorked(testDB.adminCommand({serverStatus: 1}));
-    assert.eq(0,
-              serverStatus.metrics.cursor.open.total,
-              'expected to find no open cursors: ' + tojson(serverStatus.metrics.cursor));
+    assertNoOpenCursorsOnSourceCollection();
 
     // Test that dropping the source collection between an aggregate and a getMore will *not* cause
     // an aggregation pipeline to fail during the getMore if it *does not need* to fetch more
@@ -127,10 +146,7 @@
     });
 
     // Make sure the cursors were cleaned up.
-    serverStatus = assert.commandWorked(testDB.adminCommand({serverStatus: 1}));
-    assert.eq(0,
-              serverStatus.metrics.cursor.open.total,
-              'expected to find no open cursors: ' + tojson(serverStatus.metrics.cursor));
+    assertNoOpenCursorsOnSourceCollection();
 
     // Test that a $lookup stage will properly clean up its cursor if it becomes invalidated between
     // batches of a single lookup. This is the same scenario as above, but with the $lookup stage
@@ -164,10 +180,7 @@
         'expected getMore to fail because the foreign collection was dropped');
 
     // Make sure the cursors were cleaned up.
-    serverStatus = assert.commandWorked(testDB.adminCommand({serverStatus: 1}));
-    assert.eq(0,
-              serverStatus.metrics.cursor.open.total,
-              'expected to find no open cursors: ' + tojson(serverStatus.metrics.cursor));
+    assertNoOpenCursorsOnSourceCollection();
 
     // Test that dropping a $graphLookup stage's foreign collection between an aggregate and a
     // getMore will *not* cause an aggregation pipeline to fail during the getMore if it needs to
@@ -199,10 +212,7 @@
         res, 'expected getMore to succeed despite the foreign collection being dropped');
 
     // Make sure the cursors were cleaned up.
-    serverStatus = assert.commandWorked(testDB.adminCommand({serverStatus: 1}));
-    assert.eq(0,
-              serverStatus.metrics.cursor.open.total,
-              'expected to find no open cursors: ' + tojson(serverStatus.metrics.cursor));
+    assertNoOpenCursorsOnSourceCollection();
 
     // Test that the getMore still succeeds if the $graphLookup is followed by an $unwind on the
     // 'as' field and the collection is dropped between the initial request and a getMore.
@@ -233,10 +243,7 @@
         res, 'expected getMore to succeed despite the foreign collection being dropped');
 
     // Make sure the cursors were cleaned up.
-    serverStatus = assert.commandWorked(testDB.adminCommand({serverStatus: 1}));
-    assert.eq(0,
-              serverStatus.metrics.cursor.open.total,
-              'expected to find no open cursors: ' + tojson(serverStatus.metrics.cursor));
+    assertNoOpenCursorsOnSourceCollection();
 
     // Test that dropping the database will kill an aggregation's cursor, causing a subsequent
     // getMore to fail.
@@ -251,10 +258,7 @@
         ErrorCodes.QueryPlanKilled,
         'expected getMore to fail because the database was dropped');
 
-    serverStatus = assert.commandWorked(testDB.adminCommand({serverStatus: 1}));
-    assert.eq(0,
-              serverStatus.metrics.cursor.open.total,
-              'expected to find no open cursors: ' + tojson(serverStatus.metrics.cursor));
+    assertNoOpenCursorsOnSourceCollection();
 
     // Test that killing an aggregation's cursor by inserting enough documents to force a truncation
     // of a capped collection will cause a subsequent getMore to fail.
@@ -282,7 +286,7 @@
     assert.eq(maxNumDocs, sourceCollection.count());
     assert.commandFailedWithCode(
         testDB.runCommand({getMore: res.cursor.id, collection: getMoreCollName}),
-        ErrorCodes.QueryPlanKilled,
+        ErrorCodes.CappedPositionLost,
         'expected getMore to fail because the capped collection was truncated');
 
     // Test that killing an aggregation's cursor via the killCursors command will cause a subsequent
@@ -294,10 +298,7 @@
     assert.commandWorked(
         testDB.runCommand({killCursors: killCursorsNamespace, cursors: [res.cursor.id]}));
 
-    serverStatus = assert.commandWorked(testDB.adminCommand({serverStatus: 1}));
-    assert.eq(0,
-              serverStatus.metrics.cursor.open.total,
-              'expected to find no open cursors: ' + tojson(serverStatus.metrics.cursor));
+    assertNoOpenCursorsOnSourceCollection();
 
     assert.commandFailedWithCode(
         testDB.runCommand({getMore: res.cursor.id, collection: getMoreCollName}),
@@ -311,7 +312,7 @@
 
     // Use a failpoint to cause a getMore to hang indefinitely.
     assert.commandWorked(testDB.adminCommand(
-        {configureFailPoint: 'keepCursorPinnedDuringGetMore', mode: 'alwaysOn'}));
+        {configureFailPoint: 'waitAfterPinningCursorBeforeGetMoreBatch', mode: 'alwaysOn'}));
     const curOpFilter = {'command.getMore': res.cursor.id};
     assert.eq(0, testDB.currentOp(curOpFilter).inprog.length);
 
@@ -327,17 +328,20 @@
         return assert.commandWorked(testDB.currentOp(curOpFilter)).inprog.length === 1;
     }, 'expected getMore operation to remain active');
 
+    // Wait until we know the failpoint has been reached.
+    assert.soon(function() {
+        const filter = {"msg": "waitAfterPinningCursorBeforeGetMoreBatch"};
+        return assert.commandWorked(testDB.currentOp(filter)).inprog.length === 1;
+    });
+
     // Kill the operation.
     const opId = assert.commandWorked(testDB.currentOp(curOpFilter)).inprog[0].opid;
     assert.commandWorked(testDB.killOp(opId));
-    assert.commandWorked(
-        testDB.adminCommand({configureFailPoint: 'keepCursorPinnedDuringGetMore', mode: 'off'}));
+    assert.commandWorked(testDB.adminCommand(
+        {configureFailPoint: 'waitAfterPinningCursorBeforeGetMoreBatch', mode: 'off'}));
     assert.eq(0, awaitParallelShell());
 
-    serverStatus = assert.commandWorked(testDB.adminCommand({serverStatus: 1}));
-    assert.eq(0,
-              serverStatus.metrics.cursor.open.total,
-              'expected to find no open cursors: ' + tojson(serverStatus.metrics.cursor));
+    assertNoOpenCursorsOnSourceCollection();
 
     assert.commandFailedWithCode(
         testDB.runCommand({getMore: res.cursor.id, collection: getMoreCollName}),
@@ -349,7 +353,7 @@
     setup();
     res = assert.commandWorked(testDB.runCommand(defaultAggregateCmdSmallBatch));
 
-    serverStatus = assert.commandWorked(testDB.serverStatus());
+    let serverStatus = assert.commandWorked(testDB.serverStatus());
     const expectedNumTimedOutCursors = serverStatus.metrics.cursor.timedOut + 1;
 
     // Wait until the idle cursor background job has killed the aggregation cursor.
@@ -367,7 +371,7 @@
                 ' timed out cursors: ' + tojson(serverStatus.metrics.cursor);
         });
 
-    assert.eq(0, serverStatus.metrics.cursor.open.total, tojson(serverStatus));
+    assertNoOpenCursorsOnSourceCollection();
     assert.commandFailedWithCode(
         testDB.runCommand({getMore: res.cursor.id, collection: getMoreCollName}),
         ErrorCodes.CursorNotFound,

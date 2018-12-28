@@ -1,25 +1,27 @@
 // expression.h
 
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -40,8 +42,15 @@
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
+
+/**
+ * Enabling the disableMatchExpressionOptimization fail point will stop match expressions from
+ * being optimized.
+ */
+MONGO_FAIL_POINT_DECLARE(disableMatchExpressionOptimization);
 
 class CollatorInterface;
 class MatchExpression;
@@ -101,6 +110,10 @@ public:
         INTERNAL_2D_KEY_IN_REGION,
         INTERNAL_2D_POINT_IN_ANNULUS,
 
+        // Used to represent an expression language equality in a match expression tree, since $eq
+        // in the expression language has different semantics than the equality match expression.
+        INTERNAL_EXPR_EQ,
+
         // JSON Schema expressions.
         INTERNAL_SCHEMA_ALLOWED_PROPERTIES,
         INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
@@ -131,8 +144,20 @@ public:
      * The value of 'expression' must not be nullptr.
      */
     static std::unique_ptr<MatchExpression> optimize(std::unique_ptr<MatchExpression> expression) {
+        // If the disableMatchExpressionOptimization failpoint is enabled, optimizations are skipped
+        // and the expression is left unmodified.
+        if (MONGO_FAIL_POINT(disableMatchExpressionOptimization)) {
+            return expression;
+        }
+
         auto optimizer = expression->getOptimizer();
-        return optimizer(std::move(expression));
+
+        try {
+            return optimizer(std::move(expression));
+        } catch (DBException& ex) {
+            ex.addContext("Failed to optimize expression");
+            throw;
+        }
     }
 
     MatchExpression(MatchType type);
@@ -267,6 +292,22 @@ public:
      * MatchExpression.
      */
     virtual void serialize(BSONObjBuilder* out) const = 0;
+
+    /**
+     * Returns true if this expression will always evaluate to false, such as an $or with no
+     * children.
+     */
+    virtual bool isTriviallyFalse() const {
+        return false;
+    }
+
+    /**
+     * Returns true if this expression will always evaluate to true, such as an $and with no
+     * children.
+     */
+    virtual bool isTriviallyTrue() const {
+        return false;
+    }
 
     //
     // Debug information

@@ -6,7 +6,7 @@
     var nodenames = replTest.nodeList();
 
     var nodes = replTest.startSet();
-    replTest.initiate({
+    replTest.initiateWithAnyNodeAsPrimary({
         "_id": "testSet",
         "members": [
             {"_id": 0, "host": nodenames[0], "priority": 1},
@@ -51,4 +51,5 @@
         assert(master.getDB("foo").bar.findOne({i: i}) != null, 'checking ' + i);
         assert(master.getDB("bar").baz.findOne({i: i}) != null, 'checking ' + i);
     }
+    replTest.stopSet();
 }());

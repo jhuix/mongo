@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,7 +35,6 @@
 #include "mongo/db/repl/reporter.h"
 
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/repl/old_update_position_args.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
@@ -68,10 +69,7 @@ long long _parseCommandRequestConfigVersion(const BSONObj& commandRequest) {
  * locally generated update command request object.
  * Returns false if config version is missing in either document.
  */
-bool _isTargetConfigNewerThanRequest(
-    const BSONObj& commandResult,
-    const BSONObj& commandRequest,
-    ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle) {
+bool _isTargetConfigNewerThanRequest(const BSONObj& commandResult, const BSONObj& commandRequest) {
     long long targetConfigVersion;
     if (!bsonExtractIntegerField(commandResult, kConfigVersionFieldName, &targetConfigVersion)
              .isOK()) {
@@ -79,9 +77,7 @@ bool _isTargetConfigNewerThanRequest(
     }
 
     const long long localConfigVersion =
-        commandStyle == ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle
-        ? _parseCommandRequestConfigVersion<UpdatePositionArgs>(commandRequest)
-        : _parseCommandRequestConfigVersion<OldUpdatePositionArgs>(commandRequest);
+        _parseCommandRequestConfigVersion<UpdatePositionArgs>(commandRequest);
     if (localConfigVersion == -1) {
         return false;
     }
@@ -94,11 +90,13 @@ bool _isTargetConfigNewerThanRequest(
 Reporter::Reporter(executor::TaskExecutor* executor,
                    PrepareReplSetUpdatePositionCommandFn prepareReplSetUpdatePositionCommandFn,
                    const HostAndPort& target,
-                   Milliseconds keepAliveInterval)
+                   Milliseconds keepAliveInterval,
+                   Milliseconds updatePositionTimeout)
     : _executor(executor),
       _prepareReplSetUpdatePositionCommandFn(prepareReplSetUpdatePositionCommandFn),
       _target(target),
-      _keepAliveInterval(keepAliveInterval) {
+      _keepAliveInterval(keepAliveInterval),
+      _updatePositionTimeout(updatePositionTimeout) {
     uassert(ErrorCodes::BadValue, "null task executor", executor);
     uassert(ErrorCodes::BadValue,
             "null function to create replSetUpdatePosition command object",
@@ -107,6 +105,9 @@ Reporter::Reporter(executor::TaskExecutor* executor,
     uassert(ErrorCodes::BadValue,
             "keep alive interval must be positive",
             keepAliveInterval > Milliseconds(0));
+    uassert(ErrorCodes::BadValue,
+            "update position timeout must be positive",
+            updatePositionTimeout > Milliseconds(0));
 }
 
 Reporter::~Reporter() {
@@ -176,8 +177,10 @@ Status Reporter::trigger() {
         return Status::OK();
     }
 
-    auto scheduleResult = _executor->scheduleWork(
-        stdx::bind(&Reporter::_prepareAndSendCommandCallback, this, stdx::placeholders::_1, true));
+    auto scheduleResult =
+        _executor->scheduleWork([=](const executor::TaskExecutor::CallbackArgs& args) {
+            _prepareAndSendCommandCallback(args, true);
+        });
 
     _status = scheduleResult.getStatus();
     if (!_status.isOK()) {
@@ -192,19 +195,7 @@ Status Reporter::trigger() {
 }
 
 StatusWith<BSONObj> Reporter::_prepareCommand() {
-    ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle =
-        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle;
-    {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        invariant(_isActive_inlock());
-        if (!_status.isOK()) {
-            return _status;
-        }
-
-        commandStyle = _commandStyle;
-    }
-
-    auto prepareResult = _prepareReplSetUpdatePositionCommandFn(commandStyle);
+    auto prepareResult = _prepareReplSetUpdatePositionCommandFn();
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
@@ -224,13 +215,15 @@ StatusWith<BSONObj> Reporter::_prepareCommand() {
     return prepareResult.getValue();
 }
 
-void Reporter::_sendCommand_inlock(BSONObj commandRequest) {
+void Reporter::_sendCommand_inlock(BSONObj commandRequest, Milliseconds netTimeout) {
     LOG(2) << "Reporter sending slave oplog progress to upstream updater " << _target << ": "
            << commandRequest;
 
     auto scheduleResult = _executor->scheduleRemoteCommand(
-        executor::RemoteCommandRequest(_target, "admin", commandRequest, nullptr),
-        stdx::bind(&Reporter::_processResponseCallback, this, stdx::placeholders::_1));
+        executor::RemoteCommandRequest(_target, "admin", commandRequest, nullptr, netTimeout),
+        [this](const executor::TaskExecutor::RemoteCommandCallbackArgs& rcbd) {
+            _processResponseCallback(rcbd);
+        });
 
     _status = scheduleResult.getStatus();
     if (!_status.isOK()) {
@@ -269,16 +262,8 @@ void Reporter::_processResponseCallback(
 
         // Some error types are OK and should not cause the reporter to stop sending updates to the
         // sync target.
-        if (_status == ErrorCodes::BadValue &&
-            _commandStyle == ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle) {
-            LOG(1) << "Reporter falling back to old style UpdatePosition command for sync source: "
-                   << _target;
-            _status = Status::OK();
-            _commandStyle = ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kOldStyle;
-            _isWaitingToSendReporter = true;
-        } else if (_status == ErrorCodes::InvalidReplicaSetConfig &&
-                   _isTargetConfigNewerThanRequest(
-                       commandResult, rcbd.request.cmdObj, _commandStyle)) {
+        if (_status == ErrorCodes::InvalidReplicaSetConfig &&
+            _isTargetConfigNewerThanRequest(commandResult, rcbd.request.cmdObj)) {
             LOG(1) << "Reporter found newer configuration on sync source: " << _target
                    << ". Retrying.";
             _status = Status::OK();
@@ -294,13 +279,10 @@ void Reporter::_processResponseCallback(
             // triggered.
             auto when = _executor->now() + _keepAliveInterval;
             bool fromTrigger = false;
-            auto scheduleResult =
-                _executor->scheduleWorkAt(when,
-                                          stdx::bind(&Reporter::_prepareAndSendCommandCallback,
-                                                     this,
-                                                     stdx::placeholders::_1,
-                                                     fromTrigger));
-
+            auto scheduleResult = _executor->scheduleWorkAt(
+                when, [=](const executor::TaskExecutor::CallbackArgs& args) {
+                    _prepareAndSendCommandCallback(args, fromTrigger);
+                });
             _status = scheduleResult.getStatus();
             if (!_status.isOK()) {
                 _onShutdown_inlock();
@@ -324,7 +306,7 @@ void Reporter::_processResponseCallback(
         return;
     }
 
-    _sendCommand_inlock(prepareResult.getValue());
+    _sendCommand_inlock(prepareResult.getValue(), _updatePositionTimeout);
     if (!_status.isOK()) {
         _onShutdown_inlock();
         return;
@@ -366,7 +348,7 @@ void Reporter::_prepareAndSendCommandCallback(const executor::TaskExecutor::Call
         return;
     }
 
-    _sendCommand_inlock(prepareResult.getValue());
+    _sendCommand_inlock(prepareResult.getValue(), _updatePositionTimeout);
     if (!_status.isOK()) {
         _onShutdown_inlock();
         return;
@@ -402,6 +384,10 @@ bool Reporter::isWaitingToSendReport() const {
 Date_t Reporter::getKeepAliveTimeoutWhen_forTest() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _keepAliveTimeoutWhen;
+}
+
+Status Reporter::getStatus_forTest() const {
+    return _status;
 }
 
 }  // namespace repl

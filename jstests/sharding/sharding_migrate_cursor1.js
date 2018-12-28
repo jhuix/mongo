@@ -1,4 +1,10 @@
-// SERVER-2068
+/**
+ * SERVER-2068
+ *
+ * This test is labeled resource intensive because its total io_write is 131MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger.
+ * @tags: [resource_intensive]
+ */
 (function() {
 
     var chunkSize = 25;
@@ -8,7 +14,7 @@
 
     s.adminCommand({enablesharding: "test"});
     db = s.getDB("test");
-    s.ensurePrimaryShard('test', 'shard0001');
+    s.ensurePrimaryShard('test', s.shard1.shardName);
     t = db.foo;
 
     bigString = "";

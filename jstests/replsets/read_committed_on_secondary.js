@@ -35,6 +35,7 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
 
     if (!startSetIfSupportsReadMajority(replTest)) {
         log("skipping test since storage engine doesn't support committed reads");
+        replTest.stopSet();
         return;
     }
 
@@ -52,7 +53,7 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
 
     // Get connections and collection.
     var primary = replTest.getPrimary();
-    var secondary = replTest.liveNodes.slaves[0];
+    var secondary = replTest._slaves[0];
     var secondaryId = replTest.getNodeId(secondary);
 
     var dbPrimary = primary.getDB(name);
@@ -72,8 +73,8 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
             {"$replData": 1});
         assert.commandWorked(res.commandReply);
         assert.eq(res.commandReply.writeErrors, undefined);
-        log("done saving doc: optime " + tojson(res.metadata.$replData.lastOpVisible));
-        return res.metadata.$replData.lastOpVisible;
+        log("done saving doc: optime " + tojson(res.commandReply.$replData.lastOpVisible));
+        return res.commandReply.$replData.lastOpVisible;
     }
 
     function doDirtyRead(lastOp) {

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -7,6 +7,81 @@
  */
 
 #include "wt_internal.h"
+
+/*
+ * __conn_dhandle_config_clear --
+ *	Clear the underlying object's configuration information.
+ */
+static void
+__conn_dhandle_config_clear(WT_SESSION_IMPL *session)
+{
+	WT_DATA_HANDLE *dhandle;
+	const char **a;
+
+	dhandle = session->dhandle;
+
+	if (dhandle->cfg == NULL)
+		return;
+	for (a = dhandle->cfg; *a != NULL; ++a)
+		__wt_free(session, *a);
+	__wt_free(session, dhandle->cfg);
+}
+
+/*
+ * __conn_dhandle_config_set --
+ *	Set up a btree handle's configuration information.
+ */
+static int
+__conn_dhandle_config_set(WT_SESSION_IMPL *session)
+{
+	WT_DATA_HANDLE *dhandle;
+	WT_DECL_RET;
+	char *metaconf;
+
+	dhandle = session->dhandle;
+
+	/*
+	 * Read the object's entry from the metadata file, we're done if we
+	 * don't find one.
+	 */
+	if ((ret =
+	    __wt_metadata_search(session, dhandle->name, &metaconf)) != 0) {
+		if (ret == WT_NOTFOUND)
+			ret = __wt_set_return(session, ENOENT);
+		WT_RET(ret);
+	}
+
+	/*
+	 * The defaults are included because persistent configuration
+	 * information is stored in the metadata file and it may be from an
+	 * earlier version of WiredTiger.  If defaults are included in the
+	 * configuration, we can add new configuration strings without
+	 * upgrading the metadata file or writing special code in case a
+	 * configuration string isn't initialized, as long as the new
+	 * configuration string has an appropriate default value.
+	 *
+	 * The error handling is a little odd, but be careful: we're holding a
+	 * chunk of allocated memory in metaconf.  If we fail before we copy a
+	 * reference to it into the object's configuration array, we must free
+	 * it, after the copy, we don't want to free it.
+	 */
+	WT_ERR(__wt_calloc_def(session, 3, &dhandle->cfg));
+	switch (dhandle->type) {
+	case WT_DHANDLE_TYPE_BTREE:
+		WT_ERR(__wt_strdup(session,
+		    WT_CONFIG_BASE(session, file_meta), &dhandle->cfg[0]));
+		break;
+	case WT_DHANDLE_TYPE_TABLE:
+		WT_ERR(__wt_strdup(session,
+		    WT_CONFIG_BASE(session, table_meta), &dhandle->cfg[0]));
+		break;
+	}
+	dhandle->cfg[1] = metaconf;
+	return (0);
+
+err:	__wt_free(session, metaconf);
+	return (ret);
+}
 
 /*
  * __conn_dhandle_destroy --
@@ -30,6 +105,7 @@ __conn_dhandle_destroy(WT_SESSION_IMPL *session, WT_DATA_HANDLE *dhandle)
 	__wt_rwlock_destroy(session, &dhandle->rwlock);
 	__wt_free(session, dhandle->name);
 	__wt_free(session, dhandle->checkpoint);
+	__conn_dhandle_config_clear(session);
 	__wt_spin_destroy(session, &dhandle->close_lock);
 	__wt_stat_dsrc_discard(session, dhandle);
 	__wt_overwrite_and_free(session, dhandle);
@@ -64,10 +140,11 @@ __wt_conn_dhandle_alloc(
 		dhandle->type = WT_DHANDLE_TYPE_BTREE;
 	} else if (WT_PREFIX_MATCH(uri, "table:")) {
 		WT_RET(__wt_calloc_one(session, &table));
-		dhandle = &table->iface;
+		dhandle = (WT_DATA_HANDLE *)table;
 		dhandle->type = WT_DHANDLE_TYPE_TABLE;
 	} else
-		return (__wt_illegal_value(session, NULL));
+		WT_PANIC_RET(session, EINVAL,
+		    "illegal handle allocation URI %s", uri);
 
 	/* Btree handles keep their data separate from the interface. */
 	if (dhandle->type == WT_DHANDLE_TYPE_BTREE) {
@@ -167,7 +244,7 @@ __wt_conn_dhandle_close(
 	WT_CONNECTION_IMPL *conn;
 	WT_DATA_HANDLE *dhandle;
 	WT_DECL_RET;
-	bool discard, is_btree, marked_dead, no_schema_lock;
+	bool discard, is_btree, is_mapped, marked_dead, no_schema_lock;
 
 	conn = S2C(session);
 	dhandle = session->dhandle;
@@ -211,7 +288,7 @@ __wt_conn_dhandle_close(
 	 */
 	__wt_spin_lock(session, &dhandle->close_lock);
 
-	discard = marked_dead = false;
+	discard = is_mapped = marked_dead = false;
 	if (is_btree && !F_ISSET(btree,
 	    WT_BTREE_SALVAGE | WT_BTREE_UPGRADE | WT_BTREE_VERIFY)) {
 		/*
@@ -230,8 +307,9 @@ __wt_conn_dhandle_close(
 		 * that become invalid if the mapping is closed.)
 		 */
 		bm = btree->bm;
-		if (!discard && mark_dead &&
-		    (bm == NULL || !bm->is_mapped(bm, session)))
+		if (bm != NULL)
+			is_mapped = bm->is_mapped(bm, session);
+		if (!discard && mark_dead && (bm == NULL || !is_mapped))
 			marked_dead = true;
 
 		/*
@@ -244,9 +322,14 @@ __wt_conn_dhandle_close(
 		 * We can't discard non-durable trees yet: first we have to
 		 * close the underlying btree handle, then we can mark the
 		 * data handle dead.
+		 *
+		 * If we are closing with timestamps enforced, then we have
+		 * already checkpointed as of the timestamp as needed and any
+		 * remaining dirty data should be discarded.
 		 */
 		if (!discard && !marked_dead) {
-			if (F_ISSET(conn, WT_CONN_IN_MEMORY) ||
+			if (F_ISSET(conn, WT_CONN_CLOSING_TIMESTAMP) ||
+			    F_ISSET(conn, WT_CONN_IN_MEMORY) ||
 			    F_ISSET(btree, WT_BTREE_NO_CHECKPOINT))
 				discard = true;
 			else {
@@ -256,6 +339,16 @@ __wt_conn_dhandle_close(
 			}
 		}
 	}
+
+	/*
+	 * We close the underlying handle before discarding pages from the cache
+	 * for performance reasons. However, the underlying block manager "owns"
+	 * information about memory mappings, and memory-mapped pages contain
+	 * pointers into memory that becomes invalid if the mapping is closed,
+	 * so discard mapped files before closing, otherwise, close first.
+	 */
+	if (discard && is_mapped)
+		WT_TRET(__wt_cache_op(session, WT_SYNC_DISCARD));
 
 	/* Close the underlying handle. */
 	switch (dhandle->type) {
@@ -288,7 +381,7 @@ __wt_conn_dhandle_close(
 	 * expects the data handle dead flag to be set when discarding modified
 	 * pages.
 	 */
-	if (discard)
+	if (discard && !is_mapped)
 		WT_TRET(__wt_cache_op(session, WT_SYNC_DISCARD));
 
 	/*
@@ -312,81 +405,6 @@ err:	__wt_spin_unlock(session, &dhandle->close_lock);
 	if (is_btree)
 		__wt_evict_file_exclusive_off(session);
 
-	return (ret);
-}
-
-/*
- * __conn_dhandle_config_clear --
- *	Clear the underlying object's configuration information.
- */
-static void
-__conn_dhandle_config_clear(WT_SESSION_IMPL *session)
-{
-	WT_DATA_HANDLE *dhandle;
-	const char **a;
-
-	dhandle = session->dhandle;
-
-	if (dhandle->cfg == NULL)
-		return;
-	for (a = dhandle->cfg; *a != NULL; ++a)
-		__wt_free(session, *a);
-	__wt_free(session, dhandle->cfg);
-}
-
-/*
- * __conn_dhandle_config_set --
- *	Set up a btree handle's configuration information.
- */
-static int
-__conn_dhandle_config_set(WT_SESSION_IMPL *session)
-{
-	WT_DATA_HANDLE *dhandle;
-	WT_DECL_RET;
-	char *metaconf;
-
-	dhandle = session->dhandle;
-
-	/*
-	 * Read the object's entry from the metadata file, we're done if we
-	 * don't find one.
-	 */
-	if ((ret =
-	    __wt_metadata_search(session, dhandle->name, &metaconf)) != 0) {
-		if (ret == WT_NOTFOUND)
-			ret = ENOENT;
-		WT_RET(ret);
-	}
-
-	/*
-	 * The defaults are included because persistent configuration
-	 * information is stored in the metadata file and it may be from an
-	 * earlier version of WiredTiger.  If defaults are included in the
-	 * configuration, we can add new configuration strings without
-	 * upgrading the metadata file or writing special code in case a
-	 * configuration string isn't initialized, as long as the new
-	 * configuration string has an appropriate default value.
-	 *
-	 * The error handling is a little odd, but be careful: we're holding a
-	 * chunk of allocated memory in metaconf.  If we fail before we copy a
-	 * reference to it into the object's configuration array, we must free
-	 * it, after the copy, we don't want to free it.
-	 */
-	WT_ERR(__wt_calloc_def(session, 3, &dhandle->cfg));
-	switch (dhandle->type) {
-	case WT_DHANDLE_TYPE_BTREE:
-		WT_ERR(__wt_strdup(session,
-		    WT_CONFIG_BASE(session, file_meta), &dhandle->cfg[0]));
-		break;
-	case WT_DHANDLE_TYPE_TABLE:
-		WT_ERR(__wt_strdup(session,
-		    WT_CONFIG_BASE(session, table_meta), &dhandle->cfg[0]));
-		break;
-	}
-	dhandle->cfg[1] = metaconf;
-	return (0);
-
-err:	__wt_free(session, metaconf);
 	return (ret);
 }
 
@@ -592,7 +610,7 @@ err:	WT_DHANDLE_RELEASE(dhandle);
  */
 static int
 __conn_dhandle_close_one(WT_SESSION_IMPL *session,
-    const char *uri, const char *checkpoint, bool mark_dead)
+    const char *uri, const char *checkpoint, bool removed, bool mark_dead)
 {
 	WT_DECL_RET;
 
@@ -622,6 +640,8 @@ __conn_dhandle_close_one(WT_SESSION_IMPL *session,
 		if (ret == 0)
 			ret = __wt_meta_track_sub_off(session);
 	}
+	if (removed)
+		F_SET(session->dhandle, WT_DHANDLE_DROPPED);
 
 	if (!WT_META_TRACKING(session))
 		WT_TRET(__wt_session_release_dhandle(session));
@@ -636,7 +656,7 @@ __conn_dhandle_close_one(WT_SESSION_IMPL *session,
  */
 int
 __wt_conn_dhandle_close_all(
-    WT_SESSION_IMPL *session, const char *uri, bool mark_dead)
+    WT_SESSION_IMPL *session, const char *uri, bool removed, bool mark_dead)
 {
 	WT_CONNECTION_IMPL *conn;
 	WT_DATA_HANDLE *dhandle;
@@ -654,7 +674,8 @@ __wt_conn_dhandle_close_all(
 	 * locking the live handle to fail fast if the tree is busy (e.g., with
 	 * cursors open or in a checkpoint).
 	 */
-	WT_ERR(__conn_dhandle_close_one(session, uri, NULL, mark_dead));
+	WT_ERR(__conn_dhandle_close_one(
+	    session, uri, NULL, removed, mark_dead));
 
 	bucket = __wt_hash_city64(uri, strlen(uri)) % WT_HASH_ARRAY_SIZE;
 	TAILQ_FOREACH(dhandle, &conn->dhhash[bucket], hashq) {
@@ -664,7 +685,8 @@ __wt_conn_dhandle_close_all(
 			continue;
 
 		WT_ERR(__conn_dhandle_close_one(
-		    session, dhandle->name, dhandle->checkpoint, mark_dead));
+		    session, dhandle->name, dhandle->checkpoint, removed,
+		    mark_dead));
 	}
 
 err:	session->dhandle = NULL;
@@ -688,12 +710,12 @@ __conn_dhandle_remove(WT_SESSION_IMPL *session, bool final)
 
 	WT_ASSERT(session,
 	    F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST_WRITE));
-	WT_ASSERT(session, dhandle != conn->cache->evict_file_next);
+	WT_ASSERT(session, dhandle != conn->cache->walk_tree);
 
 	/* Check if the handle was reacquired by a session while we waited. */
 	if (!final &&
 	    (dhandle->session_inuse != 0 || dhandle->session_ref != 0))
-		return (EBUSY);
+		return (__wt_set_return(session, EBUSY));
 
 	WT_CONN_DHANDLE_REMOVE(conn, dhandle, bucket);
 	return (0);
@@ -746,7 +768,6 @@ __wt_conn_dhandle_discard_single(
 	 * After successfully removing the handle, clean it up.
 	 */
 	if (ret == 0 || final) {
-		__conn_dhandle_config_clear(session);
 		WT_TRET(__conn_dhandle_destroy(session, dhandle));
 		session->dhandle = NULL;
 	}
@@ -781,7 +802,8 @@ __wt_conn_dhandle_discard(WT_SESSION_IMPL *session)
 restart:
 	TAILQ_FOREACH(dhandle, &conn->dhqh, q) {
 		if (WT_IS_METADATA(dhandle) ||
-		    strcmp(dhandle->name, WT_LAS_URI) == 0)
+		    strcmp(dhandle->name, WT_LAS_URI) == 0 ||
+		    WT_PREFIX_MATCH(dhandle->name, WT_SYSTEM_PREFIX))
 			continue;
 
 		WT_WITH_DHANDLE(session, dhandle,

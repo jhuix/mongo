@@ -1,3 +1,5 @@
+// @tags: [does_not_support_stepdowns, requires_getmore, requires_non_retryable_writes]
+
 // Tests for $expr in the CRUD commands.
 (function() {
     "use strict";
@@ -59,9 +61,39 @@
     assert.writeOK(coll.insert({a: 0}));
     assert.eq(1, coll.find({$expr: {$eq: ["$a", 0]}}).itcount());
 
+    // $expr with time zone expression across getMore (SERVER-31664).
+    coll.drop();
+    assert.writeOK(coll.insert({a: ISODate("2017-10-01T22:00:00")}));
+
+    let res = assert.commandWorked(db.runCommand({
+        find: coll.getName(),
+        filter: {$expr: {$eq: [1, {$dayOfMonth: {date: "$a", timezone: "America/New_York"}}]}},
+        batchSize: 0
+    }));
+    assert.eq(0, res.cursor.firstBatch.length);
+
+    let cursorId = res.cursor.id;
+    res = assert.commandWorked(db.runCommand({getMore: cursorId, collection: coll.getName()}));
+    assert.eq(1, res.cursor.nextBatch.length);
+
     // $expr with unbound variable throws.
     assert.throws(function() {
         coll.find({$expr: {$eq: ["$a", "$$unbound"]}}).itcount();
+    });
+
+    // $and with $expr child containing an invalid expression throws.
+    assert.throws(function() {
+        coll.find({$and: [{a: 0}, {$expr: {$anyElementTrue: undefined}}]}).itcount();
+    });
+
+    // $or with $expr child containing an invalid expression throws.
+    assert.throws(function() {
+        coll.find({$or: [{a: 0}, {$expr: {$anyElementTrue: undefined}}]}).itcount();
+    });
+
+    // $nor with $expr child containing an invalid expression throws.
+    assert.throws(function() {
+        coll.find({$nor: [{a: 0}, {$expr: {$anyElementTrue: undefined}}]}).itcount();
     });
 
     // $expr with division by zero throws.
@@ -140,71 +172,39 @@
     }
 
     //
-    // $expr in geoNear.
+    // $expr in the $geoNear stage.
     //
 
     coll.drop();
     assert.writeOK(coll.insert({geo: {type: "Point", coordinates: [0, 0]}, a: 0}));
     assert.commandWorked(coll.ensureIndex({geo: "2dsphere"}));
     assert.eq(1,
-              assert
-                  .commandWorked(db.runCommand({
-                      geoNear: coll.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {$expr: {$eq: ["$a", 0]}}
-                  }))
-                  .results.length);
-    assert.commandFailed(db.runCommand({
-        geoNear: coll.getName(),
-        near: {type: "Point", coordinates: [0, 0]},
-        spherical: true,
-        query: {$expr: {$eq: ["$a", "$$unbound"]}}
+              coll.aggregate({
+                      $geoNear: {
+                          near: {type: "Point", coordinates: [0, 0]},
+                          distanceField: "dist",
+                          spherical: true,
+                          query: {$expr: {$eq: ["$a", 0]}}
+                      }
+                  })
+                  .toArray()
+                  .length);
+    assert.throws(() => coll.aggregate({
+        $geoNear: {
+            near: {type: "Point", coordinates: [0, 0]},
+            distanceField: "dist",
+            spherical: true,
+            query: {$expr: {$eq: ["$a", "$$unbound"]}}
+        }
     }));
-    assert.commandFailed(db.runCommand({
-        geoNear: coll.getName(),
-        near: {type: "Point", coordinates: [0, 0]},
-        spherical: true,
-        query: {$expr: {$divide: [1, "$a"]}}
+    assert.throws(() => coll.aggregate({
+        $geoNear: {
+            near: {type: "Point", coordinates: [0, 0]},
+            distanceField: "dist",
+            spherical: true,
+            query: {$expr: {$divide: [1, "$a"]}}
+        }
     }));
-
-    //
-    // $expr in group.
-    //
-
-    // The group command is not permitted in sharded collections.
-    if (!isMongos) {
-        coll.drop();
-        assert.writeOK(coll.insert({a: 0}));
-        assert.eq([{a: 0, count: 1}], coll.group({
-            cond: {$expr: {$eq: ["$a", 0]}},
-            key: {a: 1},
-            initial: {count: 0},
-            reduce: function(curr, result) {
-                result.count += 1;
-            }
-        }));
-        assert.throws(function() {
-            coll.group({
-                cond: {$expr: {$eq: ["$a", "$$unbound"]}},
-                key: {a: 1},
-                initial: {count: 0},
-                reduce: function(curr, result) {
-                    result.count += 1;
-                }
-            });
-        });
-        assert.throws(function() {
-            coll.group({
-                cond: {$expr: {$divide: [1, "$a"]}},
-                key: {a: 1},
-                initial: {count: 0},
-                reduce: function(curr, result) {
-                    result.count += 1;
-                }
-            });
-        });
-    }
 
     //
     // $expr in mapReduce.
@@ -264,7 +264,7 @@
         delete: coll.getName(),
         deletes: [{q: {_id: 0}, limit: 1}, {q: {$expr: "$$unbound"}, limit: 1}]
     });
-    assert.commandWorked(writeRes);
+    assert.commandWorkedIgnoringWriteErrors(writeRes);
     assert.eq(writeRes.writeErrors[0].code, 17276, tojson(writeRes));
     assert.eq(writeRes.n, 1, tojson(writeRes));
 
@@ -312,7 +312,7 @@
         update: coll.getName(),
         updates: [{q: {_id: 0}, u: {$set: {b: 6}}}, {q: {$expr: "$$unbound"}, u: {$set: {b: 6}}}]
     });
-    assert.commandWorked(writeRes);
+    assert.commandWorkedIgnoringWriteErrors(writeRes);
     assert.eq(writeRes.writeErrors[0].code, 17276, tojson(writeRes));
     assert.eq(writeRes.n, 1, tojson(writeRes));
 })();

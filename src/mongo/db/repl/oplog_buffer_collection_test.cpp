@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -273,7 +275,7 @@ TEST_F(OplogBufferCollectionTest, StartupWithExistingCollectionInitializesCorrec
         _opCtx.get(),
         nss,
         TimestampedBSONObj{std::get<0>(OplogBufferCollection::addIdToDocument(oplog[0], {}, 0)),
-                           SnapshotName(0)},
+                           Timestamp(0)},
         OpTime::kUninitializedTerm));
     _assertDocumentsInCollectionEquals(_opCtx.get(), nss, oplog);
 
@@ -320,7 +322,7 @@ TEST_F(OplogBufferCollectionTest, StartupWithEmptyExistingCollectionInitializesC
     _assertDocumentsInCollectionEquals(_opCtx.get(), nss, {});
 
     auto lastPushed = oplogBuffer.lastObjectPushed(_opCtx.get());
-    ASSERT_EQUALS(lastPushed, boost::none);
+    ASSERT_FALSE(lastPushed);
 
     BSONObj doc;
     ASSERT_FALSE(oplogBuffer.peek(_opCtx.get(), &doc));
@@ -366,11 +368,10 @@ DEATH_TEST_F(OplogBufferCollectionTest,
     CollectionOptions collOpts;
     collOpts.setNoIdIndex();
     ASSERT_OK(_storageInterface->createCollection(_opCtx.get(), nss, collOpts));
-    ASSERT_OK(
-        _storageInterface->insertDocument(_opCtx.get(),
-                                          nss,
-                                          TimestampedBSONObj{makeOplogEntry(1), SnapshotName(0)},
-                                          OpTime::kUninitializedTerm));
+    ASSERT_OK(_storageInterface->insertDocument(_opCtx.get(),
+                                                nss,
+                                                TimestampedBSONObj{makeOplogEntry(1), Timestamp(0)},
+                                                OpTime::kUninitializedTerm));
 
     OplogBufferCollection::Options opts;
     opts.dropCollectionAtStartup = false;
@@ -383,11 +384,10 @@ DEATH_TEST_F(OplogBufferCollectionTest,
              "Fatal assertion 40405 NoSuchKey: Missing expected field \"ts\"") {
     auto nss = makeNamespace(_agent);
     ASSERT_OK(_storageInterface->createCollection(_opCtx.get(), nss, CollectionOptions()));
-    ASSERT_OK(
-        _storageInterface->insertDocument(_opCtx.get(),
-                                          nss,
-                                          TimestampedBSONObj{BSON("_id" << 1), SnapshotName(0)},
-                                          OpTime::kUninitializedTerm));
+    ASSERT_OK(_storageInterface->insertDocument(_opCtx.get(),
+                                                nss,
+                                                TimestampedBSONObj{BSON("_id" << 1), Timestamp(0)},
+                                                OpTime::kUninitializedTerm));
 
     OplogBufferCollection::Options opts;
     opts.dropCollectionAtStartup = false;
@@ -403,7 +403,7 @@ DEATH_TEST_F(OplogBufferCollectionTest,
     ASSERT_OK(_storageInterface->insertDocument(
         _opCtx.get(),
         nss,
-        TimestampedBSONObj{BSON("_id" << BSON("ts" << Timestamp(1, 1))), SnapshotName(1)},
+        TimestampedBSONObj{BSON("_id" << BSON("ts" << Timestamp(1, 1))), Timestamp(1)},
         OpTime::kUninitializedTerm));
 
     OplogBufferCollection::Options opts;
@@ -418,8 +418,7 @@ TEST_F(OplogBufferCollectionTest, PeekWithExistingCollectionReturnsEmptyObjectWh
     ASSERT_OK(_storageInterface->insertDocument(
         _opCtx.get(),
         nss,
-        TimestampedBSONObj{BSON("_id" << BSON("ts" << Timestamp(1, 1) << "s" << 0)),
-                           SnapshotName(1)},
+        TimestampedBSONObj{BSON("_id" << BSON("ts" << Timestamp(1, 1) << "s" << 0)), Timestamp(1)},
         OpTime::kUninitializedTerm));
 
     OplogBufferCollection::Options opts;
@@ -441,7 +440,7 @@ TEST_F(OplogBufferCollectionTest,
         _opCtx.get(),
         nss,
         TimestampedBSONObj{std::get<0>(OplogBufferCollection::addIdToDocument(oplog[0], {}, 0)),
-                           SnapshotName(0)},
+                           Timestamp(0)},
         OpTime::kUninitializedTerm));
 
     OplogBufferCollection::Options opts;
@@ -545,7 +544,7 @@ TEST_F(OplogBufferCollectionTest, PeekingFromExistingCollectionReturnsDocument) 
         _opCtx.get(),
         nss,
         TimestampedBSONObj{std::get<0>(OplogBufferCollection::addIdToDocument(oplog[0], {}, 0)),
-                           SnapshotName(0)},
+                           Timestamp(0)},
         OpTime::kUninitializedTerm));
 
     OplogBufferCollection::Options opts;
@@ -689,14 +688,14 @@ TEST_F(OplogBufferCollectionTest,
         _opCtx.get(),
         nss,
         TimestampedBSONObj{std::get<0>(OplogBufferCollection::addIdToDocument(firstDoc, {}, 0)),
-                           SnapshotName(0)},
+                           Timestamp(0)},
         OpTime::kUninitializedTerm));
     auto secondDoc = makeOplogEntry(2);
     ASSERT_OK(_storageInterface->insertDocument(
         _opCtx.get(),
         nss,
         TimestampedBSONObj{std::get<0>(OplogBufferCollection::addIdToDocument(secondDoc, {}, 0)),
-                           SnapshotName(0)},
+                           Timestamp(0)},
         OpTime::kUninitializedTerm));
 
     OplogBufferCollection::Options opts;
@@ -724,7 +723,7 @@ TEST_F(OplogBufferCollectionTest, LastObjectPushedReturnsNoneWithNoEntries) {
     oplogBuffer.startup(_opCtx.get());
 
     auto doc = oplogBuffer.lastObjectPushed(_opCtx.get());
-    ASSERT_EQUALS(doc, boost::none);
+    ASSERT_FALSE(doc);
 }
 
 TEST_F(OplogBufferCollectionTest, IsEmptyReturnsTrueWhenEmptyAndFalseWhenNot) {
@@ -816,7 +815,7 @@ TEST_F(OplogBufferCollectionTest, WaitForDataReturnsImmediatelyWhenStartedWithEx
         nss,
         TimestampedBSONObj{
             std::get<0>(OplogBufferCollection::addIdToDocument(makeOplogEntry(1), {}, 0)),
-            SnapshotName(0)},
+            Timestamp(0)},
         OpTime::kUninitializedTerm));
 
     OplogBufferCollection::Options opts;

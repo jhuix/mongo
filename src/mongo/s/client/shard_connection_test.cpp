@@ -1,48 +1,42 @@
-/*    Copyright 2012 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
-#include <cstdint>
 #include <vector>
 
-#include "mongo/base/init.h"
-#include "mongo/client/connpool.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/client.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context_test_fixture.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/s/client/shard_connection.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/socket_exception.h"
 
@@ -55,20 +49,11 @@
 namespace mongo {
 namespace {
 
-using std::string;
-using std::vector;
+const std::string TARGET_HOST = "$dummy:27017";
 
-const string TARGET_HOST = "$dummy:27017";
-
-/**
- * Warning: cannot run in parallel
- */
-class ShardConnFixture : public mongo::unittest::Test {
+class ShardConnFixture : public ServiceContextTest {
 public:
     void setUp() {
-        if (!haveClient()) {
-            Client::initThread("ShardConnFixture", getGlobalServiceContext(), NULL);
-        }
         _maxPoolSizePerHost = mongo::shardConnectionPool.getMaxPoolSize();
 
         mongo::ConnectionString::setConnectionHook(
@@ -115,40 +100,47 @@ protected:
     void checkNewConns(void (*checkFunc)(uint64_t, uint64_t),
                        uint64_t arg2,
                        size_t newConnsToCreate) {
-        vector<ShardConnection*> newConnList;
+        // The check below creates new connections and tries to differentiate them from older ones
+        // using the creation timestamp. On certain hardware the clock resolution is not high enough
+        // and the new connections end up getting the same time, which makes the test unreliable.
+        // Adding the sleep below makes the test more robust.
+        //
+        // A more proper solution would be to use a MockTimeSource and explicitly control the time,
+        // but since this test supports legacy functionality only used by map/reduce we won't spend
+        // time rewriting it.
+        sleepmillis(5);
+
+        std::vector<std::unique_ptr<ShardConnection>> newConnList;
         for (size_t x = 0; x < newConnsToCreate; x++) {
-            ShardConnection* newConn =
-                new ShardConnection(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+            auto newConn = std::make_unique<ShardConnection>(
+                _opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
             checkFunc(newConn->get()->getSockCreationMicroSec(), arg2);
-            newConnList.push_back(newConn);
+            newConnList.emplace_back(std::move(newConn));
         }
 
         const uint64_t oldCreationTime = mongo::curTimeMicros64();
 
-        for (vector<ShardConnection*>::iterator iter = newConnList.begin();
-             iter != newConnList.end();
-             ++iter) {
-            (*iter)->done();
-            delete *iter;
+        for (auto& conn : newConnList) {
+            conn->done();
         }
 
         newConnList.clear();
 
         // Check that connections created after the purge was put back to the pool.
         for (size_t x = 0; x < newConnsToCreate; x++) {
-            ShardConnection* newConn =
-                new ShardConnection(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+            auto newConn = std::make_unique<ShardConnection>(
+                _opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
             ASSERT_LESS_THAN(newConn->get()->getSockCreationMicroSec(), oldCreationTime);
-            newConnList.push_back(newConn);
+            newConnList.emplace_back(std::move(newConn));
         }
 
-        for (vector<ShardConnection*>::iterator iter = newConnList.begin();
-             iter != newConnList.end();
-             ++iter) {
-            (*iter)->done();
-            delete *iter;
+        for (auto& conn : newConnList) {
+            conn->done();
         }
     }
+
+    const ServiceContext::UniqueOperationContext _uniqueOpCtx = makeOperationContext();
+    OperationContext* const _opCtx = _uniqueOpCtx.get();
 
 private:
     MockRemoteDBServer* _dummyServer;
@@ -156,13 +148,13 @@ private:
 };
 
 TEST_F(ShardConnFixture, BasicShardConnection) {
-    ShardConnection conn1(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn2(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn1(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn2(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
 
     DBClientBase* conn1Ptr = conn1.get();
     conn1.done();
 
-    ShardConnection conn3(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn3(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
     ASSERT_EQUALS(conn1Ptr, conn3.get());
 
     conn2.done();
@@ -170,9 +162,9 @@ TEST_F(ShardConnFixture, BasicShardConnection) {
 }
 
 TEST_F(ShardConnFixture, InvalidateBadConnInPool) {
-    ShardConnection conn1(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn2(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn3(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn1(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn2(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn3(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
 
     conn1.done();
     conn3.done();
@@ -181,8 +173,8 @@ TEST_F(ShardConnFixture, InvalidateBadConnInPool) {
     killServer();
 
     try {
-        conn2.get()->query("test.user", mongo::Query());
-    } catch (const mongo::SocketException&) {
+        conn2.get()->query(NamespaceString("test.user"), mongo::Query());
+    } catch (const mongo::NetworkException&) {
     }
 
     conn2.done();
@@ -192,16 +184,16 @@ TEST_F(ShardConnFixture, InvalidateBadConnInPool) {
 }
 
 TEST_F(ShardConnFixture, DontReturnKnownBadConnToPool) {
-    ShardConnection conn1(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn2(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn3(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn1(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn2(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn3(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
 
     conn1.done();
     killServer();
 
     try {
-        conn3.get()->query("test.user", mongo::Query());
-    } catch (const mongo::SocketException&) {
+        conn3.get()->query(NamespaceString("test.user"), mongo::Query());
+    } catch (const mongo::NetworkException&) {
     }
 
     restartServer();
@@ -215,16 +207,16 @@ TEST_F(ShardConnFixture, DontReturnKnownBadConnToPool) {
 }
 
 TEST_F(ShardConnFixture, BadConnClearsPoolWhenKilled) {
-    ShardConnection conn1(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn2(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn3(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn1(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn2(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn3(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
 
     conn1.done();
     killServer();
 
     try {
-        conn3.get()->query("test.user", mongo::Query());
-    } catch (const mongo::SocketException&) {
+        conn3.get()->query(NamespaceString("test.user"), mongo::Query());
+    } catch (const mongo::NetworkException&) {
     }
 
     restartServer();
@@ -238,9 +230,9 @@ TEST_F(ShardConnFixture, BadConnClearsPoolWhenKilled) {
 }
 
 TEST_F(ShardConnFixture, KilledGoodConnShouldNotClearPool) {
-    ShardConnection conn1(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn2(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn3(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn1(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn2(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn3(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
 
     const uint64_t upperBoundCreationTime = conn3.get()->getSockCreationMicroSec();
     conn3.done();
@@ -250,8 +242,8 @@ TEST_F(ShardConnFixture, KilledGoodConnShouldNotClearPool) {
 
     conn2.done();
 
-    ShardConnection conn4(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn5(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn4(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn5(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
 
     ASSERT_GREATER_THAN(conn4.get()->getSockCreationMicroSec(), badCreationTime);
     ASSERT_LESS_THAN_OR_EQUALS(conn4.get()->getSockCreationMicroSec(), upperBoundCreationTime);
@@ -265,9 +257,9 @@ TEST_F(ShardConnFixture, KilledGoodConnShouldNotClearPool) {
 TEST_F(ShardConnFixture, InvalidateBadConnEvenWhenPoolIsFull) {
     mongo::shardConnectionPool.setMaxPoolSize(2);
 
-    ShardConnection conn1(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn2(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
-    ShardConnection conn3(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn1(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn2(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn3(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
 
     conn1.done();
     conn3.done();
@@ -276,8 +268,8 @@ TEST_F(ShardConnFixture, InvalidateBadConnEvenWhenPoolIsFull) {
     killServer();
 
     try {
-        conn2.get()->query("test.user", mongo::Query());
-    } catch (const mongo::SocketException&) {
+        conn2.get()->query(NamespaceString("test.user"), mongo::Query());
+    } catch (const mongo::NetworkException&) {
     }
 
     conn2.done();
@@ -287,13 +279,13 @@ TEST_F(ShardConnFixture, InvalidateBadConnEvenWhenPoolIsFull) {
 }
 
 TEST_F(ShardConnFixture, DontReturnConnGoneBadToPool) {
-    ShardConnection conn1(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn1(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
     const uint64_t conn1CreationTime = conn1.get()->getSockCreationMicroSec();
 
     uint64_t conn2CreationTime = 0;
 
     {
-        ShardConnection conn2(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+        ShardConnection conn2(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
         conn2CreationTime = conn2.get()->getSockCreationMicroSec();
 
         conn1.done();
@@ -304,7 +296,7 @@ TEST_F(ShardConnFixture, DontReturnConnGoneBadToPool) {
     // also not invalidate older connections since it didn't encounter
     // a socket exception.
 
-    ShardConnection conn1Again(ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
+    ShardConnection conn1Again(_opCtx, ConnectionString(HostAndPort(TARGET_HOST)), "test.user");
     ASSERT_EQUALS(conn1CreationTime, conn1Again.get()->getSockCreationMicroSec());
 
     checkNewConns(assertNotEqual, conn2CreationTime, 10);

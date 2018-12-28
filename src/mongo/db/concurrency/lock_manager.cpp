@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -108,7 +110,7 @@ uint64_t hashStringData(StringData str) {
  * Maps the resource id to a human-readable string.
  */
 static const char* ResourceTypeNames[] = {
-    "Invalid", "Global", "MMAPV1Journal", "Database", "Collection", "Metadata", "Mutex"};
+    "Invalid", "Global", "Database", "Collection", "Metadata", "Mutex"};
 
 // Ensure we do not add new types without updating the names array
 MONGO_STATIC_ASSERT((sizeof(ResourceTypeNames) / sizeof(ResourceTypeNames[0])) ==
@@ -188,7 +190,7 @@ struct LockHead {
     }
 
     /**
-     * Finish creation of request and put it on the lockhead's conflict or granted queues. Returns
+     * Finish creation of request and put it on the LockHead's conflict or granted queues. Returns
      * LOCK_WAITING for conflict case and LOCK_OK otherwise.
      */
     LockResult newRequest(LockRequest* request) {
@@ -282,7 +284,7 @@ struct LockHead {
     // the end of the queue. Conversion requests are granted from the beginning forward.
     LockRequestList grantedList;
 
-    // Counts the grants and coversion counts for each of the supported lock modes. These
+    // Counts the grants and conversion counts for each of the supported lock modes. These
     // counts should exactly match the aggregated modes on the granted list.
     uint32_t grantedCounts[LockModesCount];
 
@@ -297,7 +299,7 @@ struct LockHead {
     // Doubly-linked list of requests, which have not been granted yet because they conflict
     // with the set of granted modes. Requests are queued at the end of the queue and are
     // granted from the beginning forward, which gives these locks FIFO ordering. Exceptions
-    // are high-priorty locks, such as the MMAP V1 flush lock.
+    // are high-priority locks, such as the MMAP V1 flush lock.
     LockRequestList conflictList;
 
     // Counts the conflicting requests for each of the lock modes. These counts should exactly
@@ -338,7 +340,7 @@ struct LockHead {
  * of resourceId to PartitionedLockHead.
  *
  * As long as all lock requests for a resource have an intent mode, as opposed to a conflicting
- * mode, its LockHead may reference ParitionedLockHeads. A partitioned LockHead will not have
+ * mode, its LockHead may reference PartitionedLockHeads. A partitioned LockHead will not have
  * any conflicts. The total set of granted requests (with intent mode) is the union of
  * its grantedList and all grantedLists in PartitionedLockHeads.
  *
@@ -397,7 +399,7 @@ void LockHead::migratePartitionedLockHeads() {
             partition->data.erase(it);
             delete partitionedLock;
         }
-        // Don't pop-back to early as otherwise the lock will be considered not partioned in
+        // Don't pop-back to early as otherwise the lock will be considered not partitioned in
         // newRequest().
         partitions.pop_back();
     }
@@ -599,7 +601,9 @@ bool LockManager::unlock(LockRequest* request) {
         lock->decGrantedModeCount(request->mode);
 
         if (request->compatibleFirst) {
+            invariant(lock->compatibleFirstCount > 0);
             lock->compatibleFirstCount--;
+            invariant(lock->compatibleFirstCount == 0 || !lock->grantedList.empty());
         }
 
         _onLockModeChanged(lock, lock->grantedCounts[request->mode] == 0);
@@ -628,7 +632,7 @@ bool LockManager::unlock(LockRequest* request) {
         _onLockModeChanged(lock, lock->grantedCounts[request->convertMode] == 0);
     } else {
         // Invalid request status
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     return (request->recursiveCount == 0);
@@ -968,151 +972,6 @@ LockHead* LockManager::LockBucket::findOrInsert(ResourceId resId) {
 }
 
 //
-// DeadlockDetector
-//
-
-DeadlockDetector::DeadlockDetector(const LockManager& lockMgr, const Locker* initialLocker)
-    : _lockMgr(lockMgr), _initialLockerId(initialLocker->getId()), _foundCycle(false) {
-    const ResourceId resId = initialLocker->getWaitingResource();
-
-    // If there is no resource waiting there is nothing to do
-    if (resId.isValid()) {
-        _queue.push_front(UnprocessedNode(_initialLockerId, resId));
-    }
-}
-
-bool DeadlockDetector::next() {
-    if (_queue.empty())
-        return false;
-
-    UnprocessedNode front = _queue.front();
-    _queue.pop_front();
-
-    _processNextNode(front);
-
-    return !_queue.empty();
-}
-
-bool DeadlockDetector::hasCycle() const {
-    invariant(_queue.empty());
-
-    return _foundCycle;
-}
-
-std::string DeadlockDetector::toString() const {
-    StringBuilder sb;
-
-    for (WaitForGraph::const_iterator it = _graph.begin(); it != _graph.end(); it++) {
-        sb << "Locker " << it->first << " waits for resource " << it->second.resId.toString()
-           << " held by [";
-
-        const ConflictingOwnersList owners = it->second.owners;
-        for (ConflictingOwnersList::const_iterator itW = owners.begin(); itW != owners.end();
-             itW++) {
-            sb << *itW << ", ";
-        }
-
-        sb << "]\n";
-    }
-
-    return sb.str();
-}
-
-void DeadlockDetector::_processNextNode(const UnprocessedNode& node) {
-    // Locate the request
-    LockManager::LockBucket* bucket = _lockMgr._getBucket(node.resId);
-    stdx::lock_guard<SimpleMutex> scopedLock(bucket->mutex);
-
-    LockManager::LockBucket::Map::const_iterator iter = bucket->data.find(node.resId);
-    if (iter == bucket->data.end()) {
-        return;
-    }
-
-    const LockHead* lock = iter->second;
-
-    LockRequest* request = lock->findRequest(node.lockerId);
-
-    // It is possible that a request which was thought to be waiting suddenly became
-    // granted, so check that before proceeding
-    if (!request || (request->status == LockRequest::STATUS_GRANTED)) {
-        return;
-    }
-
-    std::pair<WaitForGraph::iterator, bool> val =
-        _graph.insert(WaitForGraphPair(node.lockerId, Edges(node.resId)));
-    if (!val.second) {
-        // We already saw this locker id, which means we have a cycle.
-        if (!_foundCycle) {
-            _foundCycle = (node.lockerId == _initialLockerId);
-        }
-
-        return;
-    }
-
-    Edges& edges = val.first->second;
-
-    bool seen = false;
-    for (LockRequest* it = lock->grantedList._back; it != nullptr; it = it->prev) {
-        // We can't conflict with ourselves
-        if (it == request) {
-            seen = true;
-            continue;
-        }
-
-        // If we are a regular conflicting request, both granted and conversion modes need to
-        // be checked for conflict, since conversions will be granted first.
-        if (request->status == LockRequest::STATUS_WAITING) {
-            if (conflicts(request->mode, modeMask(it->mode)) ||
-                conflicts(request->mode, modeMask(it->convertMode))) {
-                const LockerId lockerId = it->locker->getId();
-                const ResourceId waitResId = it->locker->getWaitingResource();
-
-                if (waitResId.isValid()) {
-                    _queue.push_front(UnprocessedNode(lockerId, waitResId));
-                    edges.owners.push_back(lockerId);
-                }
-            }
-
-            continue;
-        }
-
-        // If we are a conversion request, only requests, which are before us need to be
-        // accounted for.
-        invariant(request->status == LockRequest::STATUS_CONVERTING);
-
-        if (conflicts(request->convertMode, modeMask(it->mode)) ||
-            (seen && conflicts(request->convertMode, modeMask(it->convertMode)))) {
-            const LockerId lockerId = it->locker->getId();
-            const ResourceId waitResId = it->locker->getWaitingResource();
-
-            if (waitResId.isValid()) {
-                _queue.push_front(UnprocessedNode(lockerId, waitResId));
-                edges.owners.push_back(lockerId);
-            }
-        }
-    }
-
-    // All conflicting waits, which would be granted before us
-    for (LockRequest* it = request->prev;
-         (request->status == LockRequest::STATUS_WAITING) && (it != nullptr);
-         it = it->prev) {
-        // We started from the previous element, so we should never see ourselves
-        invariant(it != request);
-
-        if (conflicts(request->mode, modeMask(it->mode))) {
-            const LockerId lockerId = it->locker->getId();
-            const ResourceId waitResId = it->locker->getWaitingResource();
-
-            if (waitResId.isValid()) {
-                _queue.push_front(UnprocessedNode(lockerId, waitResId));
-                edges.owners.push_back(lockerId);
-            }
-        }
-    }
-}
-
-
-//
 // ResourceId
 //
 
@@ -1174,6 +1033,7 @@ void LockRequest::initNew(Locker* locker, LockGrantNotification* notify) {
     partitioned = false;
     mode = MODE_NONE;
     convertMode = MODE_NONE;
+    unlockPending = 0;
 }
 
 

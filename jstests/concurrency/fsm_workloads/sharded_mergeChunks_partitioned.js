@@ -5,6 +5,8 @@
  *
  * Exercises the concurrent moveChunk operations, with each thread operating on its own set of
  * chunks.
+ *
+ * @tags: [requires_sharding, assumes_balancer_off, assumes_autosplit_off]
  */
 
 load('jstests/concurrency/fsm_libs/extend_workload.js');                // for extendWorkload
@@ -58,7 +60,8 @@ var $config = extendWorkload($config, function($config, $super) {
     $config.states.init = function init(db, collName, connCache) {
         // Inform this thread about its partition.
         // Each thread has tid in range 0..(n-1) where n is the number of threads.
-        this.partition = this.makePartition(this.tid, this.partitionSize);
+        this.partition =
+            this.makePartition(db[collName].getFullName(), this.tid, this.partitionSize);
         Object.freeze(this.partition);
 
         var config = ChunkHelper.getPrimary(connCache.config);
@@ -90,6 +93,7 @@ var $config = extendWorkload($config, function($config, $super) {
         // Skip this iteration if our data partition contains less than 2 chunks.
         if (configDB.chunks
                 .find({
+                    ns: ns,
                     'min._id': {$gte: this.partition.lower},
                     'max._id': {$lte: this.partition.upper}
                 })
@@ -101,9 +105,9 @@ var $config = extendWorkload($config, function($config, $super) {
         chunk1 = this.getRandomChunkInPartition(config);
         // If we randomly chose the last chunk, choose the one before it.
         if (chunk1.max._id === this.partition.chunkUpper) {
-            chunk1 = configDB.chunks.findOne({'max._id': chunk1.min._id});
+            chunk1 = configDB.chunks.findOne({ns: ns, 'max._id': chunk1.min._id});
         }
-        chunk2 = configDB.chunks.findOne({'min._id': chunk1.max._id});
+        chunk2 = configDB.chunks.findOne({ns: ns, 'min._id': chunk1.max._id});
 
         // Save the number of documents found in these two chunks' ranges before the mergeChunks
         // operation. This will be used to verify that the same number of documents in that

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,299 +41,180 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/platform/unordered_map.h"
 
 namespace mongo {
 class Client;
 class Collection;
 
 class IndexDescriptor;
-class IndexAccessMethod;
 struct InsertDeleteOptions;
 
+struct BsonRecord {
+    RecordId id;
+    Timestamp ts;
+    const BSONObj* docPtr;
+};
+
 /**
- * how many: 1 per Collection.
- * lifecycle: attached to a Collection.
+ * The IndexCatalog is owned by the Collection and is responsible for the lookup and lifetimes of
+ * the indexes in a collection. Every collection has exactly one instance of this class.
+ *
+ * Callers are expected to have acquired the necessary locks while accessing this interface.
+ *
+ * To inspect the contents of this IndexCatalog, callers may obtain an iterator from
+ * getIndexIterator().
+ *
+ * Index building functionality is supported by the IndexBuildBlockInterface interface. However, it
+ * is recommended to use the higher level MultiIndexBlock interface.
+ *
+ * Due to the resource-intensive nature of the index building process, this interface also provides
+ * information on which indexes are available for queries through the following functions:
+ *     int numIndexesTotal();
+ *     int numIndexesReady();
+ *     int numIndexesInProgress();
  */
 class IndexCatalog {
 public:
     class IndexIterator {
     public:
-        class Impl {
-        public:
-            virtual ~Impl() = 0;
+        virtual ~IndexIterator() = default;
+        bool more();
+        const IndexCatalogEntry* next();
 
-        private:
-            virtual Impl* clone_impl() const = 0;
-
-        public:
-            inline std::unique_ptr<Impl> clone() const {
-                return std::unique_ptr<Impl>{this->clone_impl()};
-            }
-
-            virtual bool more() = 0;
-            virtual IndexDescriptor* next() = 0;
-
-            virtual IndexAccessMethod* accessMethod(const IndexDescriptor* desc) = 0;
-
-            virtual IndexCatalogEntry* catalogEntry(const IndexDescriptor* desc) = 0;
-        };
+    protected:
+        /**
+         * Advance the underlying iterator and returns the next index entry. Returns nullptr when
+         * the iterator is exhausted.
+         */
+        virtual const IndexCatalogEntry* _advance() = 0;
 
     private:
-        static std::unique_ptr<Impl> makeImpl(OperationContext* opCtx,
-                                              const IndexCatalog* cat,
-                                              bool includeUnfinishedIndexes);
-
-        explicit inline IndexIterator(OperationContext* const opCtx,
-                                      const IndexCatalog* const cat,
-                                      const bool includeUnfinishedIndexes)
-            : _pimpl(makeImpl(opCtx, cat, includeUnfinishedIndexes)) {}
-
-    public:
-        using factory_function_type = stdx::function<decltype(makeImpl)>;
-        static void registerFactory(factory_function_type factory);
-
-        inline ~IndexIterator() = default;
-
-        inline IndexIterator(const IndexIterator& copy) = default;
-        inline IndexIterator& operator=(const IndexIterator& copy) = default;
-
-        inline IndexIterator(IndexIterator&& copy) = default;
-        inline IndexIterator& operator=(IndexIterator&& copy) = default;
-
-        inline bool more() {
-            return this->_impl().more();
-        }
-
-        inline IndexDescriptor* next() {
-            return this->_impl().next();
-        }
-
-        // Returns the access method for the last return IndexDescriptor.
-        inline IndexAccessMethod* accessMethod(const IndexDescriptor* const desc) {
-            return this->_impl().accessMethod(desc);
-        }
-
-        // Returns the IndexCatalogEntry for the last return IndexDescriptor.
-        inline IndexCatalogEntry* catalogEntry(const IndexDescriptor* const desc) {
-            return this->_impl().catalogEntry(desc);
-        }
-
-    private:
-        // This structure exists to give us a customization point to decide how to force users of
-        // this class to depend upon the corresponding `index_catalog.cpp` Translation Unit (TU).
-        // All public forwarding functions call `_impl(), and `_impl` creates an instance of this
-        // structure.
-        struct TUHook {
-            static void hook() noexcept;
-
-            explicit inline TUHook() noexcept {
-                if (kDebugBuild)
-                    this->hook();
-            }
-        };
-
-        inline const Impl& _impl() const {
-            TUHook{};
-            return *this->_pimpl;
-        }
-
-        inline Impl& _impl() {
-            TUHook{};
-            return *this->_pimpl;
-        }
-
-        clonable_ptr<Impl> _pimpl;
-
-        friend IndexCatalog;
+        bool _start = true;
+        const IndexCatalogEntry* _prev = nullptr;
+        const IndexCatalogEntry* _next = nullptr;
     };
 
-    class Impl {
+    class ReadyIndexesIterator : public IndexIterator {
     public:
-        virtual ~Impl() = 0;
-
-        virtual Status init(OperationContext* opCtx) = 0;
-
-        virtual bool ok() const = 0;
-
-        virtual bool haveAnyIndexes() const = 0;
-
-        virtual int numIndexesTotal(OperationContext* opCtx) const = 0;
-
-        virtual int numIndexesReady(OperationContext* opCtx) const = 0;
-
-        virtual bool haveIdIndex(OperationContext* opCtx) const = 0;
-
-        virtual BSONObj getDefaultIdIndexSpec(ServerGlobalParams::FeatureCompatibility::Version
-                                                  featureCompatibilityVersion) const = 0;
-
-        virtual IndexDescriptor* findIdIndex(OperationContext* opCtx) const = 0;
-
-        virtual IndexDescriptor* findIndexByName(OperationContext* opCtx,
-                                                 StringData name,
-                                                 bool includeUnfinishedIndexes) const = 0;
-
-        virtual IndexDescriptor* findIndexByKeyPatternAndCollationSpec(
-            OperationContext* opCtx,
-            const BSONObj& key,
-            const BSONObj& collationSpec,
-            bool includeUnfinishedIndexes) const = 0;
-
-        virtual void findIndexesByKeyPattern(OperationContext* opCtx,
-                                             const BSONObj& key,
-                                             bool includeUnfinishedIndexes,
-                                             std::vector<IndexDescriptor*>* matches) const = 0;
-
-        virtual IndexDescriptor* findShardKeyPrefixedIndex(OperationContext* opCtx,
-                                                           const BSONObj& shardKey,
-                                                           bool requireSingleKey) const = 0;
-
-        virtual void findIndexByType(OperationContext* opCtx,
-                                     const std::string& type,
-                                     std::vector<IndexDescriptor*>& matches,
-                                     bool includeUnfinishedIndexes) const = 0;
-
-        virtual const IndexDescriptor* refreshEntry(OperationContext* opCtx,
-                                                    const IndexDescriptor* oldDesc) = 0;
-
-        virtual const IndexCatalogEntry* getEntry(const IndexDescriptor* desc) const = 0;
-
-        virtual IndexAccessMethod* getIndex(const IndexDescriptor* desc) = 0;
-
-        virtual const IndexAccessMethod* getIndex(const IndexDescriptor* desc) const = 0;
-
-        virtual Status checkUnfinished() const = 0;
-
-        virtual StatusWith<BSONObj> createIndexOnEmptyCollection(OperationContext* opCtx,
-                                                                 BSONObj spec) = 0;
-
-        virtual StatusWith<BSONObj> prepareSpecForCreate(OperationContext* opCtx,
-                                                         const BSONObj& original) const = 0;
-
-        virtual void dropAllIndexes(OperationContext* opCtx,
-                                    bool includingIdIndex,
-                                    std::map<std::string, BSONObj>* droppedIndexes) = 0;
-
-        virtual Status dropIndex(OperationContext* opCtx, IndexDescriptor* desc) = 0;
-
-        virtual std::vector<BSONObj> getAndClearUnfinishedIndexes(OperationContext* opCtx) = 0;
-
-        virtual bool isMultikey(OperationContext* opCtx, const IndexDescriptor* idx) = 0;
-
-        virtual MultikeyPaths getMultikeyPaths(OperationContext* opCtx,
-                                               const IndexDescriptor* idx) = 0;
-
-        virtual Status indexRecords(OperationContext* opCtx,
-                                    const std::vector<BsonRecord>& bsonRecords,
-                                    int64_t* keysInsertedOut) = 0;
-
-        virtual void unindexRecord(OperationContext* opCtx,
-                                   const BSONObj& obj,
-                                   const RecordId& loc,
-                                   bool noWarn,
-                                   int64_t* keysDeletedOut) = 0;
-
-        virtual std::string getAccessMethodName(OperationContext* opCtx,
-                                                const BSONObj& keyPattern) = 0;
-
-        virtual Status _upgradeDatabaseMinorVersionIfNeeded(OperationContext* opCtx,
-                                                            const std::string& newPluginName) = 0;
+        ReadyIndexesIterator(OperationContext* const opCtx,
+                             IndexCatalogEntryContainer::const_iterator beginIterator,
+                             IndexCatalogEntryContainer::const_iterator endIterator);
 
     private:
-        virtual const Collection* _getCollection() const = 0;
-        virtual Collection* _getCollection() = 0;
+        const IndexCatalogEntry* _advance() override;
 
-        virtual IndexCatalogEntry* _setupInMemoryStructures(
-            OperationContext* opCtx,
-            std::unique_ptr<IndexDescriptor> descriptor,
-            bool initFromDisk) = 0;
-        virtual Status _dropIndex(OperationContext* opCtx, IndexCatalogEntry* entry) = 0;
-
-        virtual const IndexCatalogEntryContainer& _getEntries() const = 0;
-        virtual IndexCatalogEntryContainer& _getEntries() = 0;
-
-        virtual void _deleteIndexFromDisk(OperationContext* const opCtx,
-                                          const std::string& indexName,
-                                          const std::string& indexNamespace) = 0;
-
-        friend IndexCatalog;
+        OperationContext* const _opCtx;
+        IndexCatalogEntryContainer::const_iterator _iterator;
+        IndexCatalogEntryContainer::const_iterator _endIterator;
     };
 
-private:
-    static std::unique_ptr<Impl> makeImpl(IndexCatalog* this_,
-                                          Collection* collection,
-                                          int maxNumIndexesAllowed);
+    class AllIndexesIterator : public IndexIterator {
+    public:
+        /**
+         * `ownedContainer` is a container whose lifetime the begin and end iterators depend
+         * on. If the caller will keep control of the container for the entire iterator lifetime,
+         * it should pass in a null value.
+         */
+        AllIndexesIterator(OperationContext* const opCtx,
+                           std::unique_ptr<std::vector<IndexCatalogEntry*>> ownedContainer);
 
-public:
-    using factory_function_type = stdx::function<decltype(makeImpl)>;
-    static void registerFactory(factory_function_type factory);
+    private:
+        const IndexCatalogEntry* _advance() override;
 
-    inline ~IndexCatalog() = default;
+        OperationContext* const _opCtx;
+        std::vector<IndexCatalogEntry*>::const_iterator _iterator;
+        std::vector<IndexCatalogEntry*>::const_iterator _endIterator;
+        std::unique_ptr<std::vector<IndexCatalogEntry*>> _ownedContainer;
+    };
 
-    explicit inline IndexCatalog(Collection* const collection, const int maxNumIndexesAllowed)
-        : _pimpl(makeImpl(this, collection, maxNumIndexesAllowed)) {}
+    /**
+     * Interface for building a single index from an index spec and persisting its state to disk.
+     */
+    class IndexBuildBlockInterface {
+    public:
+        virtual ~IndexBuildBlockInterface() = default;
+
+        /**
+         * Initializes a new entry for the index in the IndexCatalog.
+         *
+         * On success, holds pointer to newly created IndexCatalogEntry that can be accessed using
+         * getEntry(). IndexCatalog will still own the entry.
+         *
+         * Must be called from within a `WriteUnitOfWork`
+         */
+        virtual Status init() = 0;
+
+        /**
+         * Marks the state of the index as 'ready' and commits the index to disk.
+         *
+         * Must be called from within a `WriteUnitOfWork`
+         */
+        virtual void success() = 0;
+
+        /**
+         * Aborts the index build and removes any on-disk state where applicable.
+         *
+         * Must be called from within a `WriteUnitOfWork`
+         */
+        virtual void fail() = 0;
+
+        /**
+         * Returns the IndexCatalogEntry that was created in init().
+         *
+         * This entry is owned by the IndexCatalog.
+         */
+        virtual IndexCatalogEntry* getEntry() = 0;
+
+        /**
+         * Returns the name of the index managed by this index builder.
+         */
+        virtual const std::string& getIndexName() const = 0;
+
+        /**
+         * Returns the index spec used to build this index.
+         */
+        virtual const BSONObj& getSpec() const = 0;
+    };
+
+    IndexCatalog() = default;
+    virtual ~IndexCatalog() = default;
 
     inline IndexCatalog(IndexCatalog&&) = delete;
     inline IndexCatalog& operator=(IndexCatalog&&) = delete;
 
     // Must be called before used.
-    inline Status init(OperationContext* const opCtx) {
-        return this->_impl().init(opCtx);
-    }
+    virtual Status init(OperationContext* const opCtx) = 0;
 
-    inline bool ok() const {
-        return this->_impl().ok();
-    }
+    virtual bool ok() const = 0;
 
     // ---- accessors -----
 
-    inline bool haveAnyIndexes() const {
-        return this->_impl().haveAnyIndexes();
-    }
+    virtual bool haveAnyIndexes() const = 0;
 
-    inline int numIndexesTotal(OperationContext* const opCtx) const {
-        return this->_impl().numIndexesTotal(opCtx);
-    }
+    virtual int numIndexesTotal(OperationContext* const opCtx) const = 0;
 
-    inline int numIndexesReady(OperationContext* const opCtx) const {
-        return this->_impl().numIndexesReady(opCtx);
-    }
+    virtual int numIndexesReady(OperationContext* const opCtx) const = 0;
 
-    inline int numIndexesInProgress(OperationContext* const opCtx) const {
-        return numIndexesTotal(opCtx) - numIndexesReady(opCtx);
-    }
+    virtual int numIndexesInProgress(OperationContext* const opCtx) const = 0;
 
-    /**
-     * this is in "alive" until the Collection goes away
-     * in which case everything from this tree has to go away.
-     */
-
-    inline bool haveIdIndex(OperationContext* const opCtx) const {
-        return this->_impl().haveIdIndex(opCtx);
-    }
+    virtual bool haveIdIndex(OperationContext* const opCtx) const = 0;
 
     /**
      * Returns the spec for the id index to create by default for this collection.
      */
-    inline BSONObj getDefaultIdIndexSpec(
-        const ServerGlobalParams::FeatureCompatibility::Version featureCompatibilityVersion) const {
-        return this->_impl().getDefaultIdIndexSpec(featureCompatibilityVersion);
-    }
+    virtual BSONObj getDefaultIdIndexSpec() const = 0;
 
-    inline IndexDescriptor* findIdIndex(OperationContext* const opCtx) const {
-        return this->_impl().findIdIndex(opCtx);
-    }
+    virtual const IndexDescriptor* findIdIndex(OperationContext* const opCtx) const = 0;
 
     /**
      * Find index by name.  The index name uniquely identifies an index.
      *
      * @return null if cannot find
      */
-    inline IndexDescriptor* findIndexByName(OperationContext* const opCtx,
-                                            const StringData name,
-                                            const bool includeUnfinishedIndexes = false) const {
-        return this->_impl().findIndexByName(opCtx, name, includeUnfinishedIndexes);
-    }
+    virtual const IndexDescriptor* findIndexByName(
+        OperationContext* const opCtx,
+        const StringData name,
+        const bool includeUnfinishedIndexes = false) const = 0;
 
     /**
      * Find index by matching key pattern and collation spec.  The key pattern and collation spec
@@ -343,14 +226,11 @@ public:
      * @return null if cannot find index, otherwise the index with a matching key pattern and
      * collation.
      */
-    inline IndexDescriptor* findIndexByKeyPatternAndCollationSpec(
+    virtual const IndexDescriptor* findIndexByKeyPatternAndCollationSpec(
         OperationContext* const opCtx,
         const BSONObj& key,
         const BSONObj& collationSpec,
-        const bool includeUnfinishedIndexes = false) const {
-        return this->_impl().findIndexByKeyPatternAndCollationSpec(
-            opCtx, key, collationSpec, includeUnfinishedIndexes);
-    }
+        const bool includeUnfinishedIndexes = false) const = 0;
 
     /**
      * Find indexes with a matching key pattern, putting them into the vector 'matches'.  The key
@@ -358,12 +238,11 @@ public:
      *
      * Consider using 'findIndexByName' if expecting to match one index.
      */
-    inline void findIndexesByKeyPattern(OperationContext* const opCtx,
-                                        const BSONObj& key,
-                                        const bool includeUnfinishedIndexes,
-                                        std::vector<IndexDescriptor*>* const matches) const {
-        return this->_impl().findIndexesByKeyPattern(opCtx, key, includeUnfinishedIndexes, matches);
-    }
+    virtual void findIndexesByKeyPattern(
+        OperationContext* const opCtx,
+        const BSONObj& key,
+        const bool includeUnfinishedIndexes,
+        std::vector<const IndexDescriptor*>* const matches) const = 0;
 
     /**
      * Returns an index suitable for shard key range scans.
@@ -378,18 +257,14 @@ public:
      *
      * If no such index exists, returns NULL.
      */
-    inline IndexDescriptor* findShardKeyPrefixedIndex(OperationContext* const opCtx,
-                                                      const BSONObj& shardKey,
-                                                      const bool requireSingleKey) const {
-        return this->_impl().findShardKeyPrefixedIndex(opCtx, shardKey, requireSingleKey);
-    }
+    virtual const IndexDescriptor* findShardKeyPrefixedIndex(OperationContext* const opCtx,
+                                                             const BSONObj& shardKey,
+                                                             const bool requireSingleKey) const = 0;
 
-    inline void findIndexByType(OperationContext* const opCtx,
-                                const std::string& type,
-                                std::vector<IndexDescriptor*>& matches,
-                                const bool includeUnfinishedIndexes = false) const {
-        return this->_impl().findIndexByType(opCtx, type, matches, includeUnfinishedIndexes);
-    }
+    virtual void findIndexByType(OperationContext* const opCtx,
+                                 const std::string& type,
+                                 std::vector<const IndexDescriptor*>& matches,
+                                 const bool includeUnfinishedIndexes = false) const = 0;
 
     /**
      * Reload the index definition for 'oldDesc' from the CollectionCatalogEntry.  'oldDesc'
@@ -402,36 +277,39 @@ public:
      * an invalidateAll() on the cursor manager to notify other users of the IndexCatalog that
      * this descriptor is now invalid.
      */
-    inline const IndexDescriptor* refreshEntry(OperationContext* const opCtx,
-                                               const IndexDescriptor* const oldDesc) {
-        return this->_impl().refreshEntry(opCtx, oldDesc);
-    }
+    virtual const IndexDescriptor* refreshEntry(OperationContext* const opCtx,
+                                                const IndexDescriptor* const oldDesc) = 0;
 
-    // never returns NULL
-    const IndexCatalogEntry* getEntry(const IndexDescriptor* const desc) const {
-        return this->_impl().getEntry(desc);
-    }
+    /**
+     * Returns a pointer to the index catalog entry associated with 'desc'. Throws if there is no
+     * such index. Never returns nullptr.
+     */
+    virtual const IndexCatalogEntry* getEntry(const IndexDescriptor* const desc) const = 0;
 
-    inline IndexAccessMethod* getIndex(const IndexDescriptor* const desc) {
-        return this->_impl().getIndex(desc);
-    }
+    /**
+     * Returns a pointer to the index catalog entry associated with 'desc', where the caller assumes
+     * shared ownership of the entry. Returns null if the entry does not exist.
+     */
+    virtual std::shared_ptr<const IndexCatalogEntry> getEntryShared(
+        const IndexDescriptor*) const = 0;
 
-    inline const IndexAccessMethod* getIndex(const IndexDescriptor* const desc) const {
-        return this->_impl().getIndex(desc);
-    }
+    /**
+     * Returns a vector of shared pointers to all index entries. Excludes unfinished indexes.
+     */
+    virtual std::vector<std::shared_ptr<const IndexCatalogEntry>> getAllReadyEntriesShared()
+        const = 0;
 
     /**
      * Returns a not-ok Status if there are any unfinished index builds. No new indexes should
      * be built when in this state.
      */
-    inline Status checkUnfinished() const {
-        return this->_impl().checkUnfinished();
-    }
+    virtual Status checkUnfinished() const = 0;
 
-    inline IndexIterator getIndexIterator(OperationContext* const opCtx,
-                                          const bool includeUnfinishedIndexes) const {
-        return IndexIterator(opCtx, this, includeUnfinishedIndexes);
-    };
+    /**
+     * Returns an iterator for the index descriptors in this IndexCatalog.
+     */
+    virtual std::unique_ptr<IndexIterator> getIndexIterator(
+        OperationContext* const opCtx, const bool includeUnfinishedIndexes) const = 0;
 
     // ---- index set modifiers ------
 
@@ -440,47 +318,42 @@ public:
      * empty collection can be rolled back as part of a larger WUOW. Returns the full specification
      * of the created index, as it is stored in this index catalog.
      */
-    inline StatusWith<BSONObj> createIndexOnEmptyCollection(OperationContext* const opCtx,
-                                                            const BSONObj spec) {
-        return this->_impl().createIndexOnEmptyCollection(opCtx, spec);
-    }
+    virtual StatusWith<BSONObj> createIndexOnEmptyCollection(OperationContext* const opCtx,
+                                                             const BSONObj spec) = 0;
 
-    inline StatusWith<BSONObj> prepareSpecForCreate(OperationContext* const opCtx,
-                                                    const BSONObj& original) const {
-        return this->_impl().prepareSpecForCreate(opCtx, original);
-    }
+    virtual StatusWith<BSONObj> prepareSpecForCreate(OperationContext* const opCtx,
+                                                     const BSONObj& original) const = 0;
+
+    /**
+     * Removes pre-existing indexes from 'indexSpecsToBuild'. If this isn't done, an index build
+     * using 'indexSpecsToBuild' may fail with error code IndexAlreadyExists.
+     */
+    virtual std::vector<BSONObj> removeExistingIndexes(
+        OperationContext* const opCtx, const std::vector<BSONObj>& indexSpecsToBuild) const = 0;
 
     /**
      * Drops all indexes in the index catalog, optionally dropping the id index depending on the
-     * 'includingIdIndex' parameter value. If the 'droppedIndexes' parameter is not null,
-     * it is filled with the names and index info of the dropped indexes.
+     * 'includingIdIndex' parameter value. If 'onDropFn' is provided, it will be called before each
+     * index is dropped to allow timestamping each individual drop.
      */
-    inline void dropAllIndexes(OperationContext* const opCtx,
-                               const bool includingIdIndex,
-                               std::map<std::string, BSONObj>* const droppedIndexes = nullptr) {
-        this->_impl().dropAllIndexes(opCtx, includingIdIndex, droppedIndexes);
-    }
+    virtual void dropAllIndexes(OperationContext* opCtx,
+                                bool includingIdIndex,
+                                stdx::function<void(const IndexDescriptor*)> onDropFn) = 0;
+    virtual void dropAllIndexes(OperationContext* opCtx, bool includingIdIndex) = 0;
 
-    inline Status dropIndex(OperationContext* const opCtx, IndexDescriptor* const desc) {
-        return this->_impl().dropIndex(opCtx, desc);
-    }
+    virtual Status dropIndex(OperationContext* const opCtx, const IndexDescriptor* const desc) = 0;
 
     /**
-     * will drop all incompleted indexes and return specs
-     * after this, the indexes can be rebuilt.
+     * Drops all incomplete indexes and returns specs. After this, the indexes can be rebuilt.
      */
-    inline std::vector<BSONObj> getAndClearUnfinishedIndexes(OperationContext* const opCtx) {
-        return this->_impl().getAndClearUnfinishedIndexes(opCtx);
-    }
+    virtual std::vector<BSONObj> getAndClearUnfinishedIndexes(OperationContext* const opCtx) = 0;
 
     // ---- modify single index
 
     /**
      * Returns true if the index 'idx' is multikey, and returns false otherwise.
      */
-    inline bool isMultikey(OperationContext* const opCtx, const IndexDescriptor* const idx) {
-        return this->_impl().isMultikey(opCtx, idx);
-    }
+    virtual bool isMultikey(OperationContext* const opCtx, const IndexDescriptor* const idx) = 0;
 
     /**
      * Returns the path components that cause the index 'idx' to be multikey if the index supports
@@ -491,12 +364,17 @@ public:
      * returns a vector with size equal to the number of elements in the index key pattern where
      * each element in the vector is an empty set.
      */
-    inline MultikeyPaths getMultikeyPaths(OperationContext* const opCtx,
-                                          const IndexDescriptor* const idx) {
-        return this->_impl().getMultikeyPaths(opCtx, idx);
-    }
+    virtual MultikeyPaths getMultikeyPaths(OperationContext* const opCtx,
+                                           const IndexDescriptor* const idx) = 0;
 
-    // --- these probably become private?
+    /**
+     * Sets the index 'desc' to be multikey with the provided 'multikeyPaths'.
+     *
+     * See IndexCatalogEntry::setMultikey().
+     */
+    virtual void setMultikeyPaths(OperationContext* const opCtx,
+                                  const IndexDescriptor* const desc,
+                                  const MultikeyPaths& multikeyPaths) = 0;
 
     // ----- data modifiers ------
 
@@ -506,30 +384,47 @@ public:
      *
      * This method may throw.
      */
-    inline Status indexRecords(OperationContext* const opCtx,
-                               const std::vector<BsonRecord>& bsonRecords,
-                               int64_t* const keysInsertedOut) {
-        return this->_impl().indexRecords(opCtx, bsonRecords, keysInsertedOut);
-    }
+    virtual Status indexRecords(OperationContext* const opCtx,
+                                const std::vector<BsonRecord>& bsonRecords,
+                                int64_t* const keysInsertedOut) = 0;
+
+    /**
+     * Both 'keysInsertedOut' and 'keysDeletedOut' are required and will be set to the number of
+     * index keys inserted and deleted by this operation, respectively.
+     *
+     * This method may throw.
+     */
+    virtual Status updateRecord(OperationContext* const opCtx,
+                                const BSONObj& oldDoc,
+                                const BSONObj& newDoc,
+                                const RecordId& recordId,
+                                int64_t* const keysInsertedOut,
+                                int64_t* const keysDeletedOut) = 0;
 
     /**
      * When 'keysDeletedOut' is not null, it will be set to the number of index keys removed by
      * this operation.
      */
-    inline void unindexRecord(OperationContext* const opCtx,
-                              const BSONObj& obj,
-                              const RecordId& loc,
-                              const bool noWarn,
-                              int64_t* const keysDeletedOut) {
-        return this->_impl().unindexRecord(opCtx, obj, loc, noWarn, keysDeletedOut);
-    }
+    virtual void unindexRecord(OperationContext* const opCtx,
+                               const BSONObj& obj,
+                               const RecordId& loc,
+                               const bool noWarn,
+                               int64_t* const keysDeletedOut) = 0;
 
-    // ------- temp internal -------
+    /*
+     * Attempt compaction on all ready indexes to regain disk space, if the storage engine's index
+     * supports compaction in-place.
+     */
+    virtual Status compactIndexes(OperationContext* opCtx) = 0;
 
-    inline std::string getAccessMethodName(OperationContext* const opCtx,
-                                           const BSONObj& keyPattern) {
-        return this->_impl().getAccessMethodName(opCtx, keyPattern);
-    }
+    virtual std::string getAccessMethodName(const BSONObj& keyPattern) = 0;
+
+    /**
+     * Creates an instance of IndexBuildBlockInterface for building an index with the provided index
+     * spex and OperationContext.
+     */
+    virtual std::unique_ptr<IndexBuildBlockInterface> createIndexBuildBlock(
+        OperationContext* opCtx, const BSONObj& spec) = 0;
 
     // public helpers
 
@@ -537,100 +432,24 @@ public:
      * Returns length of longest index name.
      * This includes unfinished indexes.
      */
-    std::string::size_type getLongestIndexNameLength(OperationContext* opCtx) const;
+    virtual std::string::size_type getLongestIndexNameLength(OperationContext* opCtx) const = 0;
 
-    // public static helpers
-
-    static BSONObj fixIndexKey(const BSONObj& key);
-    static void registerFixIndexKeyImpl(stdx::function<decltype(fixIndexKey)> impl);
+    /**
+     * Detects and normalizes _id index key pattern if found.
+     */
+    virtual BSONObj fixIndexKey(const BSONObj& key) const = 0;
 
     /**
      * Fills out 'options' in order to indicate whether to allow dups or relax
      * index constraints, as needed by replication.
      */
-    static void prepareInsertDeleteOptions(OperationContext* opCtx,
-                                           const IndexDescriptor* desc,
-                                           InsertDeleteOptions* options);
-    static void registerPrepareInsertDeleteOptionsImpl(
-        stdx::function<decltype(prepareInsertDeleteOptions)> impl);
+    virtual void prepareInsertDeleteOptions(OperationContext* opCtx,
+                                            const IndexDescriptor* desc,
+                                            InsertDeleteOptions* options) const = 0;
 
-private:
-    inline const Collection* _getCollection() const {
-        return this->_impl()._getCollection();
-    }
+    virtual void setNs(NamespaceString ns) = 0;
 
-    inline Collection* _getCollection() {
-        return this->_impl()._getCollection();
-    }
-
-    IndexCatalogEntry* _setupInMemoryStructures(OperationContext* opCtx,
-                                                std::unique_ptr<IndexDescriptor> descriptor,
-                                                bool initFromDisk);
-
-    inline Status _dropIndex(OperationContext* const opCtx, IndexCatalogEntry* const desc) {
-        return this->_impl()._dropIndex(opCtx, desc);
-    }
-
-    inline Status _upgradeDatabaseMinorVersionIfNeeded(OperationContext* const opCtx,
-                                                       const std::string& newPluginName) {
-        return this->_impl()._upgradeDatabaseMinorVersionIfNeeded(opCtx, newPluginName);
-    }
-
-    inline const IndexCatalogEntryContainer& _getEntries() const {
-        return this->_impl()._getEntries();
-    }
-
-    inline IndexCatalogEntryContainer& _getEntries() {
-        return this->_impl()._getEntries();
-    }
-
-    inline static IndexCatalogEntryContainer& _getEntries(IndexCatalog* const this_) {
-        return this_->_getEntries();
-    }
-
-    inline static const IndexCatalogEntryContainer& _getEntries(const IndexCatalog* const this_) {
-        return this_->_getEntries();
-    }
-
-    inline void _deleteIndexFromDisk(OperationContext* const opCtx,
-                                     const std::string& indexName,
-                                     const std::string& indexNamespace) {
-        return this->_impl()._deleteIndexFromDisk(opCtx, indexName, indexNamespace);
-    }
-
-    inline static void _deleteIndexFromDisk(IndexCatalog* const this_,
-                                            OperationContext* const opCtx,
-                                            const std::string& indexName,
-                                            const std::string& indexNamespace) {
-        return this_->_deleteIndexFromDisk(opCtx, indexName, indexNamespace);
-    }
-
-    // This structure exists to give us a customization point to decide how to force users of this
-    // class to depend upon the corresponding `index_catalog.cpp` Translation Unit (TU).  All public
-    // forwarding functions call `_impl(), and `_impl` creates an instance of this structure.
-    struct TUHook {
-        static void hook() noexcept;
-
-        explicit inline TUHook() noexcept {
-            if (kDebugBuild)
-                this->hook();
-        }
-    };
-
-    inline const Impl& _impl() const {
-        TUHook{};
-        return *this->_pimpl;
-    }
-
-    inline Impl& _impl() {
-        TUHook{};
-        return *this->_pimpl;
-    }
-
-    std::unique_ptr<Impl> _pimpl;
-
-    friend IndexCatalogEntry;
-    friend class IndexCatalogImpl;
-    friend class MultiIndexBlockImpl;
+    virtual void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) = 0;
 };
+
 }  // namespace mongo

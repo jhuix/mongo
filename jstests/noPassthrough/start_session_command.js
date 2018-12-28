@@ -1,17 +1,22 @@
 (function() {
     'use strict';
+
+    // This test makes assertions about the number of sessions, which are not compatible with
+    // implicit sessions.
+    TestData.disableImplicitSessions = true;
+
     var conn;
     var admin;
     var foo;
     var result;
     const request = {startSession: 1};
 
-    conn = MongoRunner.runMongod({nojournal: ""});
+    conn = MongoRunner.runMongod({setParameter: {maxSessions: 2}});
     admin = conn.getDB("admin");
 
     // ensure that the cache is empty
     var serverStatus = assert.commandWorked(admin.adminCommand({serverStatus: 1}));
-    assert.eq(0, serverStatus.logicalSessionRecordCache.records);
+    assert.eq(0, serverStatus.logicalSessionRecordCache.activeSessionsCount);
 
     // test that we can run startSession unauthenticated when the server is running without --auth
 
@@ -25,7 +30,7 @@
 
     // test that startSession added to the cache
     serverStatus = assert.commandWorked(admin.adminCommand({serverStatus: 1}));
-    assert.eq(1, serverStatus.logicalSessionRecordCache.records);
+    assert.eq(1, serverStatus.logicalSessionRecordCache.activeSessionsCount);
 
     // test that we can run startSession authenticated when the server is running without --auth
 
@@ -40,6 +45,8 @@
     assert.eq(
         result.timeoutMinutes, 30, "failed test that our session record has the correct timeout");
 
+    assert.commandFailed(admin.runCommand(request),
+                         "failed test that we can't run startSession when the cache is full");
     MongoRunner.stopMongod(conn);
 
     //

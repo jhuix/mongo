@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -62,14 +62,12 @@
 #define	HELIUM_PATH							\
 	EXTPATH "datasources/helium/.libs/libwiredtiger_helium.so"
 
-#define	LZO_PATH	".libs/lzo_compress.so"
-
 #undef	M
-#define	M(v)		((v) * 1000000)		/* Million */
+#define	M(v)		((v) * WT_MILLION)	/* Million */
 #undef	KILOBYTE
-#define	KILOBYTE(v)	((v) * 1024)
+#define	KILOBYTE(v)	((v) * WT_KILOBYTE)
 #undef	MEGABYTE
-#define	MEGABYTE(v)	((v) * 1048576)
+#define	MEGABYTE(v)	((v) * WT_MEGABYTE)
 
 #define	WT_NAME	"wt"				/* Object name */
 
@@ -119,11 +117,23 @@ typedef struct {
 	bool workers_finished;			/* Operations completed */
 
 	pthread_rwlock_t backup_lock;		/* Backup running */
-	pthread_rwlock_t checkpoint_lock;	/* Checkpoint running */
 
 	WT_RAND_STATE rnd;			/* Global RNG state */
 
-	uint64_t timestamp;			/* Counter for timestamps. */
+	/*
+	 * Prepare will return an error if the prepare timestamp is less than
+	 * any active read timestamp. Lock across allocating prepare and read
+	 * timestamps.
+	 *
+	 * We get the last committed timestamp periodically in order to update
+	 * the oldest timestamp, that requires locking out transactional ops
+	 * that set a timestamp.
+	 */
+	pthread_rwlock_t ts_lock;
+
+	uint64_t timestamp;			/* Counter for timestamps */
+
+	uint64_t truncate_cnt;			/* Counter for truncation */
 
 	/*
 	 * We have a list of records that are appended, but not yet "resolved",
@@ -151,7 +161,10 @@ typedef struct {
 	uint32_t c_bloom_hash_count;
 	uint32_t c_bloom_oldest;
 	uint32_t c_cache;
-	uint32_t c_checkpoints;
+	uint32_t c_cache_minimum;
+	char	*c_checkpoint;
+	uint32_t c_checkpoint_log_size;
+	uint32_t c_checkpoint_wait;
 	char	*c_checksum;
 	uint32_t c_chunk_size;
 	uint32_t c_compact;
@@ -182,15 +195,18 @@ typedef struct {
 	uint32_t c_logging;
 	uint32_t c_logging_archive;
 	char	*c_logging_compression;
+	uint32_t c_logging_file_max;
 	uint32_t c_logging_prealloc;
 	uint32_t c_long_running_txn;
 	uint32_t c_lsm_worker_threads;
+	uint32_t c_memory_page_max;
 	uint32_t c_merge_max;
 	uint32_t c_mmap;
 	uint32_t c_modify_pct;
 	uint32_t c_ops;
 	uint32_t c_prefix_compression;
 	uint32_t c_prefix_compression_min;
+	uint32_t c_prepare;
 	uint32_t c_quiet;
 	uint32_t c_read_pct;
 	uint32_t c_rebalance;
@@ -204,6 +220,17 @@ typedef struct {
 	uint32_t c_statistics_server;
 	uint32_t c_threads;
 	uint32_t c_timer;
+	uint32_t c_timing_stress_checkpoint;
+	uint32_t c_timing_stress_lookaside_sweep;
+	uint32_t c_timing_stress_split_1;
+	uint32_t c_timing_stress_split_2;
+	uint32_t c_timing_stress_split_3;
+	uint32_t c_timing_stress_split_4;
+	uint32_t c_timing_stress_split_5;
+	uint32_t c_timing_stress_split_6;
+	uint32_t c_timing_stress_split_7;
+	uint32_t c_timing_stress_split_8;
+	uint32_t c_truncate;
 	uint32_t c_txn_freq;
 	uint32_t c_txn_timestamps;
 	uint32_t c_value_max;
@@ -216,6 +243,11 @@ typedef struct {
 #define	VAR				3
 	u_int type;				/* File type's flag value */
 
+#define	CHECKPOINT_OFF			1
+#define	CHECKPOINT_ON			2
+#define	CHECKPOINT_WIREDTIGER		3
+	u_int c_checkpoint_flag;		/* Checkpoint flag value */
+
 #define	CHECKSUM_OFF			1
 #define	CHECKSUM_ON			2
 #define	CHECKSUM_UNCOMPRESSED		3
@@ -223,12 +255,9 @@ typedef struct {
 
 #define	COMPRESS_NONE			1
 #define	COMPRESS_LZ4			2
-#define	COMPRESS_LZ4_NO_RAW		3
-#define	COMPRESS_LZO			4
-#define	COMPRESS_SNAPPY			5
-#define	COMPRESS_ZLIB			6
-#define	COMPRESS_ZLIB_NO_RAW		7
-#define	COMPRESS_ZSTD			8
+#define	COMPRESS_SNAPPY			3
+#define	COMPRESS_ZLIB			4
+#define	COMPRESS_ZSTD			5
 	u_int c_compression_flag;		/* Compression flag value */
 	u_int c_logging_compression_flag;	/* Log compression flag value */
 
@@ -241,6 +270,9 @@ typedef struct {
 #define	ISOLATION_READ_COMMITTED	3
 #define	ISOLATION_SNAPSHOT		4
 	u_int c_isolation_flag;			/* Isolation flag value */
+
+	uint32_t intl_page_max;			/* Maximum page sizes */
+	uint32_t leaf_page_max;
 
 	uint64_t key_cnt;			/* Keys loaded so far */
 	uint64_t rows;				/* Total rows */
@@ -255,19 +287,26 @@ typedef struct {
 
 	WT_RAND_STATE rnd;			/* thread RNG state */
 
-	uint64_t commit;			/* transaction resolution */
-	uint64_t rollback;
-	uint64_t deadlock;
+	volatile bool quit;			/* thread should quit */
 
-	uint64_t timestamp;			/* last committed timestamp */
-
-	bool quit;				/* thread should quit */
-
-	uint64_t search;			/* operation counts */
+	uint64_t ops;				/* total operations */
+	uint64_t commit;			/* operation counts */
 	uint64_t insert;
-	uint64_t update;
+	uint64_t prepare;
 	uint64_t remove;
-	uint64_t ops;
+	uint64_t rollback;
+	uint64_t search;
+	uint64_t truncate;
+	uint64_t update;
+
+	uint64_t keyno;				/* key */
+	WT_ITEM	 *key, _key;			/* key, value */
+	WT_ITEM	 *value, _value;
+
+	uint64_t last;				/* truncate range */
+	WT_ITEM	 *lastkey, _lastkey;
+
+	WT_ITEM  *tbuf, _tbuf;			/* temporary buffer */
 
 #define	TINFO_RUNNING	1			/* Running */
 #define	TINFO_COMPLETE	2			/* Finished */
@@ -278,10 +317,11 @@ typedef struct {
 #ifdef HAVE_BERKELEY_DB
 void	 bdb_close(void);
 void	 bdb_insert(const void *, size_t, const void *, size_t);
-void	 bdb_np(int, void *, size_t *, void *, size_t *, int *);
+void	 bdb_np(bool, void *, size_t *, void *, size_t *, int *);
 void	 bdb_open(void);
 void	 bdb_read(uint64_t, void *, size_t *, int *);
 void	 bdb_remove(uint64_t, int *);
+void	 bdb_truncate(uint64_t, uint64_t);
 void	 bdb_update(const void *, size_t, const void *, size_t);
 #endif
 
@@ -305,7 +345,7 @@ WT_THREAD_RET lrt(void *);
 void	 path_setup(const char *);
 void	 print_item(const char *, WT_ITEM *);
 void	 print_item_data(const char *, const uint8_t *, size_t);
-int	 read_row(WT_CURSOR *, WT_ITEM *, WT_ITEM *, uint64_t);
+int	 read_row_worker(WT_CURSOR *, uint64_t, WT_ITEM *, WT_ITEM *, bool);
 uint32_t rng(WT_RAND_STATE *);
 WT_THREAD_RET timestamp(void *);
 void	 track(const char *, uint64_t, TINFO *);
@@ -337,9 +377,40 @@ mmrand(WT_RAND_STATE *rnd, u_int min, u_int max)
 	uint32_t v;
 	u_int range;
 
+	/*
+	 * Test runs with small row counts can easily pass a max of 0 (for
+	 * example, "g.rows / 20"). Avoid the problem.
+	 */
+	if (min <= max)
+		return (min);
+
 	v = rng(rnd);
 	range = (max - min) + 1;
 	v %= range;
 	v += min;
 	return (v);
+}
+
+static inline void
+random_sleep(WT_RAND_STATE *rnd, u_int max_seconds)
+{
+	uint64_t i, micro_seconds;
+
+	/*
+	 * We need a fast way to choose a sleep time. We want to sleep a short
+	 * period most of the time, but occasionally wait longer. Divide the
+	 * maximum period of time into 10 buckets (where bucket 0 doesn't sleep
+	 * at all), and roll dice, advancing to the next bucket 50% of the time.
+	 * That means we'll hit the maximum roughly every 1K calls.
+	 */
+	for (i = 0;;)
+		if (rng(rnd) & 0x1 || ++i > 9)
+			break;
+
+	if (i == 0)
+		__wt_yield();
+	else {
+		micro_seconds = (uint64_t)max_seconds * WT_MILLION;
+		__wt_sleep(0, i * (micro_seconds / 10));
+	}
 }

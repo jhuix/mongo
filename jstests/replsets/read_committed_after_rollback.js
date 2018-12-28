@@ -15,7 +15,7 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
             coll.runCommand('find', {"readConcern": {"level": "majority"}, "maxTimeMS": 3000});
         assert.commandFailedWithCode(
             res,
-            ErrorCodes.ExceededTimeLimit,
+            ErrorCodes.MaxTimeMSExpired,
             "Expected read of " + coll.getFullName() + ' on ' + coll.getMongo().host + " to block");
     }
 
@@ -41,6 +41,7 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
 
     if (!startSetIfSupportsReadMajority(replTest)) {
         jsTest.log("skipping test since storage engine doesn't support committed reads");
+        replTest.stopSet();
         return;
     }
 
@@ -63,8 +64,8 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
 
     // Get connections.
     var oldPrimary = replTest.getPrimary();
-    var newPrimary = replTest.liveNodes.slaves[0];
-    var pureSecondary = replTest.liveNodes.slaves[1];
+    var newPrimary = replTest._slaves[0];
+    var pureSecondary = replTest._slaves[1];
     var arbiters = [replTest.nodes[3], replTest.nodes[4]];
 
     // This is the collection that all of the tests will use.
@@ -141,5 +142,14 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
     assert.writeOK(newPrimary.getDB(name).unrelatedCollection.insert(
         {a: 1}, {writeConcern: {w: 'majority', wtimeout: replTest.kDefaultTimeoutMS}}));
     assert.eq(doCommittedRead(newPrimaryColl), 'new');
+    // Do another write to the new primary so that the old primary can be sure to receive the
+    // new committed optime.
+    assert.writeOK(newPrimary.getDB(name).unrelatedCollection.insert(
+        {a: 2}, {writeConcern: {w: 'majority', wtimeout: replTest.kDefaultTimeoutMS}}));
     assert.eq(doCommittedRead(oldPrimaryColl), 'new');
+
+    // Verify data consistency between nodes.
+    replTest.checkReplicatedDataHashes();
+    replTest.checkOplogs();
+    replTest.stopSet();
 }());

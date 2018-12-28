@@ -8,7 +8,7 @@ replTest.initiate(
     {"_id": name, "members": [{"_id": 0, "host": nodes[0]}, {"_id": 1, "host": nodes[1]}]});
 
 var primary = replTest.getPrimary().getDB(name);
-var secondary = replTest.liveNodes.slaves[0].getDB(name);
+var secondary = replTest._slaves[0].getDB(name);
 
 // populate the collection
 for (i = 0; i < 5; i++) {
@@ -30,3 +30,5 @@ assert.throws(function() {
 primary.coll.aggregate({$out: "out"}).itcount();
 replTest.awaitReplication();
 assert.eq(primary.out.find().sort({x: 1}).toArray(), secondary.out.find().sort({x: 1}).toArray());
+
+replTest.stopSet();

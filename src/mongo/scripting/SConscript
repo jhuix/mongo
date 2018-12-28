@@ -15,11 +15,12 @@ env.Library(
         'deadline_monitor.cpp',
         'dbdirectclient_factory.cpp',
         'engine.cpp',
+        'jsexception.cpp',
         'utils.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/client/clientdriver_minimal',
         '$BUILD_DIR/mongo/shell/mongojs',
         '$BUILD_DIR/mongo/util/md5',
     ],
@@ -140,6 +141,7 @@ if usemozjs:
             'mozjs/proxyscope.cpp',
             'mozjs/regexp.cpp',
             'mozjs/session.cpp',
+            'mozjs/status.cpp',
             'mozjs/timestamp.cpp',
             'mozjs/uri.cpp',
             'mozjs/valuereader.cpp',
@@ -151,8 +153,10 @@ if usemozjs:
             'scripting_common',
             '$BUILD_DIR/mongo/shell/mongojs',
             '$BUILD_DIR/mongo/db/service_context',
+            '$BUILD_DIR/mongo/db/storage/duplicate_key_error_info',
         ],
         LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/client/clientdriver_network',
             '$BUILD_DIR/third_party/shim_mozjs',
         ],
     )

@@ -44,6 +44,7 @@ Google's
 HyperDex
 HyperLevelDB
 IEC
+JDK
 JavaScript
 KMS
 LD
@@ -151,6 +152,7 @@ colgroups
 combinatorial
 command's
 comparator
+compressibility
 cond
 config
 configurign
@@ -354,7 +356,6 @@ nolock
 nolocking
 nommap
 nop
-noraw
 nosql
 nosync
 notgranted
@@ -368,6 +369,7 @@ objectsin
 ol
 oltp
 oob
+optrack
 optype
 os
 outlier
@@ -380,6 +382,7 @@ perf
 petabyte
 pget
 php
+pid
 plantuml
 png
 posix
@@ -469,6 +472,7 @@ tcmalloc
 td
 th
 thang
+tid
 timestamp
 timestamps
 todo

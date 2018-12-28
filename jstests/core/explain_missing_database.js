@@ -17,13 +17,6 @@
     assert.commandWorked(explain);
     assert("executionStats" in explain);
 
-    // .group()
-    explainMissingDb.dropDatabase();
-    explainColl = explainMissingDb.collection.explain("executionStats");
-    explain = explainColl.group({key: "a", initial: {}, reduce: function() {}});
-    assert.commandWorked(explain);
-    assert("executionStats" in explain);
-
     // .remove()
     explainMissingDb.dropDatabase();
     explain = explainMissingDb.collection.explain("executionStats").remove({a: 1});

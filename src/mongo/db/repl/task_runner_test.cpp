@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,7 +38,7 @@
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/unittest/barrier.h"
-#include "mongo/util/concurrency/old_thread_pool.h"
+#include "mongo/util/concurrency/thread_pool.h"
 
 namespace {
 
@@ -68,7 +70,7 @@ TEST_F(TaskRunnerTest, CallbackValues) {
         return TaskRunner::NextAction::kCancel;
     };
     getTaskRunner().schedule(task);
-    getThreadPool().join();
+    getThreadPool().waitForIdle();
     ASSERT_FALSE(getTaskRunner().isActive());
 
     stdx::lock_guard<stdx::mutex> lk(mutex);
@@ -81,7 +83,7 @@ using OpIdVector = std::vector<unsigned int>;
 
 OpIdVector _testRunTaskTwice(TaskRunnerTest& test,
                              TaskRunner::NextAction nextAction,
-                             stdx::function<void(const Task& task)> schedule) {
+                             unique_function<void(Task task)> schedule) {
     unittest::Barrier barrier(2U);
     stdx::mutex mutex;
     std::vector<OperationContext*> txns;
@@ -107,7 +109,7 @@ OpIdVector _testRunTaskTwice(TaskRunnerTest& test,
     ASSERT_TRUE(test.getTaskRunner().isActive());
     barrier.countDownAndWait();
 
-    test.getThreadPool().join();
+    test.getThreadPool().waitForIdle();
     ASSERT_FALSE(test.getTaskRunner().isActive());
 
     stdx::lock_guard<stdx::mutex> lk(mutex);
@@ -119,7 +121,7 @@ OpIdVector _testRunTaskTwice(TaskRunnerTest& test,
 
 std::vector<unsigned int> _testRunTaskTwice(TaskRunnerTest& test,
                                             TaskRunner::NextAction nextAction) {
-    auto schedule = [&](const Task& task) { test.getTaskRunner().schedule(task); };
+    auto schedule = [&](Task task) { test.getTaskRunner().schedule(std::move(task)); };
     return _testRunTaskTwice(test, nextAction, schedule);
 }
 
@@ -132,9 +134,9 @@ TEST_F(TaskRunnerTest, RunTaskTwiceDisposeOperationContext) {
 // Joining thread pool before scheduling second task ensures that task runner releases
 // thread back to pool after disposing of operation context.
 TEST_F(TaskRunnerTest, RunTaskTwiceDisposeOperationContextJoinThreadPoolBeforeScheduling) {
-    auto schedule = [this](const Task& task) {
-        getThreadPool().join();
-        getTaskRunner().schedule(task);
+    auto schedule = [this](Task task) {
+        getThreadPool().waitForIdle();
+        getTaskRunner().schedule(std::move(task));
     };
     auto txnId =
         _testRunTaskTwice(*this, TaskRunner::NextAction::kDisposeOperationContext, schedule);
@@ -177,7 +179,7 @@ TEST_F(TaskRunnerTest, SkipSecondTask) {
         schedulingDone = true;
         condition.notify_all();
     }
-    getThreadPool().join();
+    getThreadPool().waitForIdle();
     ASSERT_FALSE(getTaskRunner().isActive());
 
     stdx::lock_guard<stdx::mutex> lk(mutex);
@@ -215,7 +217,7 @@ TEST_F(TaskRunnerTest, FirstTaskThrowsException) {
         uassert(ErrorCodes::OperationFailed, "task failure", false);
 
         // not reached.
-        invariant(false);
+        MONGO_UNREACHABLE;
         return TaskRunner::NextAction::kKeepOperationContext;
     };
     getTaskRunner().schedule(task);
@@ -226,7 +228,7 @@ TEST_F(TaskRunnerTest, FirstTaskThrowsException) {
         schedulingDone = true;
         condition.notify_all();
     }
-    getThreadPool().join();
+    getThreadPool().waitForIdle();
     ASSERT_FALSE(getTaskRunner().isActive());
 
     stdx::lock_guard<stdx::mutex> lk(mutex);
@@ -270,7 +272,7 @@ TEST_F(TaskRunnerTest, Cancel) {
     getTaskRunner().cancel();
     getTaskRunner().cancel();
 
-    getThreadPool().join();
+    getThreadPool().waitForIdle();
     ASSERT_FALSE(getTaskRunner().isActive());
 
     // This status will not be OK if canceling the task runner
@@ -345,7 +347,7 @@ TEST_F(TaskRunnerTest, DestroyShouldWaitForTasksToComplete) {
 
     destroyTaskRunner();
 
-    getThreadPool().join();
+    getThreadPool().waitForIdle();
 
     // This status will not be OK if canceling the task runner
     // before scheduling the task results in the task being canceled.

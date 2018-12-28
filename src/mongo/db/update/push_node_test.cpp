@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -287,6 +289,7 @@ TEST_F(PushNodeTest, ApplyToEmptyArray) {
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToEmptyDocument) {
@@ -304,6 +307,7 @@ TEST_F(PushNodeTest, ApplyToEmptyDocument) {
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToArrayWithOneElement) {
@@ -321,6 +325,7 @@ TEST_F(PushNodeTest, ApplyToArrayWithOneElement) {
     ASSERT_EQUALS(fromjson("{a: [0, 1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'a.1': 1}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToDottedPathElement) {
@@ -349,6 +354,7 @@ TEST_F(PushNodeTest, ApplyToDottedPathElement) {
                   doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'choices.first.votes': [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{choices.first.votes}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplySimpleEachToEmptyArray) {
@@ -366,6 +372,7 @@ TEST_F(PushNodeTest, ApplySimpleEachToEmptyArray) {
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplySimpleEachToEmptyDocument) {
@@ -383,6 +390,7 @@ TEST_F(PushNodeTest, ApplySimpleEachToEmptyDocument) {
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyMultipleEachToEmptyDocument) {
@@ -400,6 +408,7 @@ TEST_F(PushNodeTest, ApplyMultipleEachToEmptyDocument) {
     ASSERT_EQUALS(fromjson("{a: [1, 2]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1, 2]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplySimpleEachToArrayWithOneElement) {
@@ -417,6 +426,7 @@ TEST_F(PushNodeTest, ApplySimpleEachToArrayWithOneElement) {
     ASSERT_EQUALS(fromjson("{a: [0, 1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'a.1': 1}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyMultipleEachToArrayWithOneElement) {
@@ -434,6 +444,7 @@ TEST_F(PushNodeTest, ApplyMultipleEachToArrayWithOneElement) {
     ASSERT_EQUALS(fromjson("{a: [0, 1, 2]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'a.1': 1, 'a.2': 2}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyEmptyEachToEmptyArray) {
@@ -451,6 +462,7 @@ TEST_F(PushNodeTest, ApplyEmptyEachToEmptyArray) {
     ASSERT_EQUALS(fromjson("{a: []}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyEmptyEachToEmptyDocument) {
@@ -468,6 +480,7 @@ TEST_F(PushNodeTest, ApplyEmptyEachToEmptyDocument) {
     ASSERT_EQUALS(fromjson("{a: []}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: []}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyEmptyEachToArrayWithOneElement) {
@@ -485,6 +498,7 @@ TEST_F(PushNodeTest, ApplyEmptyEachToArrayWithOneElement) {
     ASSERT_EQUALS(fromjson("{a: [0]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToArrayWithSlice) {
@@ -502,6 +516,7 @@ TEST_F(PushNodeTest, ApplyToArrayWithSlice) {
     ASSERT_EQUALS(fromjson("{a: [3]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [3]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyWithNumericSort) {
@@ -519,6 +534,7 @@ TEST_F(PushNodeTest, ApplyWithNumericSort) {
     ASSERT_EQUALS(fromjson("{a: [-1, 2, 3]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [-1, 2, 3]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyWithReverseNumericSort) {
@@ -536,6 +552,7 @@ TEST_F(PushNodeTest, ApplyWithReverseNumericSort) {
     ASSERT_EQUALS(fromjson("{a: [4, 3, -1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [4, 3, -1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyWithMixedSort) {
@@ -553,6 +570,7 @@ TEST_F(PushNodeTest, ApplyWithMixedSort) {
     ASSERT_EQUALS(fromjson("{a: [-1, 3, 4, 't', {a: 1}, {b: 1}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [-1, 3, 4, 't', {a: 1}, {b: 1}]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyWithReverseMixedSort) {
@@ -570,6 +588,7 @@ TEST_F(PushNodeTest, ApplyWithReverseMixedSort) {
     ASSERT_EQUALS(fromjson("{a: [{b: 1}, {a: 1}, 't', 4, 3, -1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [{b: 1}, {a: 1}, 't', 4, 3, -1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyWithEmbeddedFieldSort) {
@@ -587,6 +606,7 @@ TEST_F(PushNodeTest, ApplyWithEmbeddedFieldSort) {
     ASSERT_EQUALS(fromjson("{a: [3, 't', {b: 1}, 4, -1, {a: 1}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [3, 't', {b: 1}, 4, -1, {a: 1}]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplySortWithCollator) {
@@ -606,6 +626,7 @@ TEST_F(PushNodeTest, ApplySortWithCollator) {
     ASSERT_EQUALS(fromjson("{a: ['ha', 'gb', 'fc', 'dd']}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: ['ha', 'gb', 'fc', 'dd']}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplySortAfterSetCollator) {
@@ -621,8 +642,12 @@ TEST_F(PushNodeTest, ApplySortAfterSetCollator) {
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: ['dd', 'fc', 'gb', 'ha']}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 
     // Now with a collator.
+    resetApplyParams();
+    setPathTaken("a");
+    setLogBuilderToNull();
     CollatorInterfaceMock mockCollator(CollatorInterfaceMock::MockType::kReverseString);
     node.setCollator(&mockCollator);
     mutablebson::Document doc2(fromjson("{a: ['dd', 'fc', 'gb']}"));
@@ -630,6 +655,7 @@ TEST_F(PushNodeTest, ApplySortAfterSetCollator) {
     ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: ['ha', 'gb', 'fc', 'dd']}"), doc2);
     ASSERT_FALSE(doc2.isInPlaceModeEnabled());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 // Some of the below tests apply multiple different update modifiers. This special check function
@@ -655,16 +681,18 @@ void checkDocumentAndResult(BSONObj updateModifier,
 
 TEST_F(PushNodeTest, ApplyToEmptyArrayWithSliceValues) {
     struct testData {
-        int sliceValue;
+        long long sliceValue;
         BSONObj resultingDoc;
     };
 
     // We repeat the same test for several different values of $slice.
-    std::vector<testData> testDataList{{-2, fromjson("{a: [1]}")},
+    std::vector<testData> testDataList{{LLONG_MIN, fromjson("{a: [1]}")},
+                                       {-2, fromjson("{a: [1]}")},
                                        {-1, fromjson("{a: [1]}")},
                                        {0, fromjson("{a: []}")},
                                        {1, fromjson("{a: [1]}")},
-                                       {2, fromjson("{a: [1]}")}};
+                                       {2, fromjson("{a: [1]}")},
+                                       {LLONG_MAX, fromjson("{a: [1]}")}};
 
     for (const auto& data : testDataList) {
         auto update = BSON(
@@ -674,6 +702,7 @@ TEST_F(PushNodeTest, ApplyToEmptyArrayWithSliceValues) {
         ASSERT_OK(node.init(update["$push"]["a"], expCtx));
 
         mutablebson::Document doc(fromjson("{a: []}"));
+        resetApplyParams();
         setPathTaken("a");
         setLogBuilderToNull();
         auto result = node.apply(getApplyParams(doc.root()["a"]));
@@ -706,6 +735,7 @@ TEST_F(PushNodeTest, ApplyToPopulatedArrayWithSliceValues) {
         ASSERT_OK(node.init(update["$push"]["a"], expCtx));
 
         mutablebson::Document doc(fromjson("{a: [2, 3]}"));
+        resetApplyParams();
         setPathTaken("a");
         setLogBuilderToNull();
         auto result = node.apply(getApplyParams(doc.root()["a"]));
@@ -807,6 +837,7 @@ TEST_F(PushNodeTest, ApplyToPopulatedArrayWithSortAndSliceValues) {
         ASSERT_OK(node.init(update["$push"]["a"], expCtx));
 
         mutablebson::Document doc(fromjson("{a: [{a: 2, b: 3}, {a: 3, b: 1}]}"));
+        resetApplyParams();
         setPathTaken("a");
         setLogBuilderToNull();
         auto result = node.apply(getApplyParams(doc.root()["a"]));
@@ -829,6 +860,7 @@ TEST_F(PushNodeTest, ApplyToEmptyArrayWithPositionZero) {
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToEmptyArrayWithPositionOne) {
@@ -846,6 +878,7 @@ TEST_F(PushNodeTest, ApplyToEmptyArrayWithPositionOne) {
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToEmptyArrayWithLargePosition) {
@@ -863,6 +896,7 @@ TEST_F(PushNodeTest, ApplyToEmptyArrayWithLargePosition) {
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToSingletonArrayWithPositionZero) {
@@ -880,6 +914,7 @@ TEST_F(PushNodeTest, ApplyToSingletonArrayWithPositionZero) {
     ASSERT_EQUALS(fromjson("{a: [1, 0]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1, 0]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToSingletonArrayWithLargePosition) {
@@ -897,6 +932,7 @@ TEST_F(PushNodeTest, ApplyToSingletonArrayWithLargePosition) {
     ASSERT_EQUALS(fromjson("{a: [0, 1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'a.1': 1}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToEmptyArrayWithNegativePosition) {
@@ -914,6 +950,7 @@ TEST_F(PushNodeTest, ApplyToEmptyArrayWithNegativePosition) {
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToSingletonArrayWithNegativePosition) {
@@ -931,6 +968,7 @@ TEST_F(PushNodeTest, ApplyToSingletonArrayWithNegativePosition) {
     ASSERT_EQUALS(fromjson("{a: [1, 0]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [1, 0]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToPopulatedArrayWithNegativePosition) {
@@ -948,6 +986,7 @@ TEST_F(PushNodeTest, ApplyToPopulatedArrayWithNegativePosition) {
     ASSERT_EQUALS(fromjson("{a: [0, 1, 2, 5, 3, 4]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [0, 1, 2, 5, 3, 4]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyToPopulatedArrayWithOutOfBoundsNegativePosition) {
@@ -965,6 +1004,7 @@ TEST_F(PushNodeTest, ApplyToPopulatedArrayWithOutOfBoundsNegativePosition) {
     ASSERT_EQUALS(fromjson("{a: [5, 0, 1, 2, 3, 4]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [5, 0, 1, 2, 3, 4]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 TEST_F(PushNodeTest, ApplyMultipleElementsPushWithNegativePosition) {
@@ -982,6 +1022,7 @@ TEST_F(PushNodeTest, ApplyMultipleElementsPushWithNegativePosition) {
     ASSERT_EQUALS(fromjson("{a: [0, 1, 2, 5, 6, 7, 3, 4]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {a: [0, 1, 2, 5, 6, 7, 3, 4]}}"), getLogDoc());
+    ASSERT_EQUALS("{a}", getModifiedPaths());
 }
 
 }  // namespace

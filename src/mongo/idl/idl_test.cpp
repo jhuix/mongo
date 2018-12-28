@@ -1,40 +1,45 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
+#include <limits>
+
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/idl/unittest_gen.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/net/op_msg.h"
 
 using namespace mongo::idl::test;
+using namespace mongo::idl::import;
 
 namespace mongo {
 
@@ -173,6 +178,10 @@ void TestLoopback(TestT test_value) {
 
         auto serializedDoc = builder.obj();
         ASSERT_BSONOBJ_EQ(testDoc, serializedDoc);
+
+        // Validate the operator == works
+        // Use ASSERT instead of ASSERT_EQ to avoid operator<<
+        ASSERT(one_new == testStruct);
     }
 }
 
@@ -268,6 +277,31 @@ TEST(IDLOneTypeTests, TestNegativeWrongTypes) {
     TestParsers<One_date, Date>();
     TestParsers<One_timestamp, bsonTimestamp>();
 }
+
+// Negative: document with wrong types for required field
+TEST(IDLOneTypeTests, TestNegativeRequiredNullTypes) {
+    TestParse<One_string, String, NullLabeler, jstNULL>(BSONNULL);
+    TestParse<One_int, NumberInt, NullLabeler, jstNULL>(BSONNULL);
+    TestParse<One_long, NumberLong, NullLabeler, jstNULL>(BSONNULL);
+    TestParse<One_double, NumberDouble, NullLabeler, jstNULL>(BSONNULL);
+    TestParse<One_bool, Bool, NullLabeler, jstNULL>(BSONNULL);
+    TestParse<One_objectid, jstOID, NullLabeler, jstNULL>(BSONNULL);
+    TestParse<One_date, Date, NullLabeler, jstNULL>(BSONNULL);
+    TestParse<One_timestamp, bsonTimestamp, NullLabeler, jstNULL>(BSONNULL);
+}
+
+// Negative: document with wrong types for required field
+TEST(IDLOneTypeTests, TestNegativeRequiredUndefinedTypes) {
+    TestParse<One_string, String, UndefinedLabeler, Undefined>(BSONUndefined);
+    TestParse<One_int, NumberInt, UndefinedLabeler, Undefined>(BSONUndefined);
+    TestParse<One_long, NumberLong, UndefinedLabeler, Undefined>(BSONUndefined);
+    TestParse<One_double, NumberDouble, UndefinedLabeler, Undefined>(BSONUndefined);
+    TestParse<One_bool, Bool, UndefinedLabeler, Undefined>(BSONUndefined);
+    TestParse<One_objectid, jstOID, UndefinedLabeler, Undefined>(BSONUndefined);
+    TestParse<One_date, Date, UndefinedLabeler, Undefined>(BSONUndefined);
+    TestParse<One_timestamp, bsonTimestamp, UndefinedLabeler, Undefined>(BSONUndefined);
+}
+
 
 // Mixed: test a type that accepts multiple bson types
 TEST(IDLOneTypeTests, TestSafeInt32) {
@@ -481,6 +515,102 @@ TEST(IDLStructTests, TestNonStrictStruct) {
     }
 }
 
+/// Struct default comparison tests
+TEST(IDLCompareTests, TestAllFields) {
+    IDLParserErrorContext ctxt("root");
+
+    // Positive: equality works
+    {
+        CompareAllField3 origStruct;
+        origStruct.setField1(12);
+        origStruct.setField2(123);
+        origStruct.setField3(1234);
+
+        auto testDoc = BSON("field1" << 12 << "field2" << 123 << "field3" << 1234);
+        auto parsedStruct = CompareAllField3::parse(ctxt, testDoc);
+
+        // Avoid ASSET_<RelOp> to avoid operator <<
+        ASSERT_TRUE(origStruct == parsedStruct);
+        ASSERT_FALSE(origStruct != parsedStruct);
+        ASSERT_FALSE(origStruct < parsedStruct);
+        ASSERT_FALSE(parsedStruct < origStruct);
+    }
+
+    // Positive: not equality works in field 3
+    {
+        CompareAllField3 origStruct;
+        origStruct.setField1(12);
+        origStruct.setField2(123);
+        origStruct.setField3(12345);
+
+        auto testDoc = BSON("field1" << 12 << "field2" << 123 << "field3" << 1234);
+        auto parsedStruct = CompareAllField3::parse(ctxt, testDoc);
+
+        // Avoid ASSET_<RelOp> to avoid operator <<
+        ASSERT_FALSE(origStruct == parsedStruct);
+        ASSERT_TRUE(origStruct != parsedStruct);
+        ASSERT_FALSE(origStruct < parsedStruct);
+        ASSERT_TRUE(parsedStruct < origStruct);
+    }
+}
+
+
+/// Struct partial comparison tests
+TEST(IDLCompareTests, TestSomeFields) {
+    IDLParserErrorContext ctxt("root");
+
+    // Positive: partial equality works when field 2 is different
+    {
+        CompareSomeField3 origStruct;
+        origStruct.setField1(12);
+        origStruct.setField2(12345);
+        origStruct.setField3(1234);
+
+        auto testDoc = BSON("field1" << 12 << "field2" << 123 << "field3" << 1234);
+        auto parsedStruct = CompareSomeField3::parse(ctxt, testDoc);
+
+        // Avoid ASSET_<RelOp> to avoid operator <<
+        ASSERT_TRUE(origStruct == parsedStruct);
+        ASSERT_FALSE(origStruct != parsedStruct);
+        ASSERT_FALSE(origStruct < parsedStruct);
+        ASSERT_FALSE(parsedStruct < origStruct);
+    }
+
+    // Positive: partial equality works when field 3 is different
+    {
+        CompareSomeField3 origStruct;
+        origStruct.setField1(12);
+        origStruct.setField2(1);
+        origStruct.setField3(12345);
+
+        auto testDoc = BSON("field1" << 12 << "field2" << 123 << "field3" << 1234);
+        auto parsedStruct = CompareSomeField3::parse(ctxt, testDoc);
+
+        // Avoid ASSET_<RelOp> to avoid operator <<
+        ASSERT_FALSE(origStruct == parsedStruct);
+        ASSERT_TRUE(origStruct != parsedStruct);
+        ASSERT_FALSE(origStruct < parsedStruct);
+        ASSERT_TRUE(parsedStruct < origStruct);
+    }
+
+    // Positive: partial equality works when field 1 is different
+    {
+        CompareSomeField3 origStruct;
+        origStruct.setField1(123);
+        origStruct.setField2(1);
+        origStruct.setField3(1234);
+
+        auto testDoc = BSON("field1" << 12 << "field2" << 123 << "field3" << 1234);
+        auto parsedStruct = CompareSomeField3::parse(ctxt, testDoc);
+
+        // Avoid ASSET_<RelOp> to avoid operator <<
+        ASSERT_FALSE(origStruct == parsedStruct);
+        ASSERT_TRUE(origStruct != parsedStruct);
+        ASSERT_FALSE(origStruct < parsedStruct);
+        ASSERT_TRUE(parsedStruct < origStruct);
+    }
+}
+
 /// Field tests
 // Positive: check ignored field is ignored
 TEST(IDLFieldTests, TestStrictStructIgnoredField) {
@@ -498,6 +628,19 @@ TEST(IDLFieldTests, TestStrictStructIgnoredField) {
         IgnoredField::parse(ctxt, testDoc);
     }
 }
+
+// Negative: check duplicate ignored fields fail
+TEST(IDLFieldTests, TestStrictDuplicateIgnoredFields) {
+    IDLParserErrorContext ctxt("root");
+
+    // Negative: Test duplicate ignored fields fail
+    {
+        auto testDoc =
+            BSON("required_field" << 12 << "ignored_field" << 123 << "ignored_field" << 456);
+        ASSERT_THROWS(IgnoredField::parse(ctxt, testDoc), AssertionException);
+    }
+}
+
 
 // First test: test an empty document and the default value
 // Second test: test a non-empty document and that we do not get the default value
@@ -582,6 +725,31 @@ TEST(IDLFieldTests, TestOptionalFields) {
         auto testDoc = BSON("field2" << 123);
         ASSERT_BSONOBJ_EQ(testDoc, loopbackDoc);
     }
+}
+
+template <typename TestT>
+void TestWeakType(TestT test_value) {
+    IDLParserErrorContext ctxt("root");
+    auto testDoc =
+        BSON("field1" << test_value << "field2" << test_value << "field3" << test_value << "field4"
+                      << test_value
+                      << "field5"
+                      << test_value);
+    auto testStruct = Optional_field::parse(ctxt, testDoc);
+
+    ASSERT_FALSE(testStruct.getField1().is_initialized());
+    ASSERT_FALSE(testStruct.getField2().is_initialized());
+    ASSERT_FALSE(testStruct.getField3().is_initialized());
+    ASSERT_FALSE(testStruct.getField4().is_initialized());
+    ASSERT_FALSE(testStruct.getField5().is_initialized());
+}
+
+// Positive: struct strict, and optional field works
+TEST(IDLFieldTests, TestOptionalFieldsWithNullAndUndefined) {
+
+    TestWeakType<NullLabeler>(BSONNULL);
+
+    TestWeakType<UndefinedLabeler>(BSONUndefined);
 }
 
 // Positive: Test a nested struct
@@ -889,17 +1057,18 @@ TEST(IDLArrayTests, TestArraysOfComplexTypes) {
                             );
     auto testStruct = Complex_array_fields::parse(ctxt, testDoc);
 
-    assert_same_types<decltype(testStruct.getField1()), const std::vector<std::int64_t>&>();
+    assert_same_types<decltype(testStruct.getField1()), const std::vector<std::int32_t>&>();
     assert_same_types<decltype(testStruct.getField2()),
                       const std::vector<mongo::NamespaceString>&>();
     assert_same_types<decltype(testStruct.getField3()), const std::vector<mongo::AnyBasicType>&>();
     assert_same_types<decltype(testStruct.getField4()),
                       const std::vector<mongo::ObjectBasicType>&>();
     assert_same_types<decltype(testStruct.getField5()), const std::vector<mongo::BSONObj>&>();
-    assert_same_types<decltype(testStruct.getField6()), const std::vector<mongo::One_string>&>();
+    assert_same_types<decltype(testStruct.getField6()),
+                      const std::vector<mongo::idl::import::One_string>&>();
 
     assert_same_types<decltype(testStruct.getField1o()),
-                      const boost::optional<std::vector<std::int64_t>>&>();
+                      const boost::optional<std::vector<std::int32_t>>&>();
     assert_same_types<decltype(testStruct.getField2o()),
                       const boost::optional<std::vector<mongo::NamespaceString>>&>();
     assert_same_types<decltype(testStruct.getField3o()),
@@ -909,9 +1078,9 @@ TEST(IDLArrayTests, TestArraysOfComplexTypes) {
     assert_same_types<decltype(testStruct.getField5o()),
                       const boost::optional<std::vector<mongo::BSONObj>>&>();
     assert_same_types<decltype(testStruct.getField6o()),
-                      const boost::optional<std::vector<mongo::One_string>>&>();
+                      const boost::optional<std::vector<mongo::idl::import::One_string>>&>();
 
-    std::vector<std::int64_t> field1{1, 2, 3};
+    std::vector<std::int32_t> field1{1, 2, 3};
     ASSERT_TRUE(field1 == testStruct.getField1());
     std::vector<NamespaceString> field2{{"a", "b"}, {"c", "d"}};
     ASSERT_TRUE(field2 == testStruct.getField2());
@@ -957,6 +1126,10 @@ void TestBinDataVector() {
 
         auto serializedDoc = builder.obj();
         ASSERT_BSONOBJ_EQ(testDoc, serializedDoc);
+
+        // Validate the operator == works
+        // Use ASSERT instead of ASSERT_EQ to avoid operator<<
+        ASSERT(one_new == testStruct);
     }
 }
 
@@ -1420,18 +1593,27 @@ TEST(IDLEnum, TestEnum) {
     auto testStruct = StructWithEnum::parse(ctxt, testDoc);
     ASSERT_TRUE(testStruct.getField1() == IntEnum::c2);
     ASSERT_TRUE(testStruct.getField2() == StringEnumEnum::s0);
+    ASSERT_TRUE(testStruct.getFieldDefault() == StringEnumEnum::s1);
 
     assert_same_types<decltype(testStruct.getField1()), IntEnum>();
     assert_same_types<decltype(testStruct.getField1o()), const boost::optional<IntEnum>>();
     assert_same_types<decltype(testStruct.getField2()), StringEnumEnum>();
     assert_same_types<decltype(testStruct.getField2o()), const boost::optional<StringEnumEnum>>();
+    assert_same_types<decltype(testStruct.getFieldDefault()), StringEnumEnum>();
+
+    auto testSerializedDoc = BSON("field1" << 2 << "field2"
+                                           << "zero"
+                                           << "fieldDefault"
+                                           << "one");
+
+
     // Positive: Test we can roundtrip from the just parsed document
     {
         BSONObjBuilder builder;
         testStruct.serialize(&builder);
         auto loopbackDoc = builder.obj();
 
-        ASSERT_BSONOBJ_EQ(testDoc, loopbackDoc);
+        ASSERT_BSONOBJ_EQ(testSerializedDoc, loopbackDoc);
     }
 
     // Positive: Test we can serialize from nothing the same document
@@ -1443,7 +1625,7 @@ TEST(IDLEnum, TestEnum) {
         one_new.serialize(&builder);
 
         auto serializedDoc = builder.obj();
-        ASSERT_BSONOBJ_EQ(testDoc, serializedDoc);
+        ASSERT_BSONOBJ_EQ(testSerializedDoc, serializedDoc);
     }
 }
 
@@ -2027,9 +2209,20 @@ TEST(IDLDocSequence, TestWellKnownFieldsAreIgnored) {
                                 << "objects"
                                 << BSON_ARRAY(BSON("foo" << 1)));
 
+
         OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
-        auto testStruct = DocSequenceCommand::parse(ctxt, request);
-        ASSERT_EQUALS(2UL, testStruct.getStructs().size());
+
+        // Validate it can be parsed as a OpMsgRequest.
+        {
+            auto testStruct = DocSequenceCommand::parse(ctxt, request);
+            ASSERT_EQUALS(2UL, testStruct.getStructs().size());
+        }
+
+        // Validate it can be parsed as just a BSON document.
+        {
+            auto testStruct = DocSequenceCommand::parse(ctxt, request.body);
+            ASSERT_EQUALS(2UL, testStruct.getStructs().size());
+        }
     }
 }
 
@@ -2171,6 +2364,469 @@ TEST(IDLCommand, TestKnownFieldDuplicate) {
     ASSERT_BSONOBJ_EQ(expectedDoc, testStruct.serialize(testPassthrough).body);
 }
 
+
+// Positive: Test an inline nested chain struct works
+TEST(IDLChainedStruct, TestInline) {
+    IDLParserErrorContext ctxt("root");
+
+    auto testDoc = BSON("stringField"
+                        << "bar"
+                        << "field3"
+                        << "foo");
+
+    auto testStruct = Chained_struct_inline::parse(ctxt, testDoc);
+    ASSERT_EQUALS(testStruct.getChained_string_inline_basic_type().getStringField(), "bar");
+    ASSERT_EQUALS(testStruct.getField3(), "foo");
+
+    assert_same_types<decltype(testStruct.getChained_string_inline_basic_type().getStringField()),
+                      const StringData>();
+    assert_same_types<decltype(testStruct.getField3()), const StringData>();
+
+    // Positive: Test we can round trip to a document from the just parsed document
+    {
+        BSONObj loopbackDoc = testStruct.toBSON();
+
+        ASSERT_BSONOBJ_EQ(testDoc, loopbackDoc);
+    }
+
+    // Positive: Test we can serialize from nothing the same document
+    {
+        BSONObjBuilder builder;
+        Chained_struct_inline one_new;
+        one_new.setField3("foo");
+
+        Chained_string_inline_basic_type f1;
+        f1.setStringField("bar");
+        one_new.setChained_string_inline_basic_type(f1);
+
+        BSONObj loopbackDoc = one_new.toBSON();
+
+        ASSERT_BSONOBJ_EQ(testDoc, loopbackDoc);
+    }
+}
+
+TEST(IDLValidatedField, Int_basic_ranges) {
+    // Explicitly call setters.
+    Int_basic_ranges obj0;
+    obj0.setPositive_int(42);
+    ASSERT_THROWS(obj0.setPositive_int(0), AssertionException);
+    ASSERT_THROWS(obj0.setPositive_int(-42), AssertionException);
+
+    ASSERT_THROWS(obj0.setNegative_int(42), AssertionException);
+    ASSERT_THROWS(obj0.setNegative_int(0), AssertionException);
+    obj0.setNegative_int(-42);
+
+    obj0.setNon_negative_int(42);
+    obj0.setNon_negative_int(0);
+    ASSERT_THROWS(obj0.setNon_negative_int(-42), AssertionException);
+
+    ASSERT_THROWS(obj0.setNon_positive_int(42), AssertionException);
+    obj0.setNon_positive_int(0);
+    obj0.setNon_positive_int(-42);
+
+    ASSERT_THROWS(obj0.setByte_range_int(-1), AssertionException);
+    obj0.setByte_range_int(0);
+    obj0.setByte_range_int(127);
+    obj0.setByte_range_int(128);
+    obj0.setByte_range_int(255);
+    ASSERT_THROWS(obj0.setByte_range_int(256), AssertionException);
+
+    // IDL ints *are* int32_t, so no number we can pass to the func will actually fail.
+    obj0.setRange_int(std::numeric_limits<std::int32_t>::min() + 1);
+    obj0.setRange_int(-65536);
+    obj0.setRange_int(0);
+    obj0.setRange_int(65536);
+    obj0.setRange_int(std::numeric_limits<std::int32_t>::max());
+
+    // Positive case parsing.
+    const auto tryPass = [](std::int32_t pos,
+                            std::int32_t neg,
+                            std::int32_t nonneg,
+                            std::int32_t nonpos,
+                            std::int32_t byte_range,
+                            std::int32_t int_range) {
+        IDLParserErrorContext ctxt("root");
+        auto doc =
+            BSON("positive_int" << pos << "negative_int" << neg << "non_negative_int" << nonneg
+                                << "non_positive_int"
+                                << nonpos
+                                << "byte_range_int"
+                                << byte_range
+                                << "range_int"
+                                << int_range);
+        auto obj = Int_basic_ranges::parse(ctxt, doc);
+        ASSERT_EQUALS(obj.getPositive_int(), pos);
+        ASSERT_EQUALS(obj.getNegative_int(), neg);
+        ASSERT_EQUALS(obj.getNon_negative_int(), nonneg);
+        ASSERT_EQUALS(obj.getNon_positive_int(), nonpos);
+        ASSERT_EQUALS(obj.getByte_range_int(), byte_range);
+        ASSERT_EQUALS(obj.getRange_int(), int_range);
+    };
+
+    // Negative case parsing.
+    const auto tryFail = [](std::int32_t pos,
+                            std::int32_t neg,
+                            std::int32_t nonneg,
+                            std::int32_t nonpos,
+                            std::int32_t byte_range,
+                            std::int32_t int_range) {
+        IDLParserErrorContext ctxt("root");
+        auto doc =
+            BSON("positive_int" << pos << "negative_int" << neg << "non_negative_int" << nonneg
+                                << "non_positive_int"
+                                << nonpos
+                                << "byte_range_int"
+                                << byte_range
+                                << "range_int"
+                                << int_range);
+        ASSERT_THROWS(Int_basic_ranges::parse(ctxt, doc), AssertionException);
+    };
+
+    tryPass(1, -1, 0, 0, 128, 65537);
+    tryFail(0, -1, 0, 0, 128, 65537);
+    tryFail(1, 0, 0, 0, 128, 65537);
+    tryFail(1, -1, -1, 0, 128, 65537);
+    tryFail(1, -1, 0, 1, 128, 65537);
+    tryFail(1, -1, 0, 0, 256, 65537);
+    tryFail(0, 0, -1, 1, 257, 0);
+
+    tryPass(1000, -1000, 1, -1, 127, 0x7FFFFFFF);
+}
+
+TEST(IDLValidatedField, Double_basic_ranges) {
+    // Explicitly call setters.
+    Double_basic_ranges obj0;
+    obj0.setPositive_double(42.0);
+    obj0.setPositive_double(0.000000000001);
+    ASSERT_THROWS(obj0.setPositive_double(0.0), AssertionException);
+    ASSERT_THROWS(obj0.setPositive_double(-42.0), AssertionException);
+
+    ASSERT_THROWS(obj0.setNegative_double(42.0), AssertionException);
+    ASSERT_THROWS(obj0.setNegative_double(0.0), AssertionException);
+    obj0.setNegative_double(-0.000000000001);
+    obj0.setNegative_double(-42.0);
+
+    obj0.setNon_negative_double(42.0);
+    obj0.setNon_negative_double(0.0);
+    ASSERT_THROWS(obj0.setNon_negative_double(-42.0), AssertionException);
+
+    ASSERT_THROWS(obj0.setNon_positive_double(42.0), AssertionException);
+    obj0.setNon_positive_double(0.0);
+    obj0.setNon_positive_double(-42.0);
+
+    ASSERT_THROWS(obj0.setRange_double(-12345678901234600000.0), AssertionException);
+    obj0.setRange_double(-12345678901234500000.0);
+    obj0.setRange_double(-3000000000.0);
+    obj0.setRange_double(0);
+    obj0.setRange_double(3000000000);
+    obj0.setRange_double(12345678901234500000.0);
+    ASSERT_THROWS(obj0.setRange_double(12345678901234600000.0), AssertionException);
+
+    // Positive case parsing.
+    const auto tryPass =
+        [](double pos, double neg, double nonneg, double nonpos, double double_range) {
+            IDLParserErrorContext ctxt("root");
+            auto doc =
+                BSON("positive_double" << pos << "negative_double" << neg << "non_negative_double"
+                                       << nonneg
+                                       << "non_positive_double"
+                                       << nonpos
+                                       << "range_double"
+                                       << double_range);
+            auto obj = Double_basic_ranges::parse(ctxt, doc);
+            ASSERT_EQUALS(obj.getPositive_double(), pos);
+            ASSERT_EQUALS(obj.getNegative_double(), neg);
+            ASSERT_EQUALS(obj.getNon_negative_double(), nonneg);
+            ASSERT_EQUALS(obj.getNon_positive_double(), nonpos);
+            ASSERT_EQUALS(obj.getRange_double(), double_range);
+        };
+
+    // Negative case parsing.
+    const auto tryFail =
+        [](double pos, double neg, double nonneg, double nonpos, double double_range) {
+            IDLParserErrorContext ctxt("root");
+            auto doc =
+                BSON("positive_double" << pos << "negative_double" << neg << "non_negative_double"
+                                       << nonneg
+                                       << "non_positive_double"
+                                       << nonpos
+                                       << "range_double"
+                                       << double_range);
+            ASSERT_THROWS(Double_basic_ranges::parse(ctxt, doc), AssertionException);
+        };
+
+    tryPass(1, -1, 0, 0, 123456789012345);
+    tryFail(0, -1, 0, 0, 123456789012345);
+    tryFail(1, 0, 0, 0, 123456789012345);
+    tryFail(1, -1, -1, 0, 123456789012345);
+    tryFail(1, -1, 0, 1, 123456789012345);
+    tryFail(1, -1, 0, -1, 12345678901234600000.0);
+    tryPass(0.00000000001, -0.00000000001, 0.0, 0.0, 1.23456789012345);
+}
+
+TEST(IDLValidatedField, Callback_validators) {
+    // Explicitly call setters.
+    Callback_validators obj0;
+    obj0.setInt_even(42);
+    ASSERT_THROWS(obj0.setInt_even(7), AssertionException);
+    obj0.setInt_even(0);
+    ASSERT_THROWS(obj0.setInt_even(-7), AssertionException);
+    obj0.setInt_even(-42);
+
+    ASSERT_THROWS(obj0.setDouble_nearly_int(3.141592), AssertionException);
+    ASSERT_THROWS(obj0.setDouble_nearly_int(-2.71828), AssertionException);
+    obj0.setDouble_nearly_int(0.0);
+    obj0.setDouble_nearly_int(1.0);
+    obj0.setDouble_nearly_int(1.05);
+    obj0.setDouble_nearly_int(-123456789.01234500000);
+
+    ASSERT_THROWS(obj0.setString_starts_with_x("whiskey"), AssertionException);
+    obj0.setString_starts_with_x("x-ray");
+    ASSERT_THROWS(obj0.setString_starts_with_x("yankee"), AssertionException);
+
+    // Positive case parsing.
+    const auto tryPass =
+        [](std::int32_t int_even, double double_nearly_int, StringData string_starts_with_x) {
+            IDLParserErrorContext ctxt("root");
+            auto doc = BSON("int_even" << int_even << "double_nearly_int" << double_nearly_int
+                                       << "string_starts_with_x"
+                                       << string_starts_with_x);
+            auto obj = Callback_validators::parse(ctxt, doc);
+            ASSERT_EQUALS(obj.getInt_even(), int_even);
+            ASSERT_EQUALS(obj.getDouble_nearly_int(), double_nearly_int);
+            ASSERT_EQUALS(obj.getString_starts_with_x(), string_starts_with_x);
+        };
+
+    // Negative case parsing.
+    const auto tryFail =
+        [](std::int32_t int_even, double double_nearly_int, StringData string_starts_with_x) {
+            IDLParserErrorContext ctxt("root");
+            auto doc = BSON("int_even" << int_even << "double_nearly_int" << double_nearly_int
+                                       << "string_starts_with_x"
+                                       << string_starts_with_x);
+            ASSERT_THROWS(Callback_validators::parse(ctxt, doc), AssertionException);
+        };
+
+    tryPass(42, 123456789.01, "x-ray");
+    tryFail(43, 123456789.01, "x-ray");
+    tryFail(42, 123456789.11, "x-ray");
+    tryFail(42, 123456789.01, "uniform");
+}
+
+// Positive: verify a command a string arg
+TEST(IDLTypeCommand, TestString) {
+    IDLParserErrorContext ctxt("root");
+
+    auto testDoc = BSON(CommandTypeStringCommand::kCommandName << "foo"
+                                                               << "field1"
+                                                               << 3
+                                                               << "$db"
+                                                               << "db");
+
+    auto testStruct = CommandTypeStringCommand::parse(ctxt, makeOMR(testDoc));
+    ASSERT_EQUALS(testStruct.getField1(), 3);
+    ASSERT_EQUALS(testStruct.getCommandParameter(), "foo");
+
+    assert_same_types<decltype(testStruct.getCommandParameter()), const StringData>();
+
+    // Positive: Test we can roundtrip from the just parsed document
+    {
+        BSONObjBuilder builder;
+        OpMsgRequest reply = testStruct.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+
+    // Positive: Test we can serialize from nothing the same document except for $db
+    {
+        auto testDocWithoutDb = BSON(CommandTypeStringCommand::kCommandName << "foo"
+                                                                            << "field1"
+                                                                            << 3);
+
+        BSONObjBuilder builder;
+        CommandTypeStringCommand one_new("foo");
+        one_new.setField1(3);
+        one_new.setDbName("db");
+        one_new.serialize(BSONObj(), &builder);
+
+        auto serializedDoc = builder.obj();
+        ASSERT_BSONOBJ_EQ(testDocWithoutDb, serializedDoc);
+    }
+
+    // Positive: Test we can serialize from nothing the same document
+    {
+        BSONObjBuilder builder;
+        CommandTypeStringCommand one_new("foo");
+        one_new.setField1(3);
+        one_new.setDbName("db");
+        OpMsgRequest reply = one_new.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+}
+
+// Positive: verify a command can take an array of object
+TEST(IDLTypeCommand, TestArrayObject) {
+    IDLParserErrorContext ctxt("root");
+
+    auto testDoc = BSON(CommandTypeArrayObjectCommand::kCommandName << BSON_ARRAY(BSON("sample"
+                                                                                       << "doc"))
+                                                                    << "$db"
+                                                                    << "db");
+
+    auto testStruct = CommandTypeArrayObjectCommand::parse(ctxt, makeOMR(testDoc));
+    ASSERT_EQUALS(testStruct.getCommandParameter().size(), 1UL);
+
+    assert_same_types<decltype(testStruct.getCommandParameter()),
+                      const std::vector<mongo::BSONObj>&>();
+
+    // Positive: Test we can roundtrip from the just parsed document
+    {
+        BSONObjBuilder builder;
+        OpMsgRequest reply = testStruct.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+
+    // Positive: Test we can serialize from nothing the same document
+    {
+        BSONObjBuilder builder;
+        std::vector<BSONObj> vec;
+        vec.emplace_back(BSON("sample"
+                              << "doc"));
+        CommandTypeArrayObjectCommand one_new(vec);
+        one_new.setDbName("db");
+        OpMsgRequest reply = one_new.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+}
+
+// Positive: verify a command can take a struct
+TEST(IDLTypeCommand, TestStruct) {
+    IDLParserErrorContext ctxt("root");
+
+    auto testDoc = BSON(CommandTypeStructCommand::kCommandName << BSON("value"
+                                                                       << "sample")
+                                                               << "$db"
+                                                               << "db");
+
+    auto testStruct = CommandTypeStructCommand::parse(ctxt, makeOMR(testDoc));
+    ASSERT_EQUALS(testStruct.getCommandParameter().getValue(), "sample");
+
+    assert_same_types<decltype(testStruct.getCommandParameter()),
+                      mongo::idl::import::One_string&>();
+
+    // Positive: Test we can roundtrip from the just parsed document
+    {
+        BSONObjBuilder builder;
+        OpMsgRequest reply = testStruct.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+
+    // Positive: Test we can serialize from nothing the same document
+    {
+        BSONObjBuilder builder;
+        One_string os;
+        os.setValue("sample");
+        CommandTypeStructCommand one_new(os);
+        one_new.setDbName("db");
+        OpMsgRequest reply = one_new.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+}
+
+// Positive: verify a command can take an array of structs
+TEST(IDLTypeCommand, TestStructArray) {
+    IDLParserErrorContext ctxt("root");
+
+    auto testDoc = BSON(CommandTypeArrayStructCommand::kCommandName << BSON_ARRAY(BSON("value"
+                                                                                       << "sample"))
+                                                                    << "$db"
+                                                                    << "db");
+
+    auto testStruct = CommandTypeArrayStructCommand::parse(ctxt, makeOMR(testDoc));
+    ASSERT_EQUALS(testStruct.getCommandParameter().size(), 1UL);
+
+    assert_same_types<decltype(testStruct.getCommandParameter()),
+                      const std::vector<mongo::idl::import::One_string>&>();
+
+    // Positive: Test we can roundtrip from the just parsed document
+    {
+        BSONObjBuilder builder;
+        OpMsgRequest reply = testStruct.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+
+    // Positive: Test we can serialize from nothing the same document
+    {
+        BSONObjBuilder builder;
+        std::vector<One_string> vec;
+        One_string os;
+        os.setValue("sample");
+        vec.push_back(os);
+        CommandTypeArrayStructCommand one_new(vec);
+        one_new.setDbName("db");
+        OpMsgRequest reply = one_new.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+}
+
+// Positive: verify a command a string arg and alternate C++ name
+TEST(IDLTypeCommand, TestUnderscoreCommand) {
+    IDLParserErrorContext ctxt("root");
+
+    auto testDoc = BSON(WellNamedCommand::kCommandName << "foo"
+                                                       << "field1"
+                                                       << 3
+                                                       << "$db"
+                                                       << "db");
+
+    auto testStruct = WellNamedCommand::parse(ctxt, makeOMR(testDoc));
+    ASSERT_EQUALS(testStruct.getField1(), 3);
+    ASSERT_EQUALS(testStruct.getCommandParameter(), "foo");
+
+    assert_same_types<decltype(testStruct.getCommandParameter()), const StringData>();
+
+    // Positive: Test we can roundtrip from the just parsed document
+    {
+        BSONObjBuilder builder;
+        OpMsgRequest reply = testStruct.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+
+    // Positive: Test we can serialize from nothing the same document except for $db
+    {
+        auto testDocWithoutDb = BSON(WellNamedCommand::kCommandName << "foo"
+                                                                    << "field1"
+                                                                    << 3);
+
+        BSONObjBuilder builder;
+        WellNamedCommand one_new("foo");
+        one_new.setField1(3);
+        one_new.setDbName("db");
+        one_new.serialize(BSONObj(), &builder);
+
+        auto serializedDoc = builder.obj();
+        ASSERT_BSONOBJ_EQ(testDocWithoutDb, serializedDoc);
+    }
+
+    // Positive: Test we can serialize from nothing the same document
+    {
+        BSONObjBuilder builder;
+        WellNamedCommand one_new("foo");
+        one_new.setField1(3);
+        one_new.setDbName("db");
+        OpMsgRequest reply = one_new.serialize(BSONObj());
+
+        ASSERT_BSONOBJ_EQ(testDoc, reply.body);
+    }
+}
 
 }  // namespace
 }  // namespace mongo

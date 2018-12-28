@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,6 +34,7 @@
 #include <string>
 
 #include "mongo/db/pipeline/parsed_aggregation_projection.h"
+#include "mongo/db/pipeline/parsed_aggregation_projection_node.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
 
@@ -47,45 +50,37 @@ namespace parsed_aggregation_projection {
  * represents one 'level' of the parsed specification. The root ExclusionNode represents all top
  * level exclusions, with any child ExclusionNodes representing dotted or nested exclusions.
  */
-class ExclusionNode {
+class ExclusionNode final : public ProjectionNode {
 public:
-    ExclusionNode(std::string pathToNode = "");
+    ExclusionNode(ProjectionPolicies policies, std::string pathToNode = "")
+        : ProjectionNode(policies, std::move(pathToNode)) {
+        // Computed fields are not supported by exclusion projections.
+        invariant(_policies.computedFieldsPolicy ==
+                  ProjectionPolicies::ComputedFieldsPolicy::kBanComputedFields);
+    }
 
-    /**
-     * Serialize this exclusion.
-     */
-    Document serialize() const;
+    ExclusionNode* addOrGetChild(const std::string& field) {
+        return static_cast<ExclusionNode*>(ProjectionNode::addOrGetChild(field));
+    }
 
-    /**
-     * Mark this path to be excluded. 'path' is allowed to be dotted.
-     */
-    void excludePath(FieldPath path);
+    void reportDependencies(DepsTracker* deps) const final {
+        // We have no dependencies on specific fields, since we only know the fields to be removed.
+    }
 
-    /**
-     * Applies this tree of exclusions to the input document.
-     */
-    Document applyProjection(const Document& input) const;
-
-    /**
-     * Creates the child if it doesn't already exist. 'field' is not allowed to be dotted.
-     */
-    ExclusionNode* addOrGetChild(FieldPath field);
-
-    void addModifiedPaths(std::set<std::string>* modifiedPaths) const;
-
-private:
-    // Helpers for addOrGetChild above.
-    ExclusionNode* getChild(std::string field) const;
-    ExclusionNode* addChild(std::string field);
-
-    // Helper for applyProjection above.
-    Value applyProjectionToValue(Value val) const;
-
-    // Fields excluded at this level.
-    stdx::unordered_set<std::string> _excludedFields;
-
-    std::string _pathToNode;
-    stdx::unordered_map<std::string, std::unique_ptr<ExclusionNode>> _children;
+protected:
+    std::unique_ptr<ProjectionNode> makeChild(std::string fieldName) const final {
+        return std::make_unique<ExclusionNode>(
+            _policies, FieldPath::getFullyQualifiedPath(_pathToNode, fieldName));
+    }
+    Document initializeOutputDocument(const Document& inputDoc) const final {
+        return inputDoc;
+    }
+    Value applyLeafProjectionToValue(const Value& value) const final {
+        return Value();
+    }
+    Value transformSkippedValueForOutput(const Value& value) const final {
+        return value;
+    }
 };
 
 /**
@@ -97,14 +92,21 @@ private:
  */
 class ParsedExclusionProjection : public ParsedAggregationProjection {
 public:
-    ParsedExclusionProjection(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : ParsedAggregationProjection(expCtx), _root(new ExclusionNode()) {}
+    ParsedExclusionProjection(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                              ProjectionPolicies policies)
+        : ParsedAggregationProjection(
+              expCtx,
+              {policies.idPolicy,
+               policies.arrayRecursionPolicy,
+               ProjectionPolicies::ComputedFieldsPolicy::kBanComputedFields}),
+          _root(new ExclusionNode(_policies)) {}
 
     TransformerType getType() const final {
         return TransformerType::kExclusionProjection;
     }
 
-    Document serializeStageOptions(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Document serializeTransformation(
+        boost::optional<ExplainOptions::Verbosity> explain) const final;
 
     /**
      * Parses the projection specification given by 'spec', populating internal data structures.
@@ -118,13 +120,13 @@ public:
      */
     Document applyProjection(const Document& inputDoc) const final;
 
-    DocumentSource::GetDepsReturn addDependencies(DepsTracker* deps) const final {
-        return DocumentSource::SEE_NEXT;
+    DepsTracker::State addDependencies(DepsTracker* deps) const final {
+        return DepsTracker::State::SEE_NEXT;
     }
 
     DocumentSource::GetModPathsReturn getModifiedPaths() const final {
         std::set<std::string> modifiedPaths;
-        _root->addModifiedPaths(&modifiedPaths);
+        _root->reportProjectedPaths(&modifiedPaths);
         return {DocumentSource::GetModPathsReturn::Type::kFiniteSet, std::move(modifiedPaths), {}};
     }
 

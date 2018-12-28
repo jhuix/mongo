@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -32,48 +34,42 @@
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_source_manager.h"
+#include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/wire_version.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/util/log.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
-
-using std::string;
-using str::stream;
-
 namespace {
 
 class SetShardVersion : public ErrmsgCommandDeprecated {
 public:
     SetShardVersion() : ErrmsgCommandDeprecated("setShardVersion") {}
 
-    void help(std::stringstream& help) const override {
-        help << "internal";
+    std::string help() const override {
+        return "internal";
     }
 
     bool adminOnly() const override {
         return true;
     }
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -82,7 +78,7 @@ public:
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         ActionSet actions;
         actions.addAction(ActionType::internal);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -91,7 +87,7 @@ public:
     bool errmsgRun(OperationContext* opCtx,
                    const std::string&,
                    const BSONObj& cmdObj,
-                   string& errmsg,
+                   std::string& errmsg,
                    BSONObjBuilder& result) {
         uassert(ErrorCodes::IllegalOperation,
                 "can't issue setShardVersion from 'eval'",
@@ -135,6 +131,12 @@ public:
         LastError::get(client).disable();
 
         const bool authoritative = cmdObj.getBoolField("authoritative");
+        // A flag that specifies whether the set shard version catalog refresh
+        // is allowed to join an in-progress refresh triggered by an other
+        // thread, or whether it's required to either a) trigger its own
+        // refresh or b) wait for a refresh to be started after it has entered the
+        // getCollectionRoutingInfoWithRefresh function
+        const bool forceRefresh = cmdObj.getBoolField("forceRefresh");
         const bool noConnectionVersioning = cmdObj.getBoolField("noConnectionVersioning");
 
         ShardedConnectionInfo dummyInfo;
@@ -159,7 +161,7 @@ public:
 
         // Validate shardName parameter.
         const auto shardName = cmdObj["shard"].str();
-        const auto storedShardName = ShardingState::get(opCtx)->getShardName();
+        const auto storedShardName = shardingState->shardId().toString();
         uassert(ErrorCodes::BadValue,
                 str::stream() << "received shardName " << shardName
                               << " which differs from stored shardName "
@@ -178,7 +180,8 @@ public:
                               << " is not of type SET",
                 givenConnStr.type() == ConnectionString::SET);
 
-        const auto storedConnStr = ShardingState::get(opCtx)->getConfigServer(opCtx);
+        const auto storedConnStr =
+            Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString();
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "Given config server set name: " << givenConnStr.getSetName()
                               << " differs from known set name: "
@@ -192,20 +195,27 @@ public:
                 nss.isValid());
 
         // Validate chunk version parameter.
-        const ChunkVersion requestedVersion =
-            uassertStatusOK(ChunkVersion::parseFromBSONForSetShardVersion(cmdObj));
+        const ChunkVersion requestedVersion = uassertStatusOK(
+            ChunkVersion::parseLegacyWithField(cmdObj, SetShardVersionRequest::kVersion));
 
         // Step 4
 
-        const ChunkVersion connectionVersion = info->getVersion(nss.ns());
-        connectionVersion.addToBSON(result, "oldVersion");
+        const auto connectionVersionOrNotSet = info->getVersion(nss.ns());
+
+        // For backwards compatibility, calling SSV for a namespace which is sharded, but doesn't
+        // have version set on the connection requires the call to fail and require the
+        // "need_authoritative" flag to be set on the response. Treating unset connection versions
+        // as UNSHARDED is the legacy way to achieve this purpose.
+        const auto connectionVersion =
+            (connectionVersionOrNotSet ? *connectionVersionOrNotSet : ChunkVersion::UNSHARDED());
+        connectionVersion.appendLegacyWithField(&result, "oldVersion");
 
         {
             boost::optional<AutoGetDb> autoDb;
             autoDb.emplace(opCtx, nss.db(), MODE_IS);
 
             // Slave nodes cannot support set shard version
-            uassert(40589,
+            uassert(ErrorCodes::NotMaster,
                     str::stream() << "setShardVersion with collection version is only supported "
                                      "against primary nodes, but it was received for namespace "
                                   << nss.ns(),
@@ -221,25 +231,28 @@ public:
             boost::optional<Lock::CollectionLock> collLock;
             collLock.emplace(opCtx->lockState(), nss.ns(), MODE_IS);
 
-            auto css = CollectionShardingState::get(opCtx, nss);
-            const ChunkVersion collectionShardVersion =
-                (css->getMetadata() ? css->getMetadata()->getShardVersion()
-                                    : ChunkVersion::UNSHARDED());
+            auto* const css = CollectionShardingState::get(opCtx, nss);
+            const ChunkVersion collectionShardVersion = [&] {
+                auto optMetadata = css->getCurrentMetadataIfKnown();
+                return (optMetadata && (*optMetadata)->isSharded())
+                    ? (*optMetadata)->getShardVersion()
+                    : ChunkVersion::UNSHARDED();
+            }();
 
             if (requestedVersion.isWriteCompatibleWith(collectionShardVersion)) {
-                // mongos and mongod agree!
+                // MongoS and MongoD agree on what is the collection's shard version
+                //
                 // Now we should update the connection's version if it's not compatible with the
                 // request's version. This could happen if the shard's metadata has changed, but
                 // the remote client has already refreshed its view of the metadata since the last
                 // time it sent anything over this connection.
                 if (!connectionVersion.isWriteCompatibleWith(requestedVersion)) {
-                    // A migration occurred.
                     if (connectionVersion < collectionShardVersion &&
                         connectionVersion.epoch() == collectionShardVersion.epoch()) {
+                        // A migration occurred
                         info->setVersion(nss.ns(), requestedVersion);
-                    }
-                    // The collection was dropped and recreated.
-                    else if (authoritative) {
+                    } else if (authoritative) {
+                        // The collection was dropped and recreated
                         info->setVersion(nss.ns(), requestedVersion);
                     } else {
                         result.append("ns", nss.ns());
@@ -261,7 +274,7 @@ public:
                 if (!authoritative) {
                     result.appendBool("need_authoritative", true);
                     result.append("ns", nss.ns());
-                    collectionShardVersion.addToBSON(result, "globalVersion");
+                    collectionShardVersion.appendLegacyWithField(&result, "globalVersion");
                     errmsg = "dropping needs to be authoritative";
                     return false;
                 }
@@ -278,31 +291,28 @@ public:
                     errmsg = str::stream() << "this connection already had a newer version "
                                            << "of collection '" << nss.ns() << "'";
                     result.append("ns", nss.ns());
-                    requestedVersion.addToBSON(result, "newVersion");
-                    collectionShardVersion.addToBSON(result, "globalVersion");
+                    requestedVersion.appendLegacyWithField(&result, "newVersion");
+                    collectionShardVersion.appendLegacyWithField(&result, "globalVersion");
                     return false;
                 }
 
                 // TODO: Refactor all of this
                 if (requestedVersion < collectionShardVersion &&
                     requestedVersion.epoch() == collectionShardVersion.epoch()) {
-                    if (css->getMigrationSourceManager()) {
-                        auto critSecSignal =
-                            css->getMigrationSourceManager()->getMigrationCriticalSectionSignal(
-                                false);
-                        if (critSecSignal) {
-                            collLock.reset();
-                            autoDb.reset();
-                            log() << "waiting till out of critical section";
-                            critSecSignal->waitFor(opCtx, Seconds(10));
-                        }
+                    auto critSecSignal =
+                        css->getCriticalSectionSignal(ShardingMigrationCriticalSection::kWrite);
+                    if (critSecSignal) {
+                        collLock.reset();
+                        autoDb.reset();
+                        log() << "waiting till out of critical section";
+                        critSecSignal->waitFor(opCtx, Seconds(10));
                     }
 
                     errmsg = str::stream() << "shard global version for collection is higher "
                                            << "than trying to set to '" << nss.ns() << "'";
                     result.append("ns", nss.ns());
-                    requestedVersion.addToBSON(result, "version");
-                    collectionShardVersion.addToBSON(result, "globalVersion");
+                    requestedVersion.appendLegacyWithField(&result, "version");
+                    collectionShardVersion.appendLegacyWithField(&result, "globalVersion");
                     result.appendBool("reloadConfig", true);
                     return false;
                 }
@@ -310,16 +320,13 @@ public:
                 if (!collectionShardVersion.isSet() && !authoritative) {
                     // Needed b/c when the last chunk is moved off a shard, the version gets reset
                     // to zero, which should require a reload.
-                    if (css->getMigrationSourceManager()) {
-                        auto critSecSignal =
-                            css->getMigrationSourceManager()->getMigrationCriticalSectionSignal(
-                                false);
-                        if (critSecSignal) {
-                            collLock.reset();
-                            autoDb.reset();
-                            log() << "waiting till out of critical section";
-                            critSecSignal->waitFor(opCtx, Seconds(10));
-                        }
+                    auto critSecSignal =
+                        css->getCriticalSectionSignal(ShardingMigrationCriticalSection::kWrite);
+                    if (critSecSignal) {
+                        collLock.reset();
+                        autoDb.reset();
+                        log() << "waiting till out of critical section";
+                        critSecSignal->waitFor(opCtx, Seconds(10));
                     }
 
                     // need authoritative for first look
@@ -335,16 +342,21 @@ public:
 
         // Step 7
 
-        Status status = shardingState->onStaleShardVersion(opCtx, nss, requestedVersion);
+        // Note: The forceRefresh flag controls whether we make sure to do our
+        // own refresh or if we're okay with joining another thread
+        const auto status = onShardVersionMismatchNoExcept(
+            opCtx, nss, requestedVersion, forceRefresh /*forceRefreshFromThisThread*/);
 
         {
             AutoGetCollection autoColl(opCtx, nss, MODE_IS);
 
-            ChunkVersion currVersion = ChunkVersion::UNSHARDED();
-            auto collMetadata = CollectionShardingState::get(opCtx, nss)->getMetadata();
-            if (collMetadata) {
-                currVersion = collMetadata->getShardVersion();
-            }
+            const ChunkVersion currVersion = [&] {
+                auto* const css = CollectionShardingState::get(opCtx, nss);
+                auto optMetadata = css->getCurrentMetadataIfKnown();
+                return (optMetadata && (*optMetadata)->isSharded())
+                    ? (*optMetadata)->getShardVersion()
+                    : ChunkVersion::UNSHARDED();
+            }();
 
             if (!status.isOK()) {
                 // The reload itself was interrupted or confused here
@@ -358,8 +370,8 @@ public:
                 warning() << errmsg;
 
                 result.append("ns", nss.ns());
-                requestedVersion.addToBSON(result, "version");
-                currVersion.addToBSON(result, "globalVersion");
+                requestedVersion.appendLegacyWithField(&result, "version");
+                currVersion.appendLegacyWithField(&result, "globalVersion");
                 result.appendBool("reloadConfig", true);
 
                 return false;
@@ -371,13 +383,16 @@ public:
                                        << ", requested version is " << requestedVersion.toString()
                                        << " but found version " << currVersion.toString();
 
-                OCCASIONALLY warning() << errmsg;
+                static Occasionally sampler;
+                if (sampler.tick()) {
+                    warning() << errmsg;
+                }
 
                 // WARNING: the exact fields below are important for compatibility with mongos
                 // version reload.
 
                 result.append("ns", nss.ns());
-                currVersion.addToBSON(result, "globalVersion");
+                currVersion.appendLegacyWithField(&result, "globalVersion");
 
                 // If this was a reset of a collection or the last chunk moved out, inform mongos to
                 // do a full reload.
@@ -385,11 +400,11 @@ public:
                     result.appendBool("reloadConfig", true);
                     // Zero-version also needed to trigger full mongos reload, sadly
                     // TODO: Make this saner, and less impactful (full reload on last chunk is bad)
-                    ChunkVersion(0, 0, OID()).addToBSON(result, "version");
+                    ChunkVersion(0, 0, OID()).appendLegacyWithField(&result, "version");
                     // For debugging
-                    requestedVersion.addToBSON(result, "origVersion");
+                    requestedVersion.appendLegacyWithField(&result, "origVersion");
                 } else {
-                    requestedVersion.addToBSON(result, "version");
+                    requestedVersion.appendLegacyWithField(&result, "version");
                 }
 
                 return false;

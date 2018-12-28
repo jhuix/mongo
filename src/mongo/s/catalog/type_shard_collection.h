@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2017 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -35,6 +37,7 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -50,8 +53,8 @@ class StatusWith;
  *
  * Expected shard server config.collections collection format:
  *   {
- *      "_id" : "foo.bar",                               // will become UUID when available
- *      "ns" : "foo.bar",
+ *      "_id" : "foo.bar",
+ *      "uuid" : UUID,                                   // optional in 3.6
  *      "epoch" : ObjectId("58b6fd76132358839e409e47"),  // will remove when UUID becomes available
  *      "key" : {
  *          "_id" : 1
@@ -60,31 +63,31 @@ class StatusWith;
  *          "locale" : "fr_CA"
  *      },
  *      "unique" : false,
- *      "refreshing" : true,
- *      "lastRefreshedCollectionVersion" : Timestamp(1, 0)
+ *      "refreshing" : true,                                 // optional
+ *      "lastRefreshedCollectionVersion" : Timestamp(1, 0),  // optional
+ *      "enterCriticalSectionCounter" : 4                    // optional
  *   }
  *
+ * enterCriticalSectionCounter is currently just an OpObserver signal, thus otherwise ignored here.
  */
 class ShardCollectionType {
 public:
-    // Name of the collections collection on the shard server.
-    static const std::string ConfigNS;
-
-    static const BSONField<std::string> uuid;
-    static const BSONField<std::string> ns;
+    static const BSONField<std::string> ns;  // "_id"
+    static const BSONField<UUID> uuid;
     static const BSONField<OID> epoch;
     static const BSONField<BSONObj> keyPattern;
     static const BSONField<BSONObj> defaultCollation;
     static const BSONField<bool> unique;
     static const BSONField<bool> refreshing;
     static const BSONField<Date_t> lastRefreshedCollectionVersion;
+    static const BSONField<int> enterCriticalSectionCounter;
 
-    explicit ShardCollectionType(const NamespaceString& uuid,
-                                 const NamespaceString& nss,
-                                 const OID& epoch,
-                                 const KeyPattern& keyPattern,
-                                 const BSONObj& defaultCollation,
-                                 const bool& unique);
+    ShardCollectionType(NamespaceString nss,
+                        boost::optional<UUID> uuid,
+                        OID epoch,
+                        const KeyPattern& keyPattern,
+                        const BSONObj& defaultCollation,
+                        bool unique);
 
     /**
      * Constructs a new ShardCollectionType object from BSON. Also does validation of the contents.
@@ -101,20 +104,20 @@ public:
      */
     std::string toString() const;
 
-    const NamespaceString& getUUID() const {
-        return _uuid;
-    }
-    void setUUID(const NamespaceString& uuid);
-
     const NamespaceString& getNss() const {
         return _nss;
     }
-    void setNss(const NamespaceString& nss);
+    void setNss(NamespaceString nss);
+
+    const boost::optional<UUID> getUUID() const {
+        return _uuid;
+    }
+    void setUUID(UUID uuid);
 
     const OID& getEpoch() const {
         return _epoch;
     }
-    void setEpoch(const OID& epoch);
+    void setEpoch(OID epoch);
 
     const KeyPattern& getKeyPattern() const {
         return _keyPattern;
@@ -152,11 +155,11 @@ public:
     }
 
 private:
-    // Will become the UUID when available. Currently a duplicate of '_nss'.
-    NamespaceString _uuid;
-
     // The full namespace (with the database prefix).
     NamespaceString _nss;
+
+    // The UUID of the collection, if known.
+    boost::optional<UUID> _uuid;
 
     // Uniquely identifies this instance of the collection, in case of drop/create.
     OID _epoch;

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,14 +37,14 @@
 #include "mongo/db/client.h"
 #include "mongo/db/server_options.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_mongos.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/hostname_canonicalization.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
@@ -50,8 +52,8 @@ namespace {
 
 const Seconds kUptimeReportInterval(10);
 
-std::string constructInstanceIdString() {
-    return str::stream() << getHostNameCached() << ":" << serverGlobalParams.port;
+std::string constructInstanceIdString(const std::string& hostName) {
+    return str::stream() << hostName << ":" << serverGlobalParams.port;
 }
 
 /**
@@ -60,6 +62,7 @@ std::string constructInstanceIdString() {
  */
 void reportStatus(OperationContext* opCtx,
                   const std::string& instanceId,
+                  const std::string& hostName,
                   const Timer& upTimeTimer) {
     MongosType mType;
     mType.setName(instanceId);
@@ -68,6 +71,8 @@ void reportStatus(OperationContext* opCtx,
     // balancer is never active in mongos. Here for backwards compatibility only.
     mType.setWaiting(true);
     mType.setMongoVersion(VersionInfoInterface::instance().version().toString());
+    mType.setAdvisoryHostFQDNs(
+        getHostFQDNs(hostName, HostnameCanonicalizationMode::kForwardAndReverse));
 
     try {
         Grid::get(opCtx)
@@ -96,16 +101,17 @@ ShardingUptimeReporter::~ShardingUptimeReporter() {
 void ShardingUptimeReporter::startPeriodicThread() {
     invariant(!_thread.joinable());
 
-    _thread = stdx::thread([this] {
+    _thread = stdx::thread([] {
         Client::initThread("Uptime reporter");
 
-        const std::string instanceId(constructInstanceIdString());
+        const std::string hostName(getHostNameCached());
+        const std::string instanceId(constructInstanceIdString(hostName));
         const Timer upTimeTimer;
 
         while (!globalInShutdownDeprecated()) {
             {
                 auto opCtx = cc().makeOperationContext();
-                reportStatus(opCtx.get(), instanceId, upTimeTimer);
+                reportStatus(opCtx.get(), instanceId, hostName, upTimeTimer);
 
                 auto status = Grid::get(opCtx.get())
                                   ->getBalancerConfiguration()

@@ -30,11 +30,17 @@
             "error awaiting replication");
     }
 
-    function runCommandWithRetries(conn, dbName, commandObj, func, funcArgs) {
+    function runCommandWithRetries(conn, dbName, commandObj, func, makeFuncArgs) {
         if (typeof commandObj !== "object" || commandObj === null) {
-            return func.apply(conn, funcArgs);
+            return func.apply(conn, makeFuncArgs(commandObj));
         }
 
+        // We create a copy of 'commandObj' to avoid mutating the parameter the caller specified.
+        // Instead, we use the makeFuncArgs() function to build the array of arguments to 'func' by
+        // giving it the 'commandObj' that should be used. This is done to work around the
+        // difference in the order of parameters for the Mongo.prototype.runCommand() and
+        // Mongo.prototype.runCommandWithMetadata() functions.
+        commandObj = Object.assign({}, commandObj);
         const commandName = Object.keys(commandObj)[0];
         let resPrevious;
         let res;
@@ -42,7 +48,7 @@
         assert.soon(
             () => {
                 resPrevious = res;
-                res = func.apply(conn, funcArgs);
+                res = func.apply(conn, makeFuncArgs(commandObj));
 
                 if (commandName === "insert" || commandName === "update") {
                     let opsExecuted;
@@ -102,12 +108,16 @@
                     }
 
                     // We filter out operations that didn't produce a write error to avoid causing a
-                    // duplicate key error when retrying the operations.
+                    // duplicate key error when retrying the operations. We cache the error message
+                    // for the assertion below to avoid the expense of serializing the server's
+                    // response as a JSON string repeatedly. (There may be up to 1000 write errors
+                    // in the server's response.)
+                    const errorMsg =
+                        "A write error was returned for an operation outside the list of" +
+                        " operations executed: " + tojson(res);
+
                     for (let writeError of res.writeErrors) {
-                        assert.lt(writeError.index,
-                                  opsExecuted.length,
-                                  "A write error was returned for an operation outside the list" +
-                                      " of operations executed: " + tojson(res));
+                        assert.lt(writeError.index, opsExecuted.length, errorMsg);
                         opsToRetry.push(opsExecuted[writeError.index]);
                     }
                 } else if (res.ok === 1 || res.code !== ErrorCodes.DatabaseDropPending) {
@@ -132,6 +142,18 @@
                 // yet have generated the oplog entry for the "dropDatabase" operation while it is
                 // dropping each intermediate collection.
                 awaitLatestOperationMajorityConfirmed(conn);
+
+                if (TestData.skipDropDatabaseOnDatabaseDropPending &&
+                    commandName === "dropDatabase") {
+                    // We avoid retrying the "dropDatabase" command when another "dropDatabase"
+                    // command was already in progress for the database. This reduces the likelihood
+                    // that other clients would observe another DatabaseDropPending error response
+                    // when they go to retry, and therefore reduces the risk that repeatedly
+                    // retrying an individual operation would take longer than the 'defaultTimeout'
+                    // period.
+                    res = {ok: 1, dropped: dbName};
+                    return true;
+                }
             },
             "timed out while retrying '" + commandName +
                 "' operation on DatabaseDropPending error response for '" + dbName + "' database",
@@ -141,11 +163,18 @@
     }
 
     Mongo.prototype.runCommand = function(dbName, commandObj, options) {
-        return runCommandWithRetries(this, dbName, commandObj, mongoRunCommandOriginal, arguments);
+        return runCommandWithRetries(this,
+                                     dbName,
+                                     commandObj,
+                                     mongoRunCommandOriginal,
+                                     (commandObj) => [dbName, commandObj, options]);
     };
 
     Mongo.prototype.runCommandWithMetadata = function(dbName, metadata, commandArgs) {
-        return runCommandWithRetries(
-            this, dbName, commandArgs, mongoRunCommandWithMetadataOriginal, arguments);
+        return runCommandWithRetries(this,
+                                     dbName,
+                                     commandArgs,
+                                     mongoRunCommandWithMetadataOriginal,
+                                     (commandArgs) => [dbName, metadata, commandArgs]);
     };
 })();

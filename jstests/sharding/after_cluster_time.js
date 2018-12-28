@@ -1,5 +1,6 @@
 /**
  * Tests readConcern: afterClusterTime behavior in a sharded cluster.
+ * @tags: [requires_majority_read_concern]
  */
 (function() {
     "use strict";
@@ -29,6 +30,7 @@
 
     if (!startSetIfSupportsReadMajority(rst)) {
         jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
+        rst.stopSet();
         return;
     }
     rst.initiate();
@@ -117,5 +119,6 @@
     assertAfterClusterTimeReadFailsWithCode(
         testDB, {level: "majority", afterClusterTime: Timestamp(0, 0)}, ErrorCodes.InvalidOptions);
 
+    rst.stopSet();
     st.stop();
 })();

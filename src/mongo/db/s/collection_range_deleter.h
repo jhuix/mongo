@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,6 +28,8 @@
  *    it in the license file.
  */
 #pragma once
+
+#include <list>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/namespace_string.h"
@@ -38,7 +42,18 @@ namespace mongo {
 
 class BSONObj;
 class Collection;
+class MetadataManager;
 class OperationContext;
+
+// The maximum number of documents to delete in a single batch during range deletion.
+// secondaryThrottle and rangeDeleterBatchDelayMS apply between each batch.
+// Must be positive or 0 (the default), which means to use the value of
+// internalQueryExecYieldIterations (or 1 if that's negative or zero).
+extern AtomicInt32 rangeDeleterBatchSize;
+
+// After completing a batch of document deletions, the time in millis to wait before commencing the
+// next batch of deletions.
+extern AtomicInt32 rangeDeleterBatchDelayMS;
 
 class CollectionRangeDeleter {
     MONGO_DISALLOW_COPYING(CollectionRangeDeleter);
@@ -53,7 +68,8 @@ public:
       * It is an error to destroy a returned CleanupNotification object n unless either n.ready()
       * is true or n.abandon() has been called.  After n.abandon(), n is in a moved-from state.
       */
-    struct DeleteNotification {
+    class DeleteNotification {
+    public:
         DeleteNotification();
         DeleteNotification(Status status);
 
@@ -66,35 +82,36 @@ public:
         DeleteNotification& operator=(DeleteNotification const& notifn) = default;
 
         ~DeleteNotification() {
-            // can be null only if moved from
-            dassert(!notification || *notification || notification.use_count() == 1);
+            // Can be null only if moved from
+            dassert(!_notification || *_notification || _notification.use_count() == 1);
         }
 
         void notify(Status status) const {
-            notification->set(status);
+            _notification->set(status);
         }
 
-        // Sleeps waiting for notification, and returns notify's argument.
-        // On interruption, throws; calling waitStatus afterward returns failed status.
+        /**
+         * Sleeps waiting for notification, and returns notify's argument. On interruption, throws;
+         * calling waitStatus afterward returns failed status.
+         */
         Status waitStatus(OperationContext* opCtx);
 
         bool ready() const {
-            return bool(*notification);
+            return bool(*_notification);
         }
         void abandon() {
-            notification = nullptr;
+            _notification = nullptr;
         }
         bool operator==(DeleteNotification const& other) const {
-            return notification == other.notification;
+            return _notification == other._notification;
         }
         bool operator!=(DeleteNotification const& other) const {
-            return notification != other.notification;
+            return _notification != other._notification;
         }
 
     private:
-        std::shared_ptr<Notification<Status>> notification;
+        std::shared_ptr<Notification<Status>> _notification;
     };
-
 
     struct Deletion {
         Deletion(ChunkRange r, Date_t when) : range(std::move(r)), whenToDelete(when) {}
@@ -104,7 +121,7 @@ public:
         DeleteNotification notification{};
     };
 
-    CollectionRangeDeleter() = default;
+    CollectionRangeDeleter();
     ~CollectionRangeDeleter();
 
     //
@@ -118,7 +135,7 @@ public:
      * Returns the time to begin deletions, if needed, or boost::none if deletions are already
      * scheduled.
      */
-    auto add(std::list<Deletion> ranges) -> boost::optional<Date_t>;
+    boost::optional<Date_t> add(std::list<Deletion> ranges);
 
     /**
      * Reports whether the argument range overlaps any of the ranges to clean.  If there is overlap,
@@ -141,7 +158,7 @@ public:
      * Notifies with the specified status anything waiting on ranges scheduled, and then discards
      * the ranges and notifications.  Is called in the destructor.
      */
-    void clear(Status);
+    void clear(Status status);
 
     /*
      * Append a representation of self to the specified builder.
@@ -156,17 +173,30 @@ public:
      * If it should be scheduled to run again because there might be more documents to delete,
      * returns the time to begin, or boost::none otherwise.
      *
+     * Negative (or zero) value for 'maxToDelete' indicates some canonical default should be used.
+     *
      * Argument 'forTestOnly' is used in unit tests that exercise the CollectionRangeDeleter class,
      * so that they do not need to set up CollectionShardingState and MetadataManager objects.
      */
-    static auto cleanUpNextRange(OperationContext*,
-                                 NamespaceString const& nss,
-                                 OID const& epoch,
-                                 int maxToDelete,
-                                 CollectionRangeDeleter* forTestOnly = nullptr)
-        -> boost::optional<Date_t>;
+    static boost::optional<Date_t> cleanUpNextRange(OperationContext*,
+                                                    NamespaceString const& nss,
+                                                    OID const& epoch,
+                                                    int maxToDelete = 0,
+                                                    CollectionRangeDeleter* forTestOnly = nullptr);
 
 private:
+    /**
+     * Verifies that the metadata for the collection to be cleaned up is still valid. Makes sure
+     * the collection has not been dropped (or dropped then recreated).
+     */
+    static bool _checkCollectionMetadataStillValid(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        OID const& epoch,
+        CollectionRangeDeleter* forTestOnly,
+        Collection* collection,
+        std::shared_ptr<MetadataManager> metadataManager);
+
     /**
      * Performs the deletion of up to maxToDelete entries within the range in progress. Must be
      * called under the collection lock.

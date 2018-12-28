@@ -1,32 +1,36 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
+
+#include <string>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/stdx/functional.h"
@@ -51,8 +55,13 @@ public:
     using Job = stdx::function<void(Client* client)>;
 
     struct PeriodicJob {
-        PeriodicJob(Job callable, Milliseconds period)
-            : job(std::move(callable)), interval(period) {}
+        PeriodicJob(std::string name, Job callable, Milliseconds period)
+            : name(std::move(name)), job(std::move(callable)), interval(period) {}
+
+        /**
+         * name of the job
+         */
+        std::string name;
 
         /**
          * A task to be run at regular intervals by the runner.
@@ -60,12 +69,45 @@ public:
         Job job;
 
         /**
-         * An interval at which the job should be run. Defaults to 1 minute.
+         * An interval at which the job should be run.
          */
         Milliseconds interval;
     };
 
+    class PeriodicJobHandle {
+    public:
+        virtual ~PeriodicJobHandle() = default;
+
+        /**
+         * Starts running the job
+         */
+        virtual void start() = 0;
+        /**
+         * Pauses the job temporarily so that it does not execute until
+         * unpaused
+         */
+        virtual void pause() = 0;
+        /**
+         * Resumes a paused job so that it continues executing each interval
+         */
+        virtual void resume() = 0;
+        /**
+         * Stops the job, this function blocks until the job is stopped
+         * Safe to invalidate the job callable after calling this.
+         */
+        virtual void stop() = 0;
+    };
+
     virtual ~PeriodicRunner();
+
+
+    /**
+     * Creates a new job and adds it to the runner, but does not schedule it.
+     * The caller is responsible for calling 'start' on the resulting handle in
+     * order to begin the job running. This API should be used when the caller
+     * is interested in observing and controlling the job execution state.
+     */
+    virtual std::unique_ptr<PeriodicJobHandle> makeJob(PeriodicJob job) = 0;
 
     /**
      * Schedules a job to be run at periodic intervals.
@@ -79,10 +121,9 @@ public:
      * Starts up this periodic runner.
      *
      * This method may safely be called multiple times, either with or without
-     * calls to shutdown() in between, but implementations may choose whether to
-     * restart or error on subsequent calls to startup().
+     * calls to shutdown() in between.
      */
-    virtual Status startup() = 0;
+    virtual void startup() = 0;
 
     /**
      * Shuts down this periodic runner. Stops all jobs from running.

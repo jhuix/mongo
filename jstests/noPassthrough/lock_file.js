@@ -17,8 +17,8 @@
     var baseName = "jstests_lock_file";
     var dbpath = MongoRunner.dataPath + baseName + '/';
 
-    // Test framework will append --storageEngine command line option if provided to smoke.py.
-    var mongod = MongoRunner.runMongod({dbpath: dbpath, smallfiles: ""});
+    // Test framework will append --storageEngine command line option.
+    var mongod = MongoRunner.runMongod({dbpath: dbpath});
     assert.neq(0,
                getMongodLockFileSize(dbpath),
                'mongod.lock should not be empty while server is running');

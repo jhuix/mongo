@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -32,15 +34,14 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/db/sorter/sorter.h"
 
 namespace mongo {
 
-class DocumentSourceSort final : public DocumentSource, public SplittableDocumentSource {
+class DocumentSourceSort final : public DocumentSource, public NeedsMergerDocumentSource {
 public:
-    static const uint64_t kMaxMemoryUsageBytes = 100 * 1024 * 1024;
     static constexpr StringData kStageName = "$sort"_sd;
-
     enum class SortKeySerialization {
         kForExplain,
         kForPipelineSerialization,
@@ -62,18 +63,17 @@ public:
         return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
     }
 
-    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
-        StageConstraints constraints(
-            _mergingPresorted ? StreamType::kStreaming : StreamType::kBlocking,
-            PositionRequirement::kNone,
-            HostTypeRequirement::kNone,
-            _mergingPresorted ? DiskUseRequirement::kNoDiskUse : DiskUseRequirement::kWritesTmpData,
-            _mergingPresorted ? FacetRequirement::kNotAllowed : FacetRequirement::kAllowed,
-            _mergingPresorted ? ChangeStreamRequirement::kWhitelist
-                              : ChangeStreamRequirement::kBlacklist);
+    StageConstraints constraints(Pipeline::SplitState) const final {
+        StageConstraints constraints(StreamType::kBlocking,
+                                     PositionRequirement::kNone,
+                                     HostTypeRequirement::kNone,
+                                     DiskUseRequirement::kWritesTmpData,
+                                     FacetRequirement::kAllowed,
+                                     TransactionRequirement::kAllowed,
+                                     ChangeStreamRequirement::kBlacklist);
 
         // Can't swap with a $match if a limit has been absorbed, as $match can't swap with $limit.
-        constraints.canSwapWithMatch = !limitSrc;
+        constraints.canSwapWithMatch = !_limitSrc;
         return constraints;
     }
 
@@ -81,10 +81,12 @@ public:
         return allPrefixes(_rawSort);
     }
 
-    GetDepsReturn getDependencies(DepsTracker* deps) const final;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
     boost::intrusive_ptr<DocumentSource> getShardSource() final;
-    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final;
+    MergingLogic mergingLogic() final;
+    bool canRunInParallelBeforeOut(
+        const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const final;
 
     /**
      * Write out a Document whose contents are the sort key pattern.
@@ -98,21 +100,14 @@ public:
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
     /**
-     * Convenience method for creating a $sort stage.
+     * Convenience method for creating a $sort stage. If maxMemoryUsageBytes is boost::none,
+     * then it will actually use the value of internalDocumentSourceSortMaxBlockingSortBytes.
      */
     static boost::intrusive_ptr<DocumentSourceSort> create(
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
         BSONObj sortOrder,
         long long limit = -1,
-        uint64_t maxMemoryUsageBytes = kMaxMemoryUsageBytes,
-        bool mergingPresorted = false);
-
-    /**
-     * Returns true if this $sort stage is merging presorted streams.
-     */
-    bool mergingPresorted() const {
-        return _mergingPresorted;
-    }
+        boost::optional<uint64_t> maxMemoryUsageBytes = boost::none);
 
     /**
      * Returns -1 for no limit.
@@ -133,6 +128,11 @@ public:
     void loadingDone();
 
     /**
+     * Returns true if the sorter used disk while satisfying the query and false otherwise.
+     */
+    bool usedDisk() final;
+
+    /**
      * Instructs the sort stage to use the given set of cursors as inputs, to merge documents that
      * have already been sorted.
      */
@@ -143,7 +143,7 @@ public:
     };
 
     boost::intrusive_ptr<DocumentSourceLimit> getLimitSrc() const {
-        return limitSrc;
+        return _limitSrc;
     }
 
 protected:
@@ -155,9 +155,6 @@ protected:
     void doDispose() final;
 
 private:
-    // This is used to merge pre-sorted results from a DocumentSourceMergeCursors.
-    class IteratorFromCursor;
-
     using MySorter = Sorter<Value, Document>;
 
     // For MySorter.
@@ -230,6 +227,13 @@ private:
      */
     BSONObj extractKeyWithArray(const Document& doc) const;
 
+    /**
+     * Returns the comparison key used to sort 'val' with the collation of the ExpressionContext.
+     * Note that these comparison keys should always be sorted with the simple (i.e. binary)
+     * collation.
+     */
+    Value getCollationComparisonKey(const Value& val) const;
+
     int compare(const Value& lhs, const Value& rhs) const;
 
     /**
@@ -237,8 +241,8 @@ private:
      * the smallest limit.
      */
     void setLimitSrc(boost::intrusive_ptr<DocumentSourceLimit> limit) {
-        if (!limitSrc || limit->getLimit() < limitSrc->getLimit()) {
-            limitSrc = limit;
+        if (!_limitSrc || limit->getLimit() < _limitSrc->getLimit()) {
+            _limitSrc = limit;
         }
     }
 
@@ -253,13 +257,13 @@ private:
     // The set of paths on which we're sorting.
     std::set<std::string> _paths;
 
-    boost::intrusive_ptr<DocumentSourceLimit> limitSrc;
+    boost::intrusive_ptr<DocumentSourceLimit> _limitSrc;
 
     uint64_t _maxMemoryUsageBytes;
     bool _done;
-    bool _mergingPresorted;
     std::unique_ptr<MySorter> _sorter;
     std::unique_ptr<MySorter::Iterator> _output;
+    bool _usedDisk = false;
 };
 
 }  // namespace mongo

@@ -19,17 +19,15 @@
     function validateWaitingMessage(launcher) {
         clearRawMongoProgramOutput();
         var conn = launcher.start({});
-        testStartupLogging(launcher, makeRegExMatchFn(/waiting for connections on port/));
         launcher.stop(conn, undefined, {});
+        testStartupLogging(launcher, makeRegExMatchFn(/waiting for connections on port/));
     }
 
     print("********************\nTesting startup logging in mongod\n********************");
 
     validateWaitingMessage({
         start: function(opts) {
-            var actualOpts = {nojournal: ""};
-            Object.extend(actualOpts, opts);
-            return MongoRunner.runMongod(actualOpts);
+            return MongoRunner.runMongod(opts);
         },
         stop: MongoRunner.stopMongod
     });

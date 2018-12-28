@@ -5,7 +5,7 @@
 (function() {
     'use strict';
 
-    var st = new ShardingTest({shards: 1, mongos: 2, config: 1, other: {smallfiles: true}});
+    var st = new ShardingTest({shards: 1, mongos: 2, config: 1});
 
     var standalone = MongoRunner.runMongod();
 
@@ -88,14 +88,13 @@
 
     // Take a copy of the config db, in order to test the harder-to-setup cases below.
     // Copy into a standalone to also test running printShardingStatus() against a config dump.
-    // TODO: Replace this manual copy with copydb once SERVER-13080 is fixed.
     var config = mongos.getDB("config");
     var configCopy = standalone.getDB("configCopy");
     config.getCollectionInfos().forEach(function(c) {
         // Create collection with options.
         assert.commandWorked(configCopy.createCollection(c.name, c.options));
         // Clone the docs.
-        config.getCollection(c.name).find().snapshot().forEach(function(d) {
+        config.getCollection(c.name).find().hint({_id: 1}).forEach(function(d) {
             assert.writeOK(configCopy.getCollection(c.name).insert(d));
         });
         // Build the indexes.

@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2013 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
@@ -46,6 +48,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_ranker.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 
 namespace {
@@ -114,9 +117,10 @@ bool PlanCacheCommand::run(OperationContext* opCtx,
                            const string& dbname,
                            const BSONObj& cmdObj,
                            BSONObjBuilder& result) {
-    const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+    const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
     Status status = runPlanCacheCommand(opCtx, nss.ns(), cmdObj, &result);
-    return appendCommandStatus(result, status);
+    uassertStatusOK(status);
+    return true;
 }
 
 
@@ -124,21 +128,17 @@ bool PlanCacheCommand::supportsWriteConcern(const BSONObj& cmd) const {
     return false;
 }
 
-bool PlanCacheCommand::slaveOk() const {
-    return false;
+Command::AllowedOnSecondary PlanCacheCommand::secondaryAllowed(ServiceContext*) const {
+    return AllowedOnSecondary::kOptIn;
 }
 
-bool PlanCacheCommand::slaveOverrideOk() const {
-    return true;
-}
-
-void PlanCacheCommand::help(stringstream& ss) const {
-    ss << helpText;
+std::string PlanCacheCommand::help() const {
+    return helpText;
 }
 
 Status PlanCacheCommand::checkAuthForCommand(Client* client,
                                              const std::string& dbname,
-                                             const BSONObj& cmdObj) {
+                                             const BSONObj& cmdObj) const {
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
     ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 
@@ -249,11 +249,10 @@ Status PlanCacheListQueryShapes::list(const PlanCache& planCache, BSONObjBuilder
     invariant(bob);
 
     // Fetch all cached solutions from plan cache.
-    vector<PlanCacheEntry*> solutions = planCache.getAllEntries();
+    auto entries = planCache.getAllEntries();
 
     BSONArrayBuilder arrayBuilder(bob->subarrayStart("shapes"));
-    for (vector<PlanCacheEntry*>::const_iterator i = solutions.begin(); i != solutions.end(); i++) {
-        PlanCacheEntry* entry = *i;
+    for (auto&& entry : entries) {
         invariant(entry);
 
         BSONObjBuilder shapeBuilder(arrayBuilder.subobjStart());
@@ -263,10 +262,8 @@ Status PlanCacheListQueryShapes::list(const PlanCache& planCache, BSONObjBuilder
         if (!entry->collation.isEmpty()) {
             shapeBuilder.append("collation", entry->collation);
         }
+        shapeBuilder.append("queryHash", unsignedIntToFixedLengthHex(entry->queryHash));
         shapeBuilder.doneFast();
-
-        // Release resources for cached solution after extracting query shape.
-        delete entry;
     }
     arrayBuilder.doneFast();
 
@@ -313,18 +310,14 @@ Status PlanCacheClear::clear(OperationContext* opCtx,
 
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-        if (!planCache->contains(*cq)) {
-            // Log if asked to clear non-existent query shape.
+        Status result = planCache->remove(*cq);
+        if (!result.isOK()) {
+            invariant(result.code() == ErrorCodes::NoSuchKey);
             LOG(1) << ns << ": query shape doesn't exist in PlanCache - "
                    << redact(cq->getQueryObj()) << "(sort: " << cq->getQueryRequest().getSort()
                    << "; projection: " << cq->getQueryRequest().getProj()
                    << "; collation: " << cq->getQueryRequest().getCollation() << ")";
             return Status::OK();
-        }
-
-        Status result = planCache->remove(*cq);
-        if (!result.isOK()) {
-            return result;
         }
 
         LOG(1) << ns << ": removed plan cache entry - " << redact(cq->getQueryObj())
@@ -362,54 +355,37 @@ Status PlanCacheListPlans::runPlanCacheCommand(OperationContext* opCtx,
     AutoGetCollectionForReadCommand ctx(opCtx, NamespaceString(ns));
 
     PlanCache* planCache;
-    Status status = getPlanCache(opCtx, ctx.getCollection(), ns, &planCache);
-    if (!status.isOK()) {
-        // No collection - return empty plans array.
-        BSONArrayBuilder plansBuilder(bob->subarrayStart("plans"));
-        plansBuilder.doneFast();
-        return Status::OK();
-    }
+    uassertStatusOK(getPlanCache(opCtx, ctx.getCollection(), ns, &planCache));
     return list(opCtx, *planCache, ns, cmdObj, bob);
 }
 
-// static
-Status PlanCacheListPlans::list(OperationContext* opCtx,
-                                const PlanCache& planCache,
-                                const std::string& ns,
-                                const BSONObj& cmdObj,
-                                BSONObjBuilder* bob) {
-    auto statusWithCQ = canonicalize(opCtx, ns, cmdObj);
-    if (!statusWithCQ.isOK()) {
-        return statusWithCQ.getStatus();
-    }
-    unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-
-    if (!planCache.contains(*cq)) {
+namespace {
+Status listPlansOriginalFormat(std::unique_ptr<CanonicalQuery> cq,
+                               const PlanCache& planCache,
+                               BSONObjBuilder* bob) {
+    auto lookupResult = planCache.getEntry(*cq);
+    if (lookupResult == ErrorCodes::NoSuchKey) {
         // Return empty plans in results if query shape does not
         // exist in plan cache.
         BSONArrayBuilder plansBuilder(bob->subarrayStart("plans"));
         plansBuilder.doneFast();
         return Status::OK();
+    } else if (!lookupResult.isOK()) {
+        return lookupResult.getStatus();
     }
 
-    PlanCacheEntry* entryRaw;
-    Status result = planCache.getEntry(*cq, &entryRaw);
-    if (!result.isOK()) {
-        return result;
-    }
-    unique_ptr<PlanCacheEntry> entry(entryRaw);
+    auto entry = std::move(lookupResult.getValue());
 
     BSONArrayBuilder plansBuilder(bob->subarrayStart("plans"));
+
     size_t numPlans = entry->plannerData.size();
     invariant(numPlans == entry->decision->stats.size());
     invariant(numPlans == entry->decision->scores.size());
     for (size_t i = 0; i < numPlans; ++i) {
         BSONObjBuilder planBob(plansBuilder.subobjStart());
 
-        // Create plan details field.
-        // Currently, simple string representationg of
-        // SolutionCacheData. Need to revisit format when we
-        // need to parse user-provided plan details for planCacheAddPlan.
+        // Create the plan details field. Currently, this is a simple string representation of
+        // SolutionCacheData.
         SolutionCacheData* scd = entry->plannerData[i];
         BSONObjBuilder detailsBob(planBob.subobjStart("details"));
         detailsBob.append("solution", scd->toString());
@@ -434,7 +410,7 @@ Status PlanCacheListPlans::list(OperationContext* opCtx,
             BSONArrayBuilder scoresBob(feedbackBob.subarrayStart("scores"));
             for (size_t i = 0; i < entry->feedback.size(); ++i) {
                 BSONObjBuilder scoreBob(scoresBob.subobjStart());
-                scoreBob.append("score", entry->feedback[i]->score);
+                scoreBob.append("score", entry->feedback[i]);
             }
             scoresBob.doneFast();
         }
@@ -442,8 +418,39 @@ Status PlanCacheListPlans::list(OperationContext* opCtx,
 
         planBob.append("filterSet", scd->indexFilterApplied);
     }
+
     plansBuilder.doneFast();
 
+    // Append the time the entry was inserted into the plan cache.
+    bob->append("timeOfCreation", entry->timeOfCreation);
+    bob->append("queryHash", unsignedIntToFixedLengthHex(entry->queryHash));
+    bob->append("planCacheKey", unsignedIntToFixedLengthHex(entry->planCacheKey));
+    // Append whether or not the entry is active.
+    bob->append("isActive", entry->isActive);
+    bob->append("works", static_cast<long long>(entry->works));
+    return Status::OK();
+}
+}  // namespace
+
+// static
+Status PlanCacheListPlans::list(OperationContext* opCtx,
+                                const PlanCache& planCache,
+                                const std::string& ns,
+                                const BSONObj& cmdObj,
+                                BSONObjBuilder* bob) {
+    auto statusWithCQ = canonicalize(opCtx, ns, cmdObj);
+    if (!statusWithCQ.isOK()) {
+        return statusWithCQ.getStatus();
+    }
+
+    if (!internalQueryCacheListPlansNewOutput.load())
+        return listPlansOriginalFormat(std::move(statusWithCQ.getValue()), planCache, bob);
+
+    unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+    auto entry = uassertStatusOK(planCache.getEntry(*cq));
+
+    // internalQueryCacheDisableInactiveEntries is True and we should use the new output format.
+    Explain::planCacheEntryToBSON(*entry, bob);
     return Status::OK();
 }
 

@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -97,7 +97,6 @@ main(int argc, char *argv[])
 			return (usage());
 		}
 	argc -= __wt_optind;
-	argv += __wt_optind;
 	if (argc != 0)
 		return (usage());
 
@@ -567,8 +566,8 @@ void
 copy(u_int gen, u_int recno)
 {
 	FILE *ifp, *ofp;
-	WT_PAGE_HEADER *dsk;
 	WT_BLOCK_HEADER *blk;
+	WT_PAGE_HEADER *dsk;
 	char buf[PSIZE];
 
 	CHECK((ifp = fopen(LOAD, "r")) != NULL);
@@ -616,9 +615,9 @@ process(void)
 	FILE *fp;
 	WT_CONNECTION *conn;
 	WT_CURSOR *cursor;
-	const char *key, *value;
 	WT_SESSION *session;
 	char config[100];
+	const char *key, *value;
 
 	/* Salvage. */
 	config[0] = '\0';
@@ -670,7 +669,7 @@ empty(int cnt)
 
 	if (page_type == WT_PAGE_COL_FIX)
 		for (i = 0; i < cnt; ++i)
-			fputs("\\00\n", res_fp);
+			CHECK(fputs("\\00\n", res_fp));
 }
 
 /*

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -337,16 +337,17 @@ __curdump_close(WT_CURSOR *cursor)
 
 	cdump = (WT_CURSOR_DUMP *)cursor;
 	child = cdump->child;
+	CURSOR_API_CALL_PREPARE_ALLOWED(cursor, session, close, NULL);
+err:
 
-	CURSOR_API_CALL(cursor, session, close, NULL);
 	if (child != NULL)
 		WT_TRET(child->close(child));
 	/* We shared the child's URI. */
 	cursor->internal_uri = NULL;
 	__wt_json_close(session, cursor);
-	WT_TRET(__wt_cursor_close(cursor));
+	__wt_cursor_close(cursor);
 
-err:	API_END_RET(session, ret);
+	API_END_RET(session, ret);
 }
 
 /*
@@ -374,6 +375,8 @@ __wt_curdump_create(WT_CURSOR *child, WT_CURSOR *owner, WT_CURSOR **cursorp)
 	    __curdump_remove,			/* remove */
 	    __wt_cursor_notsup,			/* reserve */
 	    __wt_cursor_reconfigure_notsup,	/* reconfigure */
+	    __wt_cursor_notsup,			/* cache */
+	    __wt_cursor_reopen_notsup,		/* reopen */
 	    __curdump_close);			/* close */
 	WT_CURSOR *cursor;
 	WT_CURSOR_DUMP *cdump;
@@ -387,7 +390,7 @@ __wt_curdump_create(WT_CURSOR *child, WT_CURSOR *owner, WT_CURSOR **cursorp)
 	session = (WT_SESSION_IMPL *)child->session;
 
 	WT_RET(__wt_calloc_one(session, &cdump));
-	cursor = &cdump->iface;
+	cursor = (WT_CURSOR *)cdump;
 	*cursor = iface;
 	cursor->session = child->session;
 	cursor->internal_uri = child->internal_uri;

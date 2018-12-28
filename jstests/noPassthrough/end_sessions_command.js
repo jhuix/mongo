@@ -1,12 +1,16 @@
 (function() {
     "use script";
 
+    // This test makes assertions about the number of sessions, which are not compatible with
+    // implicit sessions.
+    TestData.disableImplicitSessions = true;
+
     var res;
     var refresh = {refreshLogicalSessionCacheNow: 1};
     var startSession = {startSession: 1};
 
     // Start up a standalone server.
-    var conn = MongoRunner.runMongod({nojournal: ""});
+    var conn = MongoRunner.runMongod();
     var admin = conn.getDB("admin");
     var config = conn.getDB("config");
 
@@ -68,4 +72,22 @@
     res = admin.runCommand(refresh);
     assert.commandWorked(res, "failed to refresh");
 
+    // verify that end on the session handle actually ends sessions
+    {
+        var session = conn.startSession();
+
+        assert.commandWorked(session.getDatabase("admin").runCommand({usersInfo: 1}),
+                             "do something to tickle the session");
+        assert.commandWorked(session.getDatabase("admin").runCommand(refresh), "failed to refresh");
+        assert.eq(
+            config.system.sessions.count(), 1, "usersInfo should have written 1 session record");
+
+        session.endSession();
+        assert.commandWorked(admin.runCommand(refresh), "failed to refresh");
+        assert.eq(config.system.sessions.count(),
+                  0,
+                  "endSessions and refresh should result in 0 remaining sessions");
+    }
+
+    MongoRunner.stopMongod(conn);
 }());

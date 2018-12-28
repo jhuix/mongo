@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,15 +41,18 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/executor/task_executor_pool.h"
-#include "mongo/s/async_requests_sender.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/multi_statement_transaction_requests_sender.h"
+#include "mongo/s/transaction_router.h"
 #include "mongo/s/write_ops/batch_write_op.h"
 #include "mongo/s/write_ops/write_error_detail.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
+
+const ReadPreferenceSetting kPrimaryOnlyReadPreference(ReadPreference::PrimaryOnly);
 
 //
 // Map which allows associating ConnectionString hosts with TargetedWriteBatches
@@ -59,17 +64,19 @@ typedef OwnedPointerMap<ShardId, TargetedWriteBatch> OwnedShardBatchMap;
 
 WriteErrorDetail errorFromStatus(const Status& status) {
     WriteErrorDetail error;
-    error.setErrCode(status.code());
-    error.setErrMessage(status.reason());
-
+    error.setStatus(status);
     return error;
 }
 
 // Helper to note several stale errors from a response
-void noteStaleResponses(const std::vector<ShardError*>& staleErrors, NSTargeter* targeter) {
-    for (const auto error : staleErrors) {
+void noteStaleResponses(const std::vector<ShardError>& staleErrors, NSTargeter* targeter) {
+    for (const auto& error : staleErrors) {
+        LOG(4) << "Noting stale config response " << error.error.getErrInfo() << " from shard "
+               << error.endpoint.shardName;
         targeter->noteStaleResponse(
-            error->endpoint, error->error.isErrInfoSet() ? error->error.getErrInfo() : BSONObj());
+            error.endpoint,
+            StaleConfigInfo::parseFromCommandError(
+                error.error.isErrInfoSet() ? error.error.getErrInfo() : BSONObj()));
     }
 }
 
@@ -141,8 +148,9 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
         // Send all child batches
         //
 
+        const size_t numToSend = childBatches.size();
         size_t numSent = 0;
-        size_t numToSend = childBatches.size();
+
         while (numSent != numToSend) {
             // Collect batches out on the network, mapped by endpoint
             OwnedShardBatchMap ownedPendingBatches;
@@ -163,12 +171,12 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                     continue;
 
                 // If we already have a batch for this shard, wait until the next time
-                ShardId targetShardId = nextBatch->getEndpoint().shardName;
+                const auto& targetShardId = nextBatch->getEndpoint().shardName;
 
-                OwnedShardBatchMap::MapType::iterator pendingIt =
-                    pendingBatches.find(targetShardId);
-                if (pendingIt != pendingBatches.end())
+                if (pendingBatches.count(targetShardId))
                     continue;
+
+                stats->noteTargetedShard(targetShardId);
 
                 const auto request = [&] {
                     const auto shardBatchRequest(batchOp.buildBatchRequest(*nextBatch));
@@ -200,20 +208,18 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                 childBatch.second = nullptr;
 
                 // Recv-side is responsible for cleaning up the nextBatch when used
-                pendingBatches.insert(std::make_pair(targetShardId, nextBatch));
+                pendingBatches.emplace(targetShardId, nextBatch);
             }
 
-            //
-            // Send the requests.
-            //
+            bool isRetryableWrite = opCtx->getTxnNumber() && !TransactionRouter::get(opCtx);
 
-            const ReadPreferenceSetting readPref(ReadPreference::PrimaryOnly, TagSet());
-            AsyncRequestsSender ars(opCtx,
-                                    Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
-                                    clientRequest.getTargetingNS().db().toString(),
-                                    requests,
-                                    readPref,
-                                    Shard::RetryPolicy::kNoRetry);
+            MultiStatementTransactionRequestsSender ars(
+                opCtx,
+                Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
+                clientRequest.getNS().db().toString(),
+                requests,
+                kPrimaryOnlyReadPreference,
+                isRetryableWrite ? Shard::RetryPolicy::kIdempotent : Shard::RetryPolicy::kNoRetry);
             numSent += pendingBatches.size();
 
             //
@@ -266,9 +272,22 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                 if (responseStatus.isOK()) {
                     TrackedErrors trackedErrors;
                     trackedErrors.startTracking(ErrorCodes::StaleShardVersion);
+                    trackedErrors.startTracking(ErrorCodes::CannotImplicitlyCreateCollection);
 
                     LOG(4) << "Write results received from " << shardHost.toString() << ": "
                            << redact(batchedCommandResponse.toString());
+
+                    // If we are in a transaction, we must fail the whole batch on any error.
+                    if (TransactionRouter::get(opCtx)) {
+                        // Note: this returns a bad status if any part of the batch failed.
+                        auto batchStatus = batchedCommandResponse.toStatus();
+                        if (!batchStatus.isOK()) {
+                            batchOp.forgetTargetedBatchesOnTransactionAbortingError();
+                            uassertStatusOK(batchStatus.withContext(
+                                str::stream() << "Encountered error from " << shardHost.toString()
+                                              << " during a transaction"));
+                        }
+                    }
 
                     // Dispatch was ok, note response
                     batchOp.noteBatchResponse(*batch, batchedCommandResponse, &trackedErrors);
@@ -276,9 +295,17 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                     // Note if anything was stale
                     const auto& staleErrors =
                         trackedErrors.getErrors(ErrorCodes::StaleShardVersion);
-                    if (staleErrors.size() > 0) {
+                    if (!staleErrors.empty()) {
                         noteStaleResponses(staleErrors, &targeter);
                         ++stats->numStaleBatches;
+                    }
+
+                    const auto& cannotImplicitlyCreateErrors =
+                        trackedErrors.getErrors(ErrorCodes::CannotImplicitlyCreateCollection);
+                    if (!cannotImplicitlyCreateErrors.empty()) {
+                        // This forces the chunk manager to reload so we can attach the correct
+                        // version on retry and make sure we route to the correct shard.
+                        targeter.noteCouldNotTarget();
                     }
 
                     // Remember that we successfully wrote to this shard
@@ -293,16 +320,21 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                                            : OID());
                 } else {
                     // Error occurred dispatching, note it
-                    const Status status(responseStatus.code(),
-                                        str::stream() << "Write results unavailable from "
-                                                      << shardHost
-                                                      << " due to "
-                                                      << responseStatus.reason());
+                    const Status status = responseStatus.withContext(
+                        str::stream() << "Write results unavailable from " << shardHost);
 
                     batchOp.noteBatchError(*batch, errorFromStatus(status));
 
                     LOG(4) << "Unable to receive write results from " << shardHost
                            << causedBy(redact(status));
+
+                    // If we are in a transaction, we must fail the whole batch on any error.
+                    if (TransactionRouter::get(opCtx)) {
+                        batchOp.forgetTargetedBatchesOnTransactionAbortingError();
+                        uassertStatusOK(status.withContext(
+                            str::stream() << "Encountered error from " << shardHost.toString()
+                                          << " during a transaction"));
+                    }
                 }
             }
         }
@@ -322,6 +354,8 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
 
         bool targeterChanged = false;
         Status refreshStatus = targeter.refreshIfNeeded(opCtx, &targeterChanged);
+
+        LOG(4) << "executeBatch targeter changed: " << targeterChanged;
 
         if (!refreshStatus.isOK()) {
             // It's okay if we can't refresh, we'll just record errors for the ops if
@@ -368,10 +402,18 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
            << " for " << clientRequest.getNS();
 }
 
+void BatchWriteExecStats::noteTargetedShard(const ShardId& shardId) {
+    _targetedShards.insert(shardId);
+}
+
 void BatchWriteExecStats::noteWriteAt(const HostAndPort& host,
                                       repl::OpTime opTime,
                                       const OID& electionId) {
     _writeOpTimes[ConnectionString(host)] = HostOpTime(opTime, electionId);
+}
+
+const std::set<ShardId>& BatchWriteExecStats::getTargetedShards() const {
+    return _targetedShards;
 }
 
 const HostOpTimeMap& BatchWriteExecStats::getWriteOpTimes() const {

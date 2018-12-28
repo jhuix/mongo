@@ -1,6 +1,7 @@
 /**
  * Tests aggregation on views for proper pipeline concatenation and semantics.
- * @tags: [requires_find_command]
+ * @tags: [requires_find_command, does_not_support_stepdowns, requires_getmore,
+ * requires_non_retryable_commands]
  */
 (function() {
     "use strict";
@@ -72,8 +73,32 @@
     assertAggResultEq("popSortedView", [], allDocuments.sort(byPopulation), doOrderedSort);
     assertAggResultEq("popSortedView", [{$limit: 1}, {$project: {_id: 1}}], [{_id: "Palo Alto"}]);
 
-    // Test that the $out stage errors when given a view namespace.
-    assertErrorCode(coll, [{$out: "emptyPipelineView"}], 18631);
+    // Test that the $out stage errors when writing to a view namespace.
+    assertErrorCode(coll, [{$out: "emptyPipelineView"}], ErrorCodes.CommandNotSupportedOnView);
+    assertErrorCode(coll,
+                    [{$out: {to: "emptyPipelineView", mode: "replaceCollection"}}],
+                    ErrorCodes.CommandNotSupportedOnView);
+    assertErrorCode(coll,
+                    [{$out: {to: "emptyPipelineView", mode: "insertDocuments"}}],
+                    ErrorCodes.CommandNotSupportedOnView);
+    assertErrorCode(coll,
+                    [{$out: {to: "emptyPipelineView", mode: "replaceDocuments"}}],
+                    ErrorCodes.CommandNotSupportedOnView);
+
+    // Test that the $out stage errors when writing to a view namespace in a foreign database.
+    let foreignDB = db.getSiblingDB("views_aggregation_foreign");
+    foreignDB.view.drop();
+    assert.commandWorked(foreignDB.createView("view", "coll", []));
+    assertErrorCode(coll,
+                    [{$out: {db: foreignDB.getName(), to: "view", mode: "insertDocuments"}}],
+                    ErrorCodes.CommandNotSupportedOnView);
+    assertErrorCode(coll,
+                    [{$out: {db: foreignDB.getName(), to: "view", mode: "replaceDocuments"}}],
+                    ErrorCodes.CommandNotSupportedOnView);
+    // TODO (SERVER-36832): When $out to foreign database is allowed with "replaceCollection", this
+    // should fail with ErrorCodes.CommandNotSupportedOnView.
+    assertErrorCode(
+        coll, [{$out: {db: foreignDB.getName(), to: "view", mode: "replaceCollection"}}], 50939);
 
     // Test that an aggregate on a view propagates the 'bypassDocumentValidation' option.
     const validatedCollName = "collectionWithValidator";
@@ -151,7 +176,7 @@
         viewsDB.coll.explain("allPlansExecution").aggregate([{$limit: 1}, {$match: {pop: 3}}]));
     assert.eq(explainPlan.stages[0].$cursor.queryPlanner.namespace, "views_aggregation.coll");
     assert(explainPlan.stages[0].$cursor.hasOwnProperty("executionStats"));
-    assert.eq(explainPlan.stages[0].$cursor.executionStats.nReturned, 5);
+    assert.eq(explainPlan.stages[0].$cursor.executionStats.nReturned, 1);
     assert(explainPlan.stages[0].$cursor.executionStats.hasOwnProperty("allPlansExecution"));
 
     // The explain:true option should not work when paired with the explain shell helper.

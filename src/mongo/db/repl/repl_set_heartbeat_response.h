@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -57,35 +59,20 @@ public:
     /**
      * Appends all non-default values to "builder".
      */
-    void addToBSON(BSONObjBuilder* builder, bool isProtocolVersionV1) const;
+    void addToBSON(BSONObjBuilder* builder) const;
 
     /**
      * Returns a BSONObj consisting of all non-default values to "builder".
      */
-    BSONObj toBSON(bool isProtocolVersionV1) const;
+    BSONObj toBSON() const;
 
     /**
      * Returns toBSON().toString()
      */
     const std::string toString() const {
-        return toBSON(true).toString();
+        return toBSON().toString();
     }
 
-    bool hasDataSet() const {
-        return _hasDataSet;
-    }
-    bool hasData() const {
-        return _hasData;
-    }
-    bool isMismatched() const {
-        return _mismatch;
-    }
-    bool isReplSet() const {
-        return _isReplSet;
-    }
-    bool isStateDisagreement() const {
-        return _stateDisagreement;
-    }
     const std::string& getReplicaSetName() const {
         return _setName;
     }
@@ -97,17 +84,6 @@ public:
         return _electionTimeSet;
     }
     Timestamp getElectionTime() const;
-    bool hasIsElectable() const {
-        return _electableSet;
-    }
-    bool isElectable() const;
-    const std::string& getHbMsg() const {
-        return _hbmsg;
-    }
-    bool hasTime() const {
-        return _timeSet;
-    }
-    Seconds getTime() const;
     const HostAndPort& getSyncingTo() const {
         return _syncingTo;
     }
@@ -135,34 +111,6 @@ public:
     OpTime getDurableOpTime() const;
 
     /**
-     * Sets _mismatch to true.
-     */
-    void noteMismatched() {
-        _mismatch = true;
-    }
-
-    /**
-     * Sets _isReplSet to true.
-     */
-    void noteReplSet() {
-        _isReplSet = true;
-    }
-
-    /**
-     * Sets _stateDisagreement to true.
-     */
-    void noteStateDisagreement() {
-        _stateDisagreement = true;
-    }
-
-    /**
-     * Sets _hasData to true, and _hasDataSet to true to indicate _hasData has been modified
-     */
-    void noteHasData() {
-        _hasDataSet = _hasData = true;
-    }
-
-    /**
      * Sets _setName to "name".
      */
     void setSetName(std::string name) {
@@ -183,31 +131,6 @@ public:
     void setElectionTime(Timestamp time) {
         _electionTimeSet = true;
         _electionTime = time;
-    }
-
-    /**
-     * Sets _electable to "electable" and sets _electableSet to true to indicate
-     * that the value of _electable has been modified.
-     */
-    void setElectable(bool electable) {
-        _electableSet = true;
-        _electable = electable;
-    }
-
-    /**
-     * Sets _hbmsg to "hbmsg".
-     */
-    void setHbMsg(std::string hbmsg) {
-        _hbmsg = hbmsg;
-    }
-
-    /**
-     * Sets the optional "time" field of the response to "theTime", which is
-     * a count of seconds since the UNIX epoch.
-     */
-    void setTime(Seconds theTime) {
-        _timeSet = true;
-        _time = theTime;
     }
 
     /**
@@ -252,31 +175,17 @@ private:
     bool _electionTimeSet = false;
     Timestamp _electionTime;
 
-    bool _timeSet = false;
-    Seconds _time = Seconds(0);  // Seconds since UNIX epoch.
-
     bool _appliedOpTimeSet = false;
     OpTime _appliedOpTime;
 
     bool _durableOpTimeSet = false;
     OpTime _durableOpTime;
 
-    bool _electableSet = false;
-    bool _electable = false;
-
-    bool _hasDataSet = false;
-    bool _hasData = false;
-
-    bool _mismatch = false;
-    bool _isReplSet = false;
-    bool _stateDisagreement = false;
-
     bool _stateSet = false;
     MemberState _state;
 
     int _configVersion = -1;
     std::string _setName;
-    std::string _hbmsg;
     HostAndPort _syncingTo;
 
     bool _configSet = false;

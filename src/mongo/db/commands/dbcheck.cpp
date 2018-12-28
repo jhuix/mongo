@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
@@ -34,7 +36,9 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
@@ -155,7 +159,7 @@ std::unique_ptr<DbCheckRun> getRun(OperationContext* opCtx,
 
     // Get rid of generic command fields.
     for (const auto& elem : obj) {
-        if (!Command::isGenericArgument(elem.fieldNameStringData())) {
+        if (!isGenericArgument(elem.fieldNameStringData())) {
             builder.append(elem);
         }
     }
@@ -189,7 +193,7 @@ protected:
 
     virtual void run() override {
         // Every dbCheck runs in its own client.
-        Client::initThread(name());
+        ThreadClient tc(name(), getGlobalServiceContext());
 
         for (const auto& coll : *_run) {
             try {
@@ -461,9 +465,23 @@ private:
                         const BSONObj& obj) {
         return writeConflictRetry(
             opCtx, "dbCheck oplog entry", NamespaceString::kRsOplogNamespace.ns(), [&] {
+                auto const clockSource = opCtx->getServiceContext()->getFastClockSource();
+                const auto wallClockTime = clockSource->now();
+
                 WriteUnitOfWork uow(opCtx);
-                repl::OpTime result = repl::logOp(
-                    opCtx, "c", nss, uuid, obj, nullptr, false, {}, kUninitializedStmtId, {});
+                repl::OpTime result = repl::logOp(opCtx,
+                                                  "c",
+                                                  nss,
+                                                  uuid,
+                                                  obj,
+                                                  nullptr,
+                                                  false,
+                                                  wallClockTime,
+                                                  {},
+                                                  kUninitializedStmtId,
+                                                  {},
+                                                  false /* prepare */,
+                                                  OplogSlot());
                 uow.commit();
                 return result;
             });
@@ -477,8 +495,8 @@ class DbCheckCmd : public BasicCommand {
 public:
     DbCheckCmd() : BasicCommand("dbCheck") {}
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     virtual bool adminOnly() const {
@@ -489,21 +507,21 @@ public:
         return false;
     }
 
-    virtual void help(std::stringstream& help) const {
-        help << "Validate replica set consistency.\n"
-             << "Invoke with { dbCheck: <collection name/uuid>,\n"
-             << "              minKey: <first key, exclusive>,\n"
-             << "              maxKey: <last key, inclusive>,\n"
-             << "              maxCount: <max number of docs>,\n"
-             << "              maxSize: <max size of docs>,\n"
-             << "              maxCountPerSecond: <max rate in docs/sec> } "
-             << "to check a collection.\n"
-             << "Invoke with {dbCheck: 1} to check all collections in the database.";
+    std::string help() const override {
+        return "Validate replica set consistency.\n"
+               "Invoke with { dbCheck: <collection name/uuid>,\n"
+               "              minKey: <first key, exclusive>,\n"
+               "              maxKey: <last key, inclusive>,\n"
+               "              maxCount: <max number of docs>,\n"
+               "              maxSize: <max size of docs>,\n"
+               "              maxCountPerSecond: <max rate in docs/sec> } "
+               "to check a collection.\n"
+               "Invoke with {dbCheck: 1} to check all collections in the database.";
     }
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         // For now, just use `find` permissions.
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
@@ -522,8 +540,6 @@ public:
                      const std::string& dbname,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        uassert(40614, "dbCheck requires FeatureCompatibilityVersion >= 3.6", _hasCorrectFCV());
-
         auto job = getRun(opCtx, dbname, cmdObj);
         try {
             (new DbCheckJob(dbname, std::move(job)))->go();
@@ -535,18 +551,8 @@ public:
         result.append("ok", true);
         return true;
     }
-
-private:
-    bool _hasCorrectFCV(void) {
-        return serverGlobalParams.featureCompatibility.isFullyUpgradedTo36();
-    }
 };
 
-MONGO_INITIALIZER(RegisterDbCheckCmd)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
-        new DbCheckCmd();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(DbCheckCmd);
 }  // namespace
 }

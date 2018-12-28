@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -25,6 +27,8 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -39,6 +43,7 @@
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -50,20 +55,14 @@ public:
     AddCollectionChange(OperationContext* opCtx,
                         KVDatabaseCatalogEntryBase* dce,
                         StringData collection,
-                        StringData ident,
-                        bool dropOnRollback)
-        : _opCtx(opCtx),
-          _dce(dce),
-          _collection(collection.toString()),
-          _ident(ident.toString()),
-          _dropOnRollback(dropOnRollback) {}
+                        StringData ident)
+        : _opCtx(opCtx), _dce(dce), _collection(collection.toString()), _ident(ident.toString()) {}
 
-    virtual void commit() {}
+    virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
-        if (_dropOnRollback) {
-            // Intentionally ignoring failure
-            _dce->_engine->getEngine()->dropIdent(_opCtx, _ident).transitional_ignore();
-        }
+        // Intentionally ignoring failure
+        MONGO_COMPILER_VARIABLE_UNUSED auto status =
+            _dce->_engine->getEngine()->dropIdent(_opCtx, _ident);
 
         const CollectionMap::iterator it = _dce->_collections.find(_collection);
         if (it != _dce->_collections.end()) {
@@ -76,7 +75,6 @@ public:
     KVDatabaseCatalogEntryBase* const _dce;
     const std::string _collection;
     const std::string _ident;
-    const bool _dropOnRollback;
 };
 
 class KVDatabaseCatalogEntryBase::RemoveCollectionChange : public RecoveryUnit::Change {
@@ -85,22 +83,28 @@ public:
                            KVDatabaseCatalogEntryBase* dce,
                            StringData collection,
                            StringData ident,
-                           KVCollectionCatalogEntry* entry,
-                           bool dropOnCommit)
+                           KVCollectionCatalogEntry* entry)
         : _opCtx(opCtx),
           _dce(dce),
           _collection(collection.toString()),
           _ident(ident.toString()),
-          _entry(entry),
-          _dropOnCommit(dropOnCommit) {}
+          _entry(entry) {}
 
-    virtual void commit() {
+    virtual void commit(boost::optional<Timestamp> commitTimestamp) {
         delete _entry;
 
         // Intentionally ignoring failure here. Since we've removed the metadata pointing to the
         // collection, we should never see it again anyway.
-        if (_dropOnCommit)
-            _dce->_engine->getEngine()->dropIdent(_opCtx, _ident).transitional_ignore();
+        auto engine = _dce->_engine;
+        auto storageEngine = engine->getStorageEngine();
+        if (storageEngine->supportsPendingDrops() && commitTimestamp) {
+            log() << "Deferring ident drop for " << _ident << " (" << _collection
+                  << ") with commit timestamp: " << commitTimestamp->toBSON();
+            engine->addDropPendingIdent(*commitTimestamp, NamespaceString(_collection), _ident);
+        } else {
+            auto kvEngine = engine->getEngine();
+            MONGO_COMPILER_VARIABLE_UNUSED auto status = kvEngine->dropIdent(_opCtx, _ident);
+        }
     }
 
     virtual void rollback() {
@@ -112,10 +116,36 @@ public:
     const std::string _collection;
     const std::string _ident;
     KVCollectionCatalogEntry* const _entry;
-    const bool _dropOnCommit;
 };
 
-KVDatabaseCatalogEntryBase::KVDatabaseCatalogEntryBase(StringData db, KVStorageEngine* engine)
+class KVDatabaseCatalogEntryBase::RenameCollectionChange final : public RecoveryUnit::Change {
+public:
+    RenameCollectionChange(KVDatabaseCatalogEntryBase* dce,
+                           KVCollectionCatalogEntry* coll,
+                           NamespaceString fromNs,
+                           NamespaceString toNs)
+        : _dce(dce), _coll(coll), _fromNs(std::move(fromNs)), _toNs(std::move(toNs)) {}
+
+    void commit(boost::optional<Timestamp>) override {}
+
+    void rollback() override {
+        auto it = _dce->_collections.find(_toNs.ns());
+        invariant(it != _dce->_collections.end());
+        invariant(it->second == _coll);
+        _dce->_collections[_fromNs.ns()] = _coll;
+        _dce->_collections.erase(_toNs.ns());
+        _coll->setNs(_fromNs);
+    }
+
+private:
+    KVDatabaseCatalogEntryBase* const _dce;
+    KVCollectionCatalogEntry* const _coll;
+    const NamespaceString _fromNs;
+    const NamespaceString _toNs;
+};
+
+KVDatabaseCatalogEntryBase::KVDatabaseCatalogEntryBase(StringData db,
+                                                       KVStorageEngineInterface* engine)
     : DatabaseCatalogEntry(db), _engine(engine) {}
 
 KVDatabaseCatalogEntryBase::~KVDatabaseCatalogEntryBase() {
@@ -230,7 +260,7 @@ Status KVDatabaseCatalogEntryBase::createCollection(OperationContext* opCtx,
         }
     }
 
-    opCtx->recoveryUnit()->registerChange(new AddCollectionChange(opCtx, this, ns, ident, true));
+    opCtx->recoveryUnit()->registerChange(new AddCollectionChange(opCtx, this, ns, ident));
 
     auto rs = _engine->getEngine()->getGroupedRecordStore(opCtx, ns, ident, options, prefix);
     invariant(rs);
@@ -307,25 +337,26 @@ Status KVDatabaseCatalogEntryBase::renameCollection(OperationContext* opCtx,
         return status;
 
     const std::string identTo = _engine->getCatalog()->getCollectionIdent(toNS);
-
     invariant(identFrom == identTo);
 
-    BSONCollectionCatalogEntry::MetaData md = _engine->getCatalog()->getMetaData(opCtx, toNS);
-
-    const CollectionMap::iterator itFrom = _collections.find(fromNS.toString());
+    // Add the destination collection to _collections before erasing the source collection. This
+    // is to ensure that _collections doesn't erroneously appear empty during listDatabases if
+    // a database consists of a single collection and that collection gets renamed (see
+    // SERVER-34531). There is no locking to prevent listDatabases from looking into
+    // _collections as a rename is taking place.
+    auto itFrom = _collections.find(fromNS.toString());
     invariant(itFrom != _collections.end());
-    opCtx->recoveryUnit()->registerChange(
-        new RemoveCollectionChange(opCtx, this, fromNS, identFrom, itFrom->second, false));
+    auto* collectionCatalogEntry = itFrom->second;
+    invariant(collectionCatalogEntry);
+    _collections[toNS.toString()] = collectionCatalogEntry;
     _collections.erase(itFrom);
 
-    opCtx->recoveryUnit()->registerChange(
-        new AddCollectionChange(opCtx, this, toNS, identTo, false));
+    collectionCatalogEntry->setNs(NamespaceString{toNS});
 
-    auto rs =
-        _engine->getEngine()->getGroupedRecordStore(opCtx, toNS, identTo, md.options, md.prefix);
-
-    _collections[toNS.toString()] = new KVCollectionCatalogEntry(
-        _engine->getEngine(), _engine->getCatalog(), toNS, identTo, std::move(rs));
+    // Register a Change which, on rollback, will reinstall the collection catalog entry in the
+    // collections map so that it is associated with 'fromNS', not 'toNS'.
+    opCtx->recoveryUnit()->registerChange(new RenameCollectionChange(
+        this, collectionCatalogEntry, NamespaceString{fromNS}, NamespaceString{toNS}));
 
     return Status::OK();
 }
@@ -362,7 +393,7 @@ Status KVDatabaseCatalogEntryBase::dropCollection(OperationContext* opCtx, Strin
     // This will lazily delete the KVCollectionCatalogEntry and notify the storageEngine to
     // drop the collection only on WUOW::commit().
     opCtx->recoveryUnit()->registerChange(
-        new RemoveCollectionChange(opCtx, this, ns, ident, it->second, true));
+        new RemoveCollectionChange(opCtx, this, ns, ident, it->second));
 
     _collections.erase(ns.toString());
 

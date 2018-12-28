@@ -1,38 +1,42 @@
+
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include <deque>
 
+#include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 
@@ -41,14 +45,17 @@ namespace mongo {
 /**
  * Constructs and returns Documents from the BSONObj objects produced by a supplied PlanExecutor.
  */
-class DocumentSourceCursor final : public DocumentSource {
+class DocumentSourceCursor : public DocumentSource {
 public:
     // virtuals from DocumentSource
     GetNextResult getNext() final;
-    const char* getSourceName() const final;
-    BSONObjSet getOutputSorts() final {
+
+    const char* getSourceName() const override;
+
+    BSONObjSet getOutputSorts() override {
         return _outputSorts;
     }
+
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
@@ -56,7 +63,8 @@ public:
                                      PositionRequirement::kFirst,
                                      HostTypeRequirement::kAnyShard,
                                      DiskUseRequirement::kNoDiskUse,
-                                     FacetRequirement::kNotAllowed);
+                                     FacetRequirement::kNotAllowed,
+                                     TransactionRequirement::kAllowed);
 
         constraints.requiresInputDocSource = false;
         return constraints;
@@ -147,9 +155,15 @@ public:
     }
 
 protected:
+    DocumentSourceCursor(Collection* collection,
+                         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    ~DocumentSourceCursor();
+
     /**
-     * Disposes of '_exec' and '_rangePreserver' if they haven't been disposed already. This
-     * involves taking a collection lock.
+     * Disposes of '_exec' if it hasn't been disposed already. This involves taking a collection
+     * lock.
      */
     void doDispose() final;
 
@@ -159,24 +173,35 @@ protected:
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
 
-private:
-    DocumentSourceCursor(Collection* collection,
-                         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
-                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
-    ~DocumentSourceCursor();
-
     /**
-     * Acquires locks to properly destroy and de-register '_exec'. '_exec' must be non-null.
+     * If '_shouldProduceEmptyDocs' is false, this function hook is called on each 'obj' returned by
+     * '_exec' when loading a batch and returns a Document to be added to '_currentBatch'.
+     *
+     * The default implementation is a dependency-aware BSONObj-to-Document transformation.
+     */
+    virtual Document transformBSONObjToDocument(const BSONObj& obj) const;
+
+private:
+    /**
+     * Acquires the appropriate locks, then destroys and de-registers '_exec'. '_exec' must be
+     * non-null.
      */
     void cleanupExecutor();
 
     /**
-     * Reads a batch of data from '_exec'.
+     * Destroys and de-registers '_exec'. '_exec' must be non-null.
+     */
+    void cleanupExecutor(const AutoGetCollectionForRead& readLock);
+
+    /**
+     * Reads a batch of data from '_exec'. Subclasses can specify custom behavior to be performed on
+     * each document by overloading transformBSONObjToDocument().
      */
     void loadBatch();
 
     void recordPlanSummaryStats();
 
+    // Batches results returned from the underlying PlanExecutor.
     std::deque<Document> _currentBatch;
 
     // BSONObj members must outlive _projection and cursor.
@@ -192,9 +217,19 @@ private:
     // collection lock.
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _exec;
 
+    // Status of the underlying executor, _exec. Used for explain queries if _exec produces an
+    // error. Since _exec may not finish running (if there is a limit, for example), we store OK as
+    // the default.
+    Status _execStatus = Status::OK();
+
     BSONObjSet _outputSorts;
     std::string _planSummary;
     PlanSummaryStats _planSummaryStats;
+
+    // Used only for explain() queries. Stores the stats of the winning plan when _exec's root
+    // stage is a MultiPlanStage. When the query is executed (with exec->executePlan()), it will
+    // wipe out its own copy of the winning plan's statistics, so they need to be saved here.
+    std::unique_ptr<PlanStageStats> _winningPlanTrialStats;
 };
 
 }  // namespace mongo

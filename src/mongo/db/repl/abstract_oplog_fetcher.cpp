@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -52,7 +54,14 @@ ServerStatusMetricField<Counter64> displayReadersCreated("repl.network.readersCr
                                                          &readersCreatedStats);
 
 // Number of seconds for the `maxTimeMS` on the initial `find` command.
+//
+// For the initial 'find' request, we provide a generous timeout, to account for the potentially
+// slow process of a sync source finding the lastApplied optime provided in a node's query in its
+// oplog.
 MONGO_EXPORT_SERVER_PARAMETER(oplogInitialFindMaxSeconds, int, 60);
+
+// Number of seconds for the `maxTimeMS` on any retried `find` commands.
+MONGO_EXPORT_SERVER_PARAMETER(oplogRetriedFindMaxSeconds, int, 2);
 
 // Number of milliseconds to add to the `find` and `getMore` timeouts to calculate the network
 // timeout for the requests.
@@ -97,8 +106,12 @@ AbstractOplogFetcher::AbstractOplogFetcher(executor::TaskExecutor* executor,
     invariant(onShutdownCallbackFn);
 }
 
-Milliseconds AbstractOplogFetcher::_getFindMaxTime() const {
+Milliseconds AbstractOplogFetcher::_getInitialFindMaxTime() const {
     return Milliseconds(oplogInitialFindMaxSeconds.load() * 1000);
+}
+
+Milliseconds AbstractOplogFetcher::_getRetriedFindMaxTime() const {
+    return Milliseconds(oplogRetriedFindMaxSeconds.load() * 1000);
 }
 
 Milliseconds AbstractOplogFetcher::_getGetMoreMaxTime() const {
@@ -126,13 +139,14 @@ void AbstractOplogFetcher::_makeAndScheduleFetcherCallback(
         return;
     }
 
-    BSONObj findCommandObj = _makeFindCommandObject(_nss, _getLastOpTimeWithHashFetched().opTime);
+    BSONObj findCommandObj = _makeFindCommandObject(
+        _nss, _getLastOpTimeWithHashFetched().opTime, _getInitialFindMaxTime());
     BSONObj metadataObj = _makeMetadataObject();
 
     Status scheduleStatus = Status::OK();
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
-        _fetcher = _makeFetcher(findCommandObj, metadataObj);
+        _fetcher = _makeFetcher(findCommandObj, metadataObj, _getInitialFindMaxTime());
         scheduleStatus = _scheduleFetcher_inlock();
     }
     if (!scheduleStatus.isOK()) {
@@ -143,8 +157,9 @@ void AbstractOplogFetcher::_makeAndScheduleFetcherCallback(
 
 Status AbstractOplogFetcher::_doStartup_inlock() noexcept {
     return _scheduleWorkAndSaveHandle_inlock(
-        stdx::bind(
-            &AbstractOplogFetcher::_makeAndScheduleFetcherCallback, this, stdx::placeholders::_1),
+        [this](const executor::TaskExecutor::CallbackArgs& args) {
+            _makeAndScheduleFetcherCallback(args);
+        },
         &_makeAndScheduleFetcherHandle,
         "_makeAndScheduleFetcherCallback");
 }
@@ -180,7 +195,8 @@ BSONObj AbstractOplogFetcher::getCommandObject_forTest() const {
 }
 
 BSONObj AbstractOplogFetcher::getFindQuery_forTest() const {
-    return _makeFindCommandObject(_nss, _getLastOpTimeWithHashFetched().opTime);
+    return _makeFindCommandObject(
+        _nss, _getLastOpTimeWithHashFetched().opTime, _getInitialFindMaxTime());
 }
 
 HostAndPort AbstractOplogFetcher::_getSource() const {
@@ -205,8 +221,9 @@ void AbstractOplogFetcher::_callback(const Fetcher::QueryResponseStatus& result,
     // If target cut connections between connecting and querying (for
     // example, because it stepped down) we might not have a cursor.
     if (!responseStatus.isOK()) {
-        BSONObj findCommandObj =
-            _makeFindCommandObject(_nss, _getLastOpTimeWithHashFetched().opTime);
+
+        BSONObj findCommandObj = _makeFindCommandObject(
+            _nss, _getLastOpTimeWithHashFetched().opTime, _getRetriedFindMaxTime());
         BSONObj metadataObj = _makeMetadataObject();
         {
             stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -222,8 +239,10 @@ void AbstractOplogFetcher::_callback(const Fetcher::QueryResponseStatus& result,
                 _shuttingDownFetcher.reset();
                 // Move the old fetcher into the shutting down instance.
                 _shuttingDownFetcher.swap(_fetcher);
-                // Create and start fetcher with current term and new starting optime.
-                _fetcher = _makeFetcher(findCommandObj, metadataObj);
+                // Create and start fetcher with current term and new starting optime, and use the
+                // retry 'find' timeout.
+                _fetcher = _makeFetcher(findCommandObj, metadataObj, _getRetriedFindMaxTime());
+
                 auto scheduleStatus = _scheduleFetcher_inlock();
                 if (scheduleStatus.isOK()) {
                     log() << "Scheduled new oplog query " << _fetcher->toString();
@@ -317,16 +336,18 @@ void AbstractOplogFetcher::_finishCallback(Status status) {
 }
 
 std::unique_ptr<Fetcher> AbstractOplogFetcher::_makeFetcher(const BSONObj& findCommandObj,
-                                                            const BSONObj& metadataObj) {
+                                                            const BSONObj& metadataObj,
+                                                            Milliseconds findMaxTime) {
     return stdx::make_unique<Fetcher>(
         _getExecutor(),
         _source,
         _nss.db().toString(),
         findCommandObj,
-        stdx::bind(
-            &AbstractOplogFetcher::_callback, this, stdx::placeholders::_1, stdx::placeholders::_3),
+        [this](const StatusWith<Fetcher::QueryResponse>& resp,
+               Fetcher::NextAction*,
+               BSONObjBuilder* builder) { return _callback(resp, builder); },
         metadataObj,
-        _getFindMaxTime() + kNetworkTimeoutBufferMS,
+        findMaxTime + kNetworkTimeoutBufferMS,
         _getGetMoreMaxTime() + kNetworkTimeoutBufferMS);
 }
 

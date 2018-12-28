@@ -1,4 +1,6 @@
-// tests sharding with replica sets
+/**
+ * tests sharding with replica sets
+ */
 (function() {
     'use strict';
 

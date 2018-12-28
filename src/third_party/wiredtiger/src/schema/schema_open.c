@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -106,8 +106,6 @@ __wt_schema_open_colgroups(WT_SESSION_IMPL *session, WT_TABLE *table)
 	}
 
 	table->cg_complete = true;
-	table->is_simple_file = (table->is_simple &&
-	    WT_PREFIX_MATCH(table->cgroups[0]->source, "file:"));
 
 err:	__wt_scr_free(session, &buf);
 	__wt_schema_destroy_colgroup(session, &colgroup);
@@ -397,8 +395,9 @@ __wt_schema_open_index(WT_SESSION_IMPL *session,
 {
 	WT_DECL_RET;
 
-	WT_WITH_TXN_ISOLATION(session, WT_ISO_READ_UNCOMMITTED,
-	    ret = __schema_open_index(session, table, idxname, len, indexp));
+	WT_WITH_TABLE_WRITE_LOCK(session,
+	    WT_WITH_TXN_ISOLATION(session, WT_ISO_READ_UNCOMMITTED, ret =
+		__schema_open_index(session, table, idxname, len, indexp)));
 	return (ret);
 }
 

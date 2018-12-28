@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2010 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
@@ -32,7 +34,6 @@
 
 #include "mongo/db/s/balancer/balancer_policy.h"
 
-#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/util/log.h"
@@ -48,10 +49,9 @@ using std::vector;
 
 namespace {
 
-// These values indicate the minimum deviation shard's number of chunks need to have from the
+// This value indicates the minimum deviation shard's number of chunks need to have from the
 // optimal average across all shards for a zone for a rebalancing migration to be initiated.
-const size_t kDefaultImbalanceThreshold = 2;
-const size_t kAggressiveImbalanceThreshold = 1;
+const size_t kDefaultImbalanceThreshold = 1;
 
 }  // namespace
 
@@ -291,12 +291,8 @@ ShardId BalancerPolicy::_getMostOverloadedShard(const ShardStatisticsVector& sha
 
 vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardStats,
                                             const DistributionStatus& distribution,
-                                            bool shouldAggressivelyBalance) {
+                                            std::set<ShardId>* usedShards) {
     vector<MigrateInfo> migrations;
-
-    // Set of shards, which have already been used for migrations. Used so we don't return multiple
-    // migrations for the same shard.
-    set<ShardId> usedShards;
 
     // 1) Check for shards, which are in draining mode
     {
@@ -304,7 +300,7 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
             if (!stat.isDraining)
                 continue;
 
-            if (usedShards.count(stat.shardId))
+            if (usedShards->count(stat.shardId))
                 continue;
 
             const vector<ChunkType>& chunks = distribution.getChunks(stat.shardId);
@@ -326,7 +322,7 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
                 const string tag = distribution.getTagForChunk(chunk);
 
                 const ShardId to =
-                    _getLeastLoadedReceiverShard(shardStats, distribution, tag, usedShards);
+                    _getLeastLoadedReceiverShard(shardStats, distribution, tag, *usedShards);
                 if (!to.isValid()) {
                     if (migrations.empty()) {
                         warning() << "Chunk " << redact(chunk.toString())
@@ -337,8 +333,8 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
 
                 invariant(to != stat.shardId);
                 migrations.emplace_back(to, chunk);
-                invariant(usedShards.insert(stat.shardId).second);
-                invariant(usedShards.insert(to).second);
+                invariant(usedShards->insert(stat.shardId).second);
+                invariant(usedShards->insert(to).second);
                 break;
             }
 
@@ -352,7 +348,7 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
     // 2) Check for chunks, which are on the wrong shard and must be moved off of it
     if (!distribution.tags().empty()) {
         for (const auto& stat : shardStats) {
-            if (usedShards.count(stat.shardId))
+            if (usedShards->count(stat.shardId))
                 continue;
 
             const vector<ChunkType>& chunks = distribution.getChunks(stat.shardId);
@@ -373,7 +369,7 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
                 }
 
                 const ShardId to =
-                    _getLeastLoadedReceiverShard(shardStats, distribution, tag, usedShards);
+                    _getLeastLoadedReceiverShard(shardStats, distribution, tag, *usedShards);
                 if (!to.isValid()) {
                     if (migrations.empty()) {
                         warning() << "Chunk " << redact(chunk.toString()) << " violates zone "
@@ -384,17 +380,14 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
 
                 invariant(to != stat.shardId);
                 migrations.emplace_back(to, chunk);
-                invariant(usedShards.insert(stat.shardId).second);
-                invariant(usedShards.insert(to).second);
+                invariant(usedShards->insert(stat.shardId).second);
+                invariant(usedShards->insert(to).second);
                 break;
             }
         }
     }
 
     // 3) for each tag balance
-    const size_t imbalanceThreshold = (shouldAggressivelyBalance || distribution.totalChunks() < 20)
-        ? kAggressiveImbalanceThreshold
-        : kDefaultImbalanceThreshold;
 
     vector<string> tagsPlusEmpty(distribution.tags().begin(), distribution.tags().end());
     tagsPlusEmpty.push_back("");
@@ -423,18 +416,16 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
             continue;
         }
 
-        // Calculate the ceiling of the optimal number of chunks per shard
+        // Calculate the rounded optimal number of chunks per shard
         const size_t idealNumberOfChunksPerShardForTag =
-            (totalNumberOfChunksWithTag / totalNumberOfShardsWithTag) +
-            (totalNumberOfChunksWithTag % totalNumberOfShardsWithTag ? 1 : 0);
+            (size_t)std::roundf(totalNumberOfChunksWithTag / (float)totalNumberOfShardsWithTag);
 
         while (_singleZoneBalance(shardStats,
                                   distribution,
                                   tag,
                                   idealNumberOfChunksPerShardForTag,
-                                  imbalanceThreshold,
                                   &migrations,
-                                  &usedShards))
+                                  usedShards))
             ;
     }
 
@@ -460,7 +451,6 @@ bool BalancerPolicy::_singleZoneBalance(const ShardStatisticsVector& shardStats,
                                         const DistributionStatus& distribution,
                                         const string& tag,
                                         size_t idealNumberOfChunksPerShardForTag,
-                                        size_t imbalanceThreshold,
                                         vector<MigrateInfo>* migrations,
                                         set<ShardId>* usedShards) {
     const ShardId from = _getMostOverloadedShard(shardStats, distribution, tag, *usedShards);
@@ -494,10 +484,10 @@ bool BalancerPolicy::_singleZoneBalance(const ShardStatisticsVector& shardStats,
     LOG(1) << "donor      : " << from << " chunks on " << max;
     LOG(1) << "receiver   : " << to << " chunks on " << min;
     LOG(1) << "ideal      : " << idealNumberOfChunksPerShardForTag;
-    LOG(1) << "threshold  : " << imbalanceThreshold;
+    LOG(1) << "threshold  : " << kDefaultImbalanceThreshold;
 
     // Check whether it is necessary to balance within this zone
-    if (imbalance < imbalanceThreshold)
+    if (imbalance < kDefaultImbalanceThreshold)
         return false;
 
     const vector<ChunkType>& chunks = distribution.getChunks(from);
@@ -536,12 +526,12 @@ string ZoneRange::toString() const {
 }
 
 MigrateInfo::MigrateInfo(const ShardId& a_to, const ChunkType& a_chunk) {
-    invariantOK(a_chunk.validate());
+    invariant(a_chunk.validate());
     invariant(a_to.isValid());
 
     to = a_to;
 
-    ns = a_chunk.getNS();
+    nss = a_chunk.getNS();
     from = a_chunk.getShard();
     minKey = a_chunk.getMin();
     maxKey = a_chunk.getMax();
@@ -549,12 +539,12 @@ MigrateInfo::MigrateInfo(const ShardId& a_to, const ChunkType& a_chunk) {
 }
 
 std::string MigrateInfo::getName() const {
-    return ChunkType::genID(ns, minKey);
+    return ChunkType::genID(nss, minKey);
 }
 
 string MigrateInfo::toString() const {
-    return str::stream() << ns << ": [" << minKey << ", " << maxKey << "), from " << from << ", to "
-                         << to;
+    return str::stream() << nss.ns() << ": [" << minKey << ", " << maxKey << "), from " << from
+                         << ", to " << to;
 }
 
 }  // namespace mongo

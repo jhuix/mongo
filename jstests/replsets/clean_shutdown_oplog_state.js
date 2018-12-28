@@ -3,9 +3,12 @@
 // present without this test failing. In particular if the rst.stop(1) doesn't execute mid-batch,
 // it isn't fully exercising the code. However, if the test fails there is definitely a bug.
 //
-// @tags: [requires_persistence]
+// @tags: [requires_persistence, requires_majority_read_concern]
 (function() {
     "use strict";
+
+    // Skip db hash check because secondary restarted as standalone.
+    TestData.skipCheckDBHashes = true;
 
     var rst = new ReplSetTest({
         name: "name",
@@ -32,8 +35,8 @@
 
     // Start a w:2 write that will block until replication is resumed.
     var waitForReplStart = startParallelShell(function() {
-        printjson(assert.writeOK(db.getCollection('side').insert(
-            {}, {writeConcern: {w: 2, wtimeout: ReplSetTest.kDefaultTimeoutMS}})));
+        printjson(assert.writeOK(
+            db.getCollection('side').insert({}, {writeConcern: {w: 2, wtimeout: 30 * 60 * 1000}})));
     }, primary.host.split(':')[1]);
 
     // Insert a lot of data in increasing order to test.coll.
@@ -54,6 +57,13 @@
     var options = slave.savedOptions;
     options.noCleanData = true;
     delete options.replSet;
+
+    var storageEngine = jsTest.options().storageEngine || "wiredTiger";
+    if (storageEngine === "wiredTiger") {
+        options.setParameter = options.setParameter || {};
+        options.setParameter.recoverFromOplogAsStandalone = true;
+    }
+
     var conn = MongoRunner.runMongod(options);
     assert.neq(null, conn, "secondary failed to start");
 
@@ -79,7 +89,9 @@
     try {
         assert.eq(collDoc._id, oplogDoc.o._id);
         assert(!('begin' in minValidDoc), 'begin in minValidDoc');
-        assert.eq(minValidDoc.ts, oplogDoc.ts);
+        if (storageEngine !== "wiredTiger") {
+            assert.eq(minValidDoc.ts, oplogDoc.ts);
+        }
         assert.eq(oplogTruncateAfterPointDoc.oplogTruncateAfterPoint, Timestamp());
     } catch (e) {
         // TODO remove once SERVER-25777 is resolved.

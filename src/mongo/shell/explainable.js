@@ -66,7 +66,6 @@ var Explainable = (function() {
             print("\t.distinct(...) - explain a distinct operation");
             print("\t.find(...) - get an explainable query");
             print("\t.findAndModify(...) - explain a findAndModify operation");
-            print("\t.group(...) - explain a group operation");
             print("\t.remove(...) - explain a remove operation");
             print("\t.update(...) - explain an update operation");
             print("Explainable collection methods");
@@ -100,22 +99,22 @@ var Explainable = (function() {
             }
 
             // Add the explain option.
-            extraOpts = extraOpts || {};
+            let extraOptsCopy = Object.extend({}, (extraOpts || {}));
 
             // For compatibility with 3.4 and older versions, when the verbosity is "queryPlanner",
             // we use the explain option to the aggregate command. Otherwise we issue an explain
             // command wrapping the agg command, which is supported by newer versions of the server.
             if (this._verbosity === "queryPlanner") {
-                extraOpts.explain = true;
-                return this._collection.aggregate(pipeline, extraOpts);
+                extraOptsCopy.explain = true;
+                return this._collection.aggregate(pipeline, extraOptsCopy);
             } else {
                 // The aggregate command requires a cursor field.
-                if (!extraOpts.hasOwnProperty("cursor")) {
-                    extraOpts = Object.extend(extraOpts, {cursor: {}});
+                if (!extraOptsCopy.hasOwnProperty("cursor")) {
+                    extraOptsCopy = Object.extend(extraOptsCopy, {cursor: {}});
                 }
 
                 let aggCmd = Object.extend(
-                    {"aggregate": this._collection.getName(), "pipeline": pipeline}, extraOpts);
+                    {"aggregate": this._collection.getName(), "pipeline": pipeline}, extraOptsCopy);
                 let explainCmd = {"explain": aggCmd, "verbosity": this._verbosity};
                 let explainResult = this._collection.runReadCommand(explainCmd);
                 return throwOrReturn(explainResult);
@@ -140,14 +139,6 @@ var Explainable = (function() {
         this.findAndModify = function(params) {
             var famCmd = Object.extend({"findAndModify": this._collection.getName()}, params);
             var explainCmd = {"explain": famCmd, "verbosity": this._verbosity};
-            var explainResult = this._collection.runReadCommand(explainCmd);
-            return throwOrReturn(explainResult);
-        };
-
-        this.group = function(params) {
-            params.ns = this._collection.getName();
-            var grpCmd = {"group": this._collection.getDB()._groupFixParms(params)};
-            var explainCmd = {"explain": grpCmd, "verbosity": this._verbosity};
             var explainResult = this._collection.runReadCommand(explainCmd);
             return throwOrReturn(explainResult);
         };

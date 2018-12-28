@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,7 +37,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -51,40 +53,6 @@
 namespace mongo {
 namespace repl {
 
-namespace {
-
-/**
- * Utility class to temporarily swap which client is bound to the running thread.
- *
- * Use this class to bind a client to the current thread for the duration of the
- * AlternativeClientRegion's lifetime, restoring the prior client, if any, at the
- * end of the block.
- */
-class AlternativeClientRegion {
-public:
-    explicit AlternativeClientRegion(ServiceContext::UniqueClient& clientToUse)
-        : _alternateClient(&clientToUse) {
-        invariant(clientToUse);
-        if (Client::getCurrent()) {
-            _originalClient = Client::releaseCurrent();
-        }
-        Client::setCurrent(std::move(*_alternateClient));
-    }
-
-    ~AlternativeClientRegion() {
-        *_alternateClient = Client::releaseCurrent();
-        if (_originalClient) {
-            Client::setCurrent(std::move(_originalClient));
-        }
-    }
-
-private:
-    ServiceContext::UniqueClient _originalClient;
-    ServiceContext::UniqueClient* const _alternateClient;
-};
-
-}  // namespace
-
 CollectionBulkLoaderImpl::CollectionBulkLoaderImpl(ServiceContext::UniqueClient&& client,
                                                    ServiceContext::UniqueOperationContext&& opCtx,
                                                    std::unique_ptr<AutoGetCollection>&& autoColl,
@@ -93,9 +61,9 @@ CollectionBulkLoaderImpl::CollectionBulkLoaderImpl(ServiceContext::UniqueClient&
       _opCtx{std::move(opCtx)},
       _autoColl{std::move(autoColl)},
       _nss{_autoColl->getCollection()->ns()},
-      _idIndexBlock(stdx::make_unique<MultiIndexBlock>(_opCtx.get(), _autoColl->getCollection())),
+      _idIndexBlock(std::make_unique<MultiIndexBlock>(_opCtx.get(), _autoColl->getCollection())),
       _secondaryIndexesBlock(
-          stdx::make_unique<MultiIndexBlock>(_opCtx.get(), _autoColl->getCollection())),
+          std::make_unique<MultiIndexBlock>(_opCtx.get(), _autoColl->getCollection())),
       _idIndexSpec(idIndexSpec.getOwned()) {
 
     invariant(_opCtx);
@@ -113,9 +81,9 @@ Status CollectionBulkLoaderImpl::init(const std::vector<BSONObj>& secondaryIndex
             // All writes in CollectionBulkLoaderImpl should be unreplicated.
             // The opCtx is accessed indirectly through _secondaryIndexesBlock.
             UnreplicatedWritesBlock uwb(_opCtx.get());
-            std::vector<BSONObj> specs(secondaryIndexSpecs);
             // This enforces the buildIndexes setting in the replica set configuration.
-            _secondaryIndexesBlock->removeExistingIndexes(&specs);
+            auto indexCatalog = coll->getIndexCatalog();
+            auto specs = indexCatalog->removeExistingIndexes(_opCtx.get(), secondaryIndexSpecs);
             if (specs.size()) {
                 _secondaryIndexesBlock->ignoreUniqueConstraint();
                 auto status = _secondaryIndexesBlock->init(specs).getStatus();
@@ -145,22 +113,18 @@ Status CollectionBulkLoaderImpl::insertDocuments(const std::vector<BSONObj>::con
         UnreplicatedWritesBlock uwb(_opCtx.get());
 
         for (auto iter = begin; iter != end; ++iter) {
-            std::vector<MultiIndexBlock*> indexers;
-            if (_idIndexBlock) {
-                indexers.push_back(_idIndexBlock.get());
-            }
-            if (_secondaryIndexesBlock) {
-                indexers.push_back(_secondaryIndexesBlock.get());
-            }
-
             Status status = writeConflictRetry(
                 _opCtx.get(), "CollectionBulkLoaderImpl::insertDocuments", _nss.ns(), [&] {
                     WriteUnitOfWork wunit(_opCtx.get());
-                    if (!indexers.empty()) {
+                    const auto& doc = *iter;
+                    if (_idIndexBlock || _secondaryIndexesBlock) {
                         // This flavor of insertDocument will not update any pre-existing indexes,
                         // only the indexers passed in.
-                        const auto status = _autoColl->getCollection()->insertDocument(
-                            _opCtx.get(), *iter, indexers, false);
+                        auto onRecordInserted = [&](const RecordId& loc) {
+                            return _addDocumentToIndexBlocks(doc, loc);
+                        };
+                        const auto status = _autoColl->getCollection()->insertDocumentForBulkLoader(
+                            _opCtx.get(), doc, onRecordInserted);
                         if (!status.isOK()) {
                             return status;
                         }
@@ -168,7 +132,7 @@ Status CollectionBulkLoaderImpl::insertDocuments(const std::vector<BSONObj>::con
                         // For capped collections, we use regular insertDocument, which will update
                         // pre-existing indexes.
                         const auto status = _autoColl->getCollection()->insertDocument(
-                            _opCtx.get(), InsertStatement(*iter), nullptr, false);
+                            _opCtx.get(), InsertStatement(doc), nullptr);
                         if (!status.isOK()) {
                             return status;
                         }
@@ -199,7 +163,7 @@ Status CollectionBulkLoaderImpl::commit() {
         // deleted.
         if (_secondaryIndexesBlock) {
             std::set<RecordId> secDups;
-            auto status = _secondaryIndexesBlock->doneInserting(&secDups);
+            auto status = _secondaryIndexesBlock->dumpInsertsFromBulk(&secDups);
             if (!status.isOK()) {
                 return status;
             }
@@ -209,18 +173,26 @@ Status CollectionBulkLoaderImpl::commit() {
                                             << " duplicates on secondary index(es) even though "
                                                "MultiIndexBlock::ignoreUniqueConstraint set."};
             }
-            writeConflictRetry(_opCtx.get(), "CollectionBulkLoaderImpl::commit", _nss.ns(), [this] {
-                WriteUnitOfWork wunit(_opCtx.get());
-                _secondaryIndexesBlock->commit();
-                wunit.commit();
-            });
+            status = writeConflictRetry(
+                _opCtx.get(), "CollectionBulkLoaderImpl::commit", _nss.ns(), [this] {
+                    WriteUnitOfWork wunit(_opCtx.get());
+                    auto status = _secondaryIndexesBlock->commit();
+                    if (!status.isOK()) {
+                        return status;
+                    }
+                    wunit.commit();
+                    return Status::OK();
+                });
+            if (!status.isOK()) {
+                return status;
+            }
         }
 
         if (_idIndexBlock) {
             // Delete dups.
             std::set<RecordId> dups;
-            // Do not do inside a WriteUnitOfWork (required by doneInserting).
-            auto status = _idIndexBlock->doneInserting(&dups);
+            // Do not do inside a WriteUnitOfWork (required by dumpInsertsFromBulk).
+            auto status = _idIndexBlock->dumpInsertsFromBulk(&dups);
             if (!status.isOK()) {
                 return status;
             }
@@ -240,11 +212,19 @@ Status CollectionBulkLoaderImpl::commit() {
             }
 
             // Commit _id index, without dups.
-            writeConflictRetry(_opCtx.get(), "CollectionBulkLoaderImpl::commit", _nss.ns(), [this] {
-                WriteUnitOfWork wunit(_opCtx.get());
-                _idIndexBlock->commit();
-                wunit.commit();
-            });
+            status = writeConflictRetry(
+                _opCtx.get(), "CollectionBulkLoaderImpl::commit", _nss.ns(), [this] {
+                    WriteUnitOfWork wunit(_opCtx.get());
+                    auto status = _idIndexBlock->commit();
+                    if (!status.isOK()) {
+                        return status;
+                    }
+                    wunit.commit();
+                    return Status::OK();
+                });
+            if (!status.isOK()) {
+                return status;
+            }
         }
         _stats.endBuildingIndexes = Date_t::now();
         LOG(2) << "Done creating indexes for ns: " << _nss.ns() << ", stats: " << _stats.toString();
@@ -256,17 +236,11 @@ Status CollectionBulkLoaderImpl::commit() {
 
 void CollectionBulkLoaderImpl::_releaseResources() {
     invariant(&cc() == _opCtx->getClient());
-    if (_secondaryIndexesBlock) {
-        // A valid Client is required to drop unfinished indexes.
-        Client::initThreadIfNotAlready();
+    if (_secondaryIndexesBlock)
         _secondaryIndexesBlock.reset();
-    }
 
-    if (_idIndexBlock) {
-        // A valid Client is required to drop unfinished indexes.
-        Client::initThreadIfNotAlready();
+    if (_idIndexBlock)
         _idIndexBlock.reset();
-    }
 
     // release locks.
     _autoColl.reset();
@@ -289,6 +263,25 @@ Status CollectionBulkLoaderImpl::_runTaskReleaseResourcesOnFailure(F task) noexc
     } catch (...) {
         std::terminate();
     }
+}
+
+Status CollectionBulkLoaderImpl::_addDocumentToIndexBlocks(const BSONObj& doc,
+                                                           const RecordId& loc) {
+    if (_idIndexBlock) {
+        auto status = _idIndexBlock->insert(doc, loc);
+        if (!status.isOK()) {
+            return status.withContext("failed to add document to _id index");
+        }
+    }
+
+    if (_secondaryIndexesBlock) {
+        auto status = _secondaryIndexesBlock->insert(doc, loc);
+        if (!status.isOK()) {
+            return status.withContext("failed to add document to secondary indexes");
+        }
+    }
+
+    return Status::OK();
 }
 
 CollectionBulkLoaderImpl::Stats CollectionBulkLoaderImpl::getStats() const {

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -46,8 +48,7 @@
 namespace mongo {
 namespace parsed_aggregation_projection {
 
-using TransformerType =
-    DocumentSourceSingleDocumentTransformation::TransformerInterface::TransformerType;
+using TransformerType = TransformerInterface::TransformerType;
 
 using expression::isPathPrefixOf;
 
@@ -150,6 +151,15 @@ void ProjectionSpecValidator::parseNestedObject(const BSONObj& thisLevelSpec,
 
 namespace {
 
+using ProjectionPolicies = ParsedAggregationProjection::ProjectionPolicies;
+using ComputedFieldsPolicy = ProjectionPolicies::ComputedFieldsPolicy;
+
+std::string makeBannedComputedFieldsErrorMessage(BSONObj projSpec) {
+    return str::stream() << "Bad projection specification, cannot use computed fields when parsing "
+                            "a spec in kBanComputedFields mode: "
+                         << projSpec.toString();
+}
+
 /**
  * This class is responsible for determining what type of $project stage it specifies.
  */
@@ -158,17 +168,18 @@ public:
     /**
      * Parses 'spec' to determine whether it is an inclusion or exclusion projection. 'Computed'
      * fields (ones which are defined by an expression or a literal) are treated as inclusion
-     * projections for in this context of the$project stage.
+     * projections for in this context of the $project stage.
      */
-    static TransformerType parse(const BSONObj& spec) {
-        ProjectTypeParser parser(spec);
+    static TransformerType parse(const BSONObj& spec, ProjectionPolicies policies) {
+        ProjectTypeParser parser(spec, policies);
         parser.parse();
         invariant(parser._parsedType);
         return *(parser._parsedType);
     }
 
 private:
-    ProjectTypeParser(const BSONObj& spec) : _rawObj(spec) {}
+    ProjectTypeParser(const BSONObj& spec, ProjectionPolicies policies)
+        : _rawObj(spec), _policies(policies) {}
 
     /**
      * Traverses '_rawObj' to determine the type of projection, populating '_parsedType' in the
@@ -192,8 +203,7 @@ private:
 
         // Default to inclusion if nothing (except maybe '_id') is explicitly included or excluded.
         if (!_parsedType) {
-            _parsedType = DocumentSourceSingleDocumentTransformation::TransformerInterface::
-                TransformerType::kInclusionProjection;
+            _parsedType = TransformerInterface::TransformerType::kInclusionProjection;
         }
     }
 
@@ -203,28 +213,46 @@ private:
      * Delegates to parseSubObject() if 'elem' is an object. Otherwise updates '_parsedType' if
      * appropriate.
      *
-     * Throws a AssertionException if this element represents a mix of projection types.
+     * Throws a AssertionException if this element represents a mix of projection types. If we are
+     * parsing in ComputedFieldsPolicy::kBanComputedFields mode, an inclusion projection
+     * which contains computed fields will also be rejected.
      */
     void parseElement(const BSONElement& elem, const FieldPath& pathToElem) {
         if (elem.type() == BSONType::Object) {
             return parseNestedObject(elem.Obj(), pathToElem);
         }
 
-        if ((elem.isBoolean() || elem.isNumber()) && !elem.trueValue()) {
-            // A top-level exclusion of "_id" is allowed in either an inclusion projection or an
-            // exclusion projection, so doesn't affect '_parsedType'.
-            if (pathToElem.fullPath() != "_id") {
-                uassert(40178,
-                        str::stream() << "Bad projection specification, cannot exclude fields "
-                                         "other than '_id' in an inclusion projection: "
+        // If this element is not a boolean or numeric value, then it is a literal value. These are
+        // illegal if we are in kBanComputedFields parse mode.
+        uassert(ErrorCodes::FailedToParse,
+                makeBannedComputedFieldsErrorMessage(_rawObj),
+                elem.isBoolean() || elem.isNumber() ||
+                    _policies.computedFieldsPolicy != ComputedFieldsPolicy::kBanComputedFields);
+
+        if (pathToElem.fullPath() == "_id") {
+            // If the _id field is a computed value, then this must be an inclusion projection. If
+            // it is numeric or boolean, then this does not determine the projection type, due to
+            // the fact that inclusions may explicitly exclude _id and exclusions may include _id.
+            if (!elem.isBoolean() && !elem.isNumber()) {
+                uassert(ErrorCodes::FailedToParse,
+                        str::stream() << "Bad projection specification, '_id' may not be a "
+                                         "computed field in an exclusion projection: "
                                       << _rawObj.toString(),
                         !_parsedType ||
-                            (*_parsedType ==
-                             DocumentSourceSingleDocumentTransformation::TransformerInterface::
-                                 TransformerType::kExclusionProjection));
-                _parsedType = DocumentSourceSingleDocumentTransformation::TransformerInterface::
-                    TransformerType::kExclusionProjection;
+                            _parsedType ==
+                                TransformerInterface::TransformerType::kInclusionProjection);
+                _parsedType = TransformerInterface::TransformerType::kInclusionProjection;
             }
+        } else if ((elem.isBoolean() || elem.isNumber()) && !elem.trueValue()) {
+            // If this is an excluded field other than '_id', ensure that the projection type has
+            // not already been set to kInclusionProjection.
+            uassert(40178,
+                    str::stream() << "Bad projection specification, cannot exclude fields "
+                                     "other than '_id' in an inclusion projection: "
+                                  << _rawObj.toString(),
+                    !_parsedType || (*_parsedType ==
+                                     TransformerInterface::TransformerType::kExclusionProjection));
+            _parsedType = TransformerInterface::TransformerType::kExclusionProjection;
         } else {
             // A boolean true, a truthy numeric value, or any expression can only be used with an
             // inclusion projection. Note that literal values like "string" or null are also treated
@@ -233,19 +261,18 @@ private:
                     str::stream() << "Bad projection specification, cannot include fields or "
                                      "add computed fields during an exclusion projection: "
                                   << _rawObj.toString(),
-                    !_parsedType ||
-                        (*_parsedType ==
-                         DocumentSourceSingleDocumentTransformation::TransformerInterface::
-                             TransformerType::kInclusionProjection));
-            _parsedType = DocumentSourceSingleDocumentTransformation::TransformerInterface::
-                TransformerType::kInclusionProjection;
+                    !_parsedType || (*_parsedType ==
+                                     TransformerInterface::TransformerType::kInclusionProjection));
+            _parsedType = TransformerInterface::TransformerType::kInclusionProjection;
         }
     }
 
     /**
      * Traverses 'thisLevelSpec', parsing each element in turn.
      *
-     * Throws a AssertionException if 'thisLevelSpec' represents an invalid mix of projections.
+     * Throws a AssertionException if 'thisLevelSpec' represents an invalid mix of projections. If
+     * we are parsing in ComputedFieldsPolicy::kBanComputedFields mode, an inclusion
+     * projection which contains computed fields will also be rejected.
      */
     void parseNestedObject(const BSONObj& thisLevelSpec, const FieldPath& prefix) {
 
@@ -254,17 +281,18 @@ private:
             if (fieldName[0] == '$') {
                 // This object is an expression specification like {$add: [...]}. It will be parsed
                 // into an Expression later, but for now, just track that the prefix has been
-                // specified and skip it.
+                // specified, validate that computed projections are legal, and skip it.
+                uassert(ErrorCodes::FailedToParse,
+                        makeBannedComputedFieldsErrorMessage(_rawObj),
+                        _policies.computedFieldsPolicy != ComputedFieldsPolicy::kBanComputedFields);
                 uassert(40182,
                         str::stream() << "Bad projection specification, cannot include fields or "
                                          "add computed fields during an exclusion projection: "
                                       << _rawObj.toString(),
                         !_parsedType ||
                             _parsedType ==
-                                DocumentSourceSingleDocumentTransformation::TransformerInterface::
-                                    TransformerType::kInclusionProjection);
-                _parsedType = DocumentSourceSingleDocumentTransformation::TransformerInterface::
-                    TransformerType::kInclusionProjection;
+                                TransformerInterface::TransformerType::kInclusionProjection);
+                _parsedType = TransformerInterface::TransformerType::kInclusionProjection;
                 continue;
             }
             parseElement(elem, FieldPath::getFullyQualifiedPath(prefix.fullPath(), fieldName));
@@ -276,19 +304,24 @@ private:
 
     // This will be populated during parse().
     boost::optional<TransformerType> _parsedType;
+
+    // Policies associated with the projection which determine its runtime behaviour.
+    ProjectionPolicies _policies;
 };
 
 }  // namespace
 
 std::unique_ptr<ParsedAggregationProjection> ParsedAggregationProjection::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const BSONObj& spec) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const BSONObj& spec,
+    ProjectionPolicies policies) {
     // Check that the specification was valid. Status returned is unspecific because validate()
     // is used by the $addFields stage as well as $project.
     // If there was an error, uassert with a $project-specific message.
     ProjectionSpecValidator::uassertValid(spec, "$project");
 
     // Check for any conflicting specifications, and determine the type of the projection.
-    auto projectionType = ProjectTypeParser::parse(spec);
+    auto projectionType = ProjectTypeParser::parse(spec, policies);
     // kComputed is a projection type reserved for $addFields, and should never be detected by the
     // ProjectTypeParser.
     invariant(projectionType != TransformerType::kComputedProjection);
@@ -296,13 +329,14 @@ std::unique_ptr<ParsedAggregationProjection> ParsedAggregationProjection::create
     // We can't use make_unique() here, since the branches have different types.
     std::unique_ptr<ParsedAggregationProjection> parsedProject(
         projectionType == TransformerType::kInclusionProjection
-            ? static_cast<ParsedAggregationProjection*>(new ParsedInclusionProjection(expCtx))
-            : static_cast<ParsedAggregationProjection*>(new ParsedExclusionProjection(expCtx)));
+            ? static_cast<ParsedAggregationProjection*>(
+                  new ParsedInclusionProjection(expCtx, policies))
+            : static_cast<ParsedAggregationProjection*>(
+                  new ParsedExclusionProjection(expCtx, policies)));
 
     // Actually parse the specification.
     parsedProject->parse(spec);
     return parsedProject;
 }
-
 }  // namespace parsed_aggregation_projection
 }  // namespace mongo

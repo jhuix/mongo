@@ -1,30 +1,33 @@
 // assert_util.cpp
 
-/*    Copyright 2009 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
@@ -32,8 +35,6 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/assert_util.h"
-
-using namespace std;
 
 #ifndef _WIN32
 #include <cxxabi.h>
@@ -60,11 +61,11 @@ AssertionCount assertionCount;
 AssertionCount::AssertionCount() : regular(0), warning(0), msg(0), user(0), rollovers(0) {}
 
 void AssertionCount::rollover() {
-    rollovers++;
-    regular = 0;
-    warning = 0;
-    msg = 0;
-    user = 0;
+    rollovers.fetchAndAdd(1);
+    regular.store(0);
+    warning.store(0);
+    msg.store(0);
+    user.store(0);
 }
 
 void AssertionCount::condrollover(int newvalue) {
@@ -77,56 +78,43 @@ AtomicBool DBException::traceExceptions(false);
 
 void DBException::traceIfNeeded(const DBException& e) {
     if (traceExceptions.load()) {
-        warning() << "DBException thrown" << causedBy(e) << endl;
+        warning() << "DBException thrown" << causedBy(e) << std::endl;
         printStackTrace();
     }
 }
 
-/* "warning" assert -- safe to continue, so we don't throw exception. */
-NOINLINE_DECL void wasserted(const char* expr, const char* file, unsigned line) {
-    static bool rateLimited;
-    static time_t lastWhen;
-    static unsigned lastLine;
-    if (lastLine == line && time(0) - lastWhen < 5) {
-        if (!rateLimited) {
-            rateLimited = true;
-            log() << "rate limiting wassert" << endl;
-        }
-        return;
-    }
-    lastWhen = time(0);
-    lastLine = line;
-
-    warning() << "warning assertion failure " << expr << ' ' << file << ' ' << dec << line << endl;
-    logContext();
-    assertionCount.condrollover(++assertionCount.warning);
-#if defined(MONGO_CONFIG_DEBUG_BUILD)
-    // this is so we notice in buildbot
-    severe() << "\n\n***aborting after wassert() failure in a debug/test build\n\n" << endl;
-    std::abort();
-#endif
-}
-
 NOINLINE_DECL void verifyFailed(const char* expr, const char* file, unsigned line) {
-    assertionCount.condrollover(++assertionCount.regular);
-    error() << "Assertion failure " << expr << ' ' << file << ' ' << dec << line << endl;
+    assertionCount.condrollover(assertionCount.regular.addAndFetch(1));
+    error() << "Assertion failure " << expr << ' ' << file << ' ' << std::dec << line << std::endl;
     logContext();
-    stringstream temp;
+    std::stringstream temp;
     temp << "assertion " << file << ":" << line;
-    AssertionException e(0, temp.str());
+
     breakpoint();
 #if defined(MONGO_CONFIG_DEBUG_BUILD)
     // this is so we notice in buildbot
-    severe() << "\n\n***aborting after verify() failure as this is a debug/test build\n\n" << endl;
+    severe() << "\n\n***aborting after verify() failure as this is a debug/test build\n\n"
+             << std::endl;
     std::abort();
 #endif
-    throw e;
+    error_details::throwExceptionForStatus(Status(ErrorCodes::UnknownError, temp.str()));
 }
 
 NOINLINE_DECL void invariantFailed(const char* expr, const char* file, unsigned line) noexcept {
-    severe() << "Invariant failure " << expr << ' ' << file << ' ' << dec << line << endl;
+    severe() << "Invariant failure " << expr << ' ' << file << ' ' << std::dec << line << std::endl;
     breakpoint();
-    severe() << "\n\n***aborting after invariant() failure\n\n" << endl;
+    severe() << "\n\n***aborting after invariant() failure\n\n" << std::endl;
+    std::abort();
+}
+
+NOINLINE_DECL void invariantFailedWithMsg(const char* expr,
+                                          const std::string& msg,
+                                          const char* file,
+                                          unsigned line) noexcept {
+    severe() << "Invariant failure " << expr << " " << msg << " " << file << ' ' << std::dec << line
+             << std::endl;
+    breakpoint();
+    severe() << "\n\n***aborting after invariant() failure\n\n" << std::endl;
     std::abort();
 }
 
@@ -135,25 +123,37 @@ NOINLINE_DECL void invariantOKFailed(const char* expr,
                                      const char* file,
                                      unsigned line) noexcept {
     severe() << "Invariant failure: " << expr << " resulted in status " << redact(status) << " at "
-             << file << ' ' << dec << line;
+             << file << ' ' << std::dec << line;
     breakpoint();
-    severe() << "\n\n***aborting after invariant() failure\n\n" << endl;
+    severe() << "\n\n***aborting after invariant() failure\n\n" << std::endl;
+    std::abort();
+}
+
+NOINLINE_DECL void invariantOKFailedWithMsg(const char* expr,
+                                            const Status& status,
+                                            const std::string& msg,
+                                            const char* file,
+                                            unsigned line) noexcept {
+    severe() << "Invariant failure: " << expr << " " << msg << " resulted in status "
+             << redact(status) << " at " << file << ' ' << std::dec << line;
+    breakpoint();
+    severe() << "\n\n***aborting after invariant() failure\n\n" << std::endl;
     std::abort();
 }
 
 NOINLINE_DECL void fassertFailedWithLocation(int msgid, const char* file, unsigned line) noexcept {
-    severe() << "Fatal Assertion " << msgid << " at " << file << " " << dec << line;
+    severe() << "Fatal Assertion " << msgid << " at " << file << " " << std::dec << line;
     breakpoint();
-    severe() << "\n\n***aborting after fassert() failure\n\n" << endl;
+    severe() << "\n\n***aborting after fassert() failure\n\n" << std::endl;
     std::abort();
 }
 
 NOINLINE_DECL void fassertFailedNoTraceWithLocation(int msgid,
                                                     const char* file,
                                                     unsigned line) noexcept {
-    severe() << "Fatal Assertion " << msgid << " at " << file << " " << dec << line;
+    severe() << "Fatal Assertion " << msgid << " at " << file << " " << std::dec << line;
     breakpoint();
-    severe() << "\n\n***aborting after fassert() failure\n\n" << endl;
+    severe() << "\n\n***aborting after fassert() failure\n\n" << std::endl;
     quickExit(EXIT_ABRUPT);
 }
 
@@ -161,10 +161,10 @@ MONGO_COMPILER_NORETURN void fassertFailedWithStatusWithLocation(int msgid,
                                                                  const Status& status,
                                                                  const char* file,
                                                                  unsigned line) noexcept {
-    severe() << "Fatal assertion " << msgid << " " << redact(status) << " at " << file << " " << dec
-             << line;
+    severe() << "Fatal assertion " << msgid << " " << redact(status) << " at " << file << " "
+             << std::dec << line;
     breakpoint();
-    severe() << "\n\n***aborting after fassert() failure\n\n" << endl;
+    severe() << "\n\n***aborting after fassert() failure\n\n" << std::endl;
     std::abort();
 }
 
@@ -172,31 +172,23 @@ MONGO_COMPILER_NORETURN void fassertFailedWithStatusNoTraceWithLocation(int msgi
                                                                         const Status& status,
                                                                         const char* file,
                                                                         unsigned line) noexcept {
-    severe() << "Fatal assertion " << msgid << " " << redact(status) << " at " << file << " " << dec
-             << line;
+    severe() << "Fatal assertion " << msgid << " " << redact(status) << " at " << file << " "
+             << std::dec << line;
     breakpoint();
-    severe() << "\n\n***aborting after fassert() failure\n\n" << endl;
+    severe() << "\n\n***aborting after fassert() failure\n\n" << std::endl;
     quickExit(EXIT_ABRUPT);
 }
 
-NOINLINE_DECL void uassertedWithLocation(int msgid,
-                                         StringData msg,
-                                         const char* file,
-                                         unsigned line) {
-    assertionCount.condrollover(++assertionCount.user);
-    LOG(1) << "User Assertion: " << msgid << ":" << redact(msg) << ' ' << file << ' ' << dec << line
-           << endl;
-    throw AssertionException(msgid, msg);
+NOINLINE_DECL void uassertedWithLocation(const Status& status, const char* file, unsigned line) {
+    assertionCount.condrollover(assertionCount.user.addAndFetch(1));
+    LOG(1) << "User Assertion: " << redact(status) << ' ' << file << ' ' << std::dec << line;
+    error_details::throwExceptionForStatus(status);
 }
 
-NOINLINE_DECL void msgassertedWithLocation(int msgid,
-                                           StringData msg,
-                                           const char* file,
-                                           unsigned line) {
-    assertionCount.condrollover(++assertionCount.msg);
-    error() << "Assertion: " << msgid << ":" << redact(msg) << ' ' << file << ' ' << dec << line
-            << endl;
-    throw AssertionException(msgid, msg);
+NOINLINE_DECL void msgassertedWithLocation(const Status& status, const char* file, unsigned line) {
+    assertionCount.condrollover(assertionCount.msg.addAndFetch(1));
+    error() << "Assertion: " << redact(status) << ' ' << file << ' ' << std::dec << line;
+    error_details::throwExceptionForStatus(status);
 }
 
 std::string causedBy(StringData e) {
@@ -228,7 +220,7 @@ std::string causedBy(const Status& e) {
     return causedBy(e.toString());
 }
 
-string demangleName(const type_info& typeinfo) {
+std::string demangleName(const std::type_info& typeinfo) {
 #ifdef _WIN32
     return typeinfo.name();
 #else
@@ -238,7 +230,7 @@ string demangleName(const type_info& typeinfo) {
     if (!niceName)
         return typeinfo.name();
 
-    string s = niceName;
+    std::string s = niceName;
     free(niceName);
     return s;
 #endif

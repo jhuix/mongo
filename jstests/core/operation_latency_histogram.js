@@ -1,4 +1,18 @@
 // Checks that histogram counters for collections are updated as we expect.
+//
+// This test attempts to perform write operations and get latency statistics using the $collStats
+// stage. The former operation must be routed to the primary in a replica set, whereas the latter
+// may be routed to a secondary. This is incompatible with embedded right now since the command
+// compact does not exist on such storage engines.
+//
+// @tags: [
+//     assumes_read_preference_unchanged,
+//     requires_collstats,
+//     incompatible_with_embedded,
+// ]
+//
+// TODO (SERVER-36055): Correct error code reported when run on mobile, and then we can remove the
+// tag incompatible_with_embedded.
 
 (function() {
     "use strict";
@@ -67,7 +81,15 @@
     for (var i = 0; i < numRecords - 1; i++) {
         cursors[i].close();
     }
-    lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 0, numRecords - 1);
+    try {
+        // Each close may result in two commands in latencyStats due to separate
+        // pinning during auth check and execution.
+        lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 0, 2 * (numRecords - 1));
+    } catch (e) {
+        // Increment last reads to account for extra getstats call
+        ++lastHistogram.reads.ops;
+        lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 0, numRecords - 1);
+    }
 
     // Remove
     for (var i = 0; i < numRecords; i++) {
@@ -93,28 +115,25 @@
     }
     lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, numRecords, 0, 0);
 
-    // Group
-    testColl.group({initial: {}, reduce: function() {}, key: {a: 1}});
-    lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 1, 0, 0);
-
-    // ParallelCollectionScan
-    testDB.runCommand({parallelCollectionScan: testColl.getName(), numCursors: 5});
-    lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 0, 1);
-
     // FindAndModify
     testColl.findAndModify({query: {}, update: {pt: {type: "Point", coordinates: [0, 0]}}});
     lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 1, 0);
 
     // CreateIndex
     assert.commandWorked(testColl.createIndex({pt: "2dsphere"}));
-    // TODO SERVER-24705: createIndex is not currently counted in Top.
-    lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 0, 0);
+    lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 0, 0, 1);
 
-    // GeoNear
+    // $geoNear aggregation stage
     assert.commandWorked(testDB.runCommand({
-        geoNear: testColl.getName(),
-        near: {type: "Point", coordinates: [0, 0]},
-        spherical: true
+        aggregate: testColl.getName(),
+        pipeline: [{
+            $geoNear: {
+                near: {type: "Point", coordinates: [0, 0]},
+                spherical: true,
+                distanceField: "dist",
+            }
+        }],
+        cursor: {},
     }));
     lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 1, 0, 0);
 

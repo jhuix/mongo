@@ -1,29 +1,31 @@
+
 /**
- *    Copyright 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -53,9 +55,7 @@ public:
     static const char kFindCommandName[];
     static const char kShardVersionField[];
 
-    QueryRequest(NamespaceString nss);
-
-    QueryRequest(CollectionUUID uuid);
+    explicit QueryRequest(NamespaceStringOrUUID nss);
 
     /**
      * Returns a non-OK status if any property of the QR has a bad value (e.g. a negative skip
@@ -85,9 +85,12 @@ public:
 
     /**
      * Converts this QR into a find command.
+     * The withUuid variants make a UUID-based find command instead of a namespace-based ones.
      */
     BSONObj asFindCommand() const;
+    BSONObj asFindCommandWithUuid() const;
     void asFindCommand(BSONObjBuilder* cmdBuilder) const;
+    void asFindCommandWithUuid(BSONObjBuilder* cmdBuilder) const;
 
     /**
      * Converts this QR into an aggregation using $match. If this QR has options that cannot be
@@ -114,12 +117,6 @@ public:
      * 3. isTextScoreMeta
      */
     static bool isValidSortOrder(const BSONObj& sortObj);
-
-    /**
-     * Returns true if the query described by "query" should execute
-     * at an elevated level of isolation (i.e., $isolated was specified).
-     */
-    static bool isQueryIsolated(const BSONObj& query);
 
     // Read preference is attached to commands in "wrapped" form, e.g.
     //   { $query: { <cmd>: ... } , <kWrappedReadPrefField>: { ... } }
@@ -268,14 +265,6 @@ public:
         _unwrappedReadPref = unwrappedReadPref.getOwned();
     }
 
-    int getMaxScan() const {
-        return _maxScan;
-    }
-
-    void setMaxScan(int maxScan) {
-        _maxScan = maxScan;
-    }
-
     int getMaxTimeMS() const {
         return _maxTimeMS;
     }
@@ -316,14 +305,6 @@ public:
         _showRecordId = showRecordId;
     }
 
-    bool isSnapshot() const {
-        return _snapshot;
-    }
-
-    void setSnapshot(bool snapshot) {
-        _snapshot = snapshot;
-    }
-
     bool hasReadPref() const {
         return _hasReadPref;
     }
@@ -333,19 +314,19 @@ public:
     }
 
     bool isTailable() const {
-        return _tailableMode == TailableMode::kTailable ||
-            _tailableMode == TailableMode::kTailableAndAwaitData;
+        return _tailableMode == TailableModeEnum::kTailable ||
+            _tailableMode == TailableModeEnum::kTailableAndAwaitData;
     }
 
     bool isTailableAndAwaitData() const {
-        return _tailableMode == TailableMode::kTailableAndAwaitData;
+        return _tailableMode == TailableModeEnum::kTailableAndAwaitData;
     }
 
-    void setTailableMode(TailableMode tailableMode) {
+    void setTailableMode(TailableModeEnum tailableMode) {
         _tailableMode = tailableMode;
     }
 
-    TailableMode getTailableMode() const {
+    TailableModeEnum getTailableMode() const {
         return _tailableMode;
     }
 
@@ -397,6 +378,22 @@ public:
         _replicationTerm = replicationTerm;
     }
 
+    bool isReadOnce() const {
+        return _readOnce;
+    }
+
+    void setReadOnce(bool readOnce) {
+        _readOnce = readOnce;
+    }
+
+    void setAllowSpeculativeMajorityRead(bool allowSpeculativeMajorityRead) {
+        _allowSpeculativeMajorityRead = allowSpeculativeMajorityRead;
+    }
+
+    bool allowSpeculativeMajorityRead() const {
+        return _allowSpeculativeMajorityRead;
+    }
+
     /**
      * Return options as a bit vector.
      */
@@ -415,7 +412,7 @@ public:
     /**
      * Parse the provided legacy query object and parameters to construct a QueryRequest.
      */
-    static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQuery(NamespaceString nss,
+    static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQuery(NamespaceStringOrUUID nsOrUuid,
                                                                      const BSONObj& queryObj,
                                                                      const BSONObj& proj,
                                                                      int ntoskip,
@@ -455,6 +452,11 @@ private:
      * Add the meta projection to this object if needed.
      */
     void addMetaProjection();
+
+    /**
+     * Common code for UUID and namespace-based find commands.
+     */
+    void asFindCommandInternal(BSONObjBuilder* cmdBuilder) const;
 
     NamespaceString _nss;
     OptionalCollectionUUID _uuid;
@@ -499,8 +501,6 @@ private:
 
     std::string _comment;
 
-    int _maxScan = 0;
-
     // A user-specified maxTimeMS limit, or a value of '0' if not specified.
     int _maxTimeMS = 0;
 
@@ -509,16 +509,17 @@ private:
 
     bool _returnKey = false;
     bool _showRecordId = false;
-    bool _snapshot = false;
     bool _hasReadPref = false;
 
     // Options that can be specified in the OP_QUERY 'flags' header.
-    TailableMode _tailableMode = TailableMode::kNormal;
+    TailableModeEnum _tailableMode = TailableModeEnum::kNormal;
     bool _slaveOk = false;
     bool _oplogReplay = false;
     bool _noCursorTimeout = false;
     bool _exhaust = false;
     bool _allowPartialResults = false;
+    bool _readOnce = false;
+    bool _allowSpeculativeMajorityRead = false;
 
     boost::optional<long long> _replicationTerm;
 };

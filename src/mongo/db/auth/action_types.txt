@@ -5,7 +5,7 @@
 # This means that the integer value assigned to each ActionType and used internally in ActionSet
 # also may change between versions.
 ["addShard",
-"advanceLogicalTime",
+"advanceClusterTime",
 "anyAction", # Special ActionType that represents *all* actions
 "appendOplogNote",
 "applicationMessage",
@@ -19,6 +19,7 @@
 "changeOwnPassword",
 "changeOwnCustomData",
 "changeStream",
+"checkFreeMonitoringStatus",
 "cleanupOrphaned",
 "closeAllDatabases",  # Deprecated, needs to stay around for backwards compatibility
 "collMod",
@@ -38,6 +39,7 @@
 "dropAllRolesFromDatabase",  # Not used for permissions checks, but to id the event in logs.
 "dropAllUsersFromDatabase",  # Not used for permissions checks, but to id the event in logs.
 "dropCollection",
+"dropConnections",
 "dropDatabase",
 "dropIndex",
 "dropRole",
@@ -47,7 +49,9 @@
 "enableSharding",
 "find",
 "flushRouterConfig",
+"forceUUID",
 "fsync",
+"getDatabaseVersion",
 "getCmdLineOpts",
 "getLog",
 "getParameter",
@@ -64,9 +68,11 @@
 "insert",
 "internal", # Special action type that represents internal actions
 "invalidateUserCache",
+"killAnyCursor",
 "killAnySession",
-"killCursors",
+"killCursors", # Deprecated in favor of killAnyCursor
 "killop",
+"listCachedAndActiveUsers",
 "listCollections",
 "listCursors",
 "listDatabases",
@@ -84,7 +90,6 @@
 "removeShard",
 "renameCollection",  # Not used for permissions checks, but to id the event in logs.
 "renameCollectionSameDB",
-"repairDatabase",
 "replSetConfigure",
 "replSetGetConfig",
 "replSetGetStatus",
@@ -99,6 +104,8 @@
 "revokeRolesFromUser",  # Not used for permissions checks, but to id the event in logs.
 "serverStatus",
 "setAuthenticationRestriction",
+"setFeatureCompatibilityVersion",
+"setFreeMonitoring",
 "setParameter",
 "shardCollection",  # Not used for permissions checks, but to id the event in logs.
 "shardingState",
@@ -116,4 +123,3 @@
 "validate",
 "viewRole",
 "viewUser"]
-

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +28,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationInitialSync
 
 #include "mongo/platform/basic.h"
 
@@ -52,32 +54,38 @@ namespace mongo {
 namespace repl {
 
 // Failpoint which causes the initial sync function to hang before running listCollections.
-MONGO_FP_DECLARE(initialSyncHangBeforeListCollections);
+MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeListCollections);
 
 namespace {
 
 using LockGuard = stdx::lock_guard<stdx::mutex>;
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using executor::RemoteCommandRequest;
 
 const char* kNameFieldName = "name";
 const char* kOptionsFieldName = "options";
 const char* kInfoFieldName = "info";
 const char* kUUIDFieldName = "uuid";
-// 16MB max batch size / 12 byte min doc size * 10 (for good measure) = defaultBatchSize to use.
-const auto defaultBatchSize = (16 * 1024 * 1024) / 12 * 10;
 
-// The batchSize to use for the find/getMore queries called by the CollectionCloner
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(collectionClonerBatchSize, int, defaultBatchSize);
+// The batch size (number of documents) to use for the queries in the CollectionCloner.  Default of
+// 0 means the limit is the number of documents which fit in a single BSON object.
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(collectionClonerBatchSize, int, 0)
+    ->withValidator([](const int& batchSize) {
+        return (batchSize >= 0)
+            ? Status::OK()
+            : Status(ErrorCodes::Error(50952),
+                     str::stream()
+                         << "collectionClonerBatchSize must be greater than or equal to 0. '"
+                         << batchSize
+                         << "' is an invalid setting.");
+    });
 
 // The number of attempts for the listCollections commands.
 MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncListCollectionsAttempts, int, 3);
 
-// The number of cursors to use in the collection cloning process.
-MONGO_EXPORT_SERVER_PARAMETER(maxNumInitialSyncCollectionClonerCursors, int, 1);
-
 // Failpoint which causes initial sync to hang right after listCollections, but before cloning
 // any colelctions in the 'database' database.
-MONGO_FP_DECLARE(initialSyncHangAfterListCollections);
+MONGO_FAIL_POINT_DEFINE(initialSyncHangAfterListCollections);
 
 /**
  * Default listCollections predicate.
@@ -101,14 +109,14 @@ BSONObj createListCollectionsCommandObject(const BSONObj& filter) {
 }  // namespace
 
 DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
-                               OldThreadPool* dbWorkThreadPool,
+                               ThreadPool* dbWorkThreadPool,
                                const HostAndPort& source,
                                const std::string& dbname,
                                const BSONObj& listCollectionsFilter,
                                const ListCollectionsPredicateFn& listCollectionsPred,
                                StorageInterface* si,
                                const CollectionCallbackFn& collWork,
-                               const CallbackFn& onCompletion)
+                               CallbackFn onCompletion)
     : _executor(executor),
       _dbWorkThreadPool(dbWorkThreadPool),
       _source(source),
@@ -120,16 +128,16 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
       _listCollectionsPredicate(listCollectionsPred ? listCollectionsPred : acceptAllPred),
       _storageInterface(si),
       _collectionWork(collWork),
-      _onCompletion(onCompletion),
+      _onCompletion(std::move(onCompletion)),
       _listCollectionsFetcher(_executor,
                               _source,
                               _dbname,
                               createListCollectionsCommandObject(_listCollectionsFilter),
-                              stdx::bind(&DatabaseCloner::_listCollectionsCallback,
-                                         this,
-                                         stdx::placeholders::_1,
-                                         stdx::placeholders::_2,
-                                         stdx::placeholders::_3),
+                              [=](const StatusWith<Fetcher::QueryResponse>& result,
+                                  Fetcher::NextAction * nextAction,
+                                  BSONObjBuilder * getMoreBob) {
+                                  _listCollectionsCallback(result, nextAction, getMoreBob);
+                              },
                               ReadPreferenceSetting::secondaryPreferredMetadata(),
                               RemoteCommandRequest::kNoTimeout /* find network timeout */,
                               RemoteCommandRequest::kNoTimeout /* getMore network timeout */,
@@ -144,7 +152,7 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
     uassert(ErrorCodes::BadValue, "empty database name", !dbname.empty());
     uassert(ErrorCodes::BadValue, "storage interface cannot be null", si);
     uassert(ErrorCodes::BadValue, "collection callback function cannot be null", collWork);
-    uassert(ErrorCodes::BadValue, "callback function cannot be null", onCompletion);
+    uassert(ErrorCodes::BadValue, "callback function cannot be null", _onCompletion);
 
     _stats.dbname = _dbname;
 }
@@ -251,7 +259,7 @@ void DatabaseCloner::join() {
     _condition.wait(lk, [this]() { return !_isActive_inlock(); });
 }
 
-void DatabaseCloner::setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& work) {
+void DatabaseCloner::setScheduleDbWorkFn_forTest(const ScheduleDbWorkFn& work) {
     LockGuard lk(_mutex);
 
     _scheduleDbWorkFn = work;
@@ -271,13 +279,10 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
                                               Fetcher::NextAction* nextAction,
                                               BSONObjBuilder* getMoreBob) {
     if (!result.isOK()) {
-        _finishCallback({result.getStatus().code(),
-                         str::stream() << "While issuing listCollections on db '" << _dbname
-                                       << "' (host:"
-                                       << _source.toString()
-                                       << ") there was an error '"
-                                       << result.getStatus().reason()
-                                       << "'"});
+        _finishCallback(result.getStatus().withContext(
+            str::stream() << "Error issuing listCollections on db '" << _dbname << "' (host:"
+                          << _source.toString()
+                          << ")"));
         return;
     }
 
@@ -341,7 +346,7 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
         const std::string collectionName = nameElement.String();
         if (seen.find(collectionName) != seen.end()) {
             _finishCallback_inlock(lk,
-                                   {ErrorCodes::DuplicateKey,
+                                   {ErrorCodes::Error(51005),
                                     str::stream()
                                         << "collection info contains duplicate collection name "
                                         << "'"
@@ -403,11 +408,9 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
                 _source,
                 nss,
                 options,
-                stdx::bind(
-                    &DatabaseCloner::_collectionClonerCallback, this, stdx::placeholders::_1, nss),
+                [=](const Status& status) { return _collectionClonerCallback(status, nss); },
                 _storageInterface,
-                collectionClonerBatchSize,
-                maxNumInitialSyncCollectionClonerCursors.load());
+                collectionClonerBatchSize);
         } catch (const AssertionException& ex) {
             _finishCallback_inlock(lk, ex.toStatus());
             return;
@@ -435,25 +438,29 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
 }
 
 void DatabaseCloner::_collectionClonerCallback(const Status& status, const NamespaceString& nss) {
-    auto newStatus = status;
-
     UniqueLock lk(_mutex);
+    auto collStatus = Status::OK();
+
+    // Record failure, but do not return just yet, in case we want to do some logging.
     if (!status.isOK()) {
-        newStatus = {status.code(),
-                     str::stream() << "While cloning collection '" << nss.toString()
-                                   << "' there was an error '"
-                                   << status.reason()
-                                   << "'"};
-        _failedNamespaces.push_back({newStatus, nss});
+        collStatus = status.withContext(
+            str::stream() << "Error cloning collection '" << nss.toString() << "'");
     }
-    ++_stats.clonedCollections;
 
     // Forward collection cloner result to caller.
-    // Failure to clone a collection does not stop the database cloner
-    // from cloning the rest of the collections in the listCollections result.
     lk.unlock();
-    _collectionWork(newStatus, nss);
+    _collectionWork(collStatus, nss);
     lk.lock();
+
+    // Failure to clone a collection will stop the database cloner from
+    // cloning the rest of the collections in the listCollections result.
+    if (!collStatus.isOK()) {
+        Status failStatus = {ErrorCodes::InitialSyncFailure, collStatus.toString()};
+        _finishCallback_inlock(lk, failStatus);
+        return;
+    }
+
+    ++_stats.clonedCollections;
     _currentCollectionClonerIter++;
 
     if (_currentCollectionClonerIter != _collectionCloners.end()) {
@@ -468,16 +475,7 @@ void DatabaseCloner::_collectionClonerCallback(const Status& status, const Names
         return;
     }
 
-    Status finalStatus(Status::OK());
-    if (_failedNamespaces.size() > 0) {
-        finalStatus = {ErrorCodes::InitialSyncFailure,
-                       str::stream() << "Failed to clone " << _failedNamespaces.size()
-                                     << " collection(s) in '"
-                                     << _dbname
-                                     << "' from "
-                                     << _source.toString()};
-    }
-    _finishCallback_inlock(lk, finalStatus);
+    _finishCallback_inlock(lk, Status::OK());
 }
 
 void DatabaseCloner::_finishCallback(const Status& status) {

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,7 +39,8 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/keys_collection_manager_sharding.h"
+#include "mongo/db/keys_collection_manager.h"
+#include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
@@ -51,12 +54,12 @@ const auto getLogicalClockValidator =
 
 stdx::mutex validatorMutex;  // protects access to decoration instance of LogicalTimeValidator.
 
-std::vector<Privilege> advanceLogicalClockPrivilege;
+std::vector<Privilege> advanceClusterTimePrivilege;
 
-MONGO_INITIALIZER(InitializeAdvanceLogicalClockPrivilegeVector)(InitializerContext* const) {
+MONGO_INITIALIZER(InitializeAdvanceClusterTimePrivilegeVector)(InitializerContext* const) {
     ActionSet actions;
-    actions.addAction(ActionType::internal);
-    advanceLogicalClockPrivilege.emplace_back(ResourcePattern::forClusterResource(), actions);
+    actions.addAction(ActionType::advanceClusterTime);
+    advanceClusterTimePrivilege.emplace_back(ResourcePattern::forClusterResource(), actions);
     return Status::OK();
 }
 
@@ -80,8 +83,7 @@ void LogicalTimeValidator::set(ServiceContext* service,
     validator = std::move(newValidator);
 }
 
-LogicalTimeValidator::LogicalTimeValidator(
-    std::shared_ptr<KeysCollectionManagerSharding> keyManager)
+LogicalTimeValidator::LogicalTimeValidator(std::shared_ptr<KeysCollectionManager> keyManager)
     : _keyManager(keyManager) {}
 
 SignedLogicalTime LogicalTimeValidator::_getProof(const KeysCollectionDocument& keyDoc,
@@ -125,7 +127,7 @@ SignedLogicalTime LogicalTimeValidator::signLogicalTime(OperationContext* opCtx,
     auto keyStatusWith = keyManager->getKeyForSigning(nullptr, newTime);
     auto keyStatus = keyStatusWith.getStatus();
 
-    while (keyStatus == ErrorCodes::KeyNotFound) {
+    while (keyStatus == ErrorCodes::KeyNotFound && LogicalClock::get(opCtx)->isEnabled()) {
         keyManager->refreshNow(opCtx);
 
         keyStatusWith = keyManager->getKeyForSigning(nullptr, newTime);
@@ -143,7 +145,7 @@ SignedLogicalTime LogicalTimeValidator::signLogicalTime(OperationContext* opCtx,
 Status LogicalTimeValidator::validate(OperationContext* opCtx, const SignedLogicalTime& newTime) {
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        if (newTime.getTime() == _lastSeenValidTime.getTime()) {
+        if (newTime.getTime() <= _lastSeenValidTime.getTime()) {
             return Status::OK();
         }
     }
@@ -172,7 +174,10 @@ void LogicalTimeValidator::init(ServiceContext* service) {
 }
 
 void LogicalTimeValidator::shutDown() {
-    _getKeyManagerCopy()->stopMonitoring();
+    stdx::lock_guard<stdx::mutex> lk(_mutexKeyManager);
+    if (_keyManager) {
+        _keyManager->stopMonitoring();
+    }
 }
 
 void LogicalTimeValidator::enableKeyGenerator(OperationContext* opCtx, bool doEnable) {
@@ -184,39 +189,41 @@ bool LogicalTimeValidator::isAuthorizedToAdvanceClock(OperationContext* opCtx) {
     // Note: returns true if auth is off, courtesy of
     // AuthzSessionExternalStateServerCommon::shouldIgnoreAuthChecks.
     return AuthorizationSession::get(client)->isAuthorizedForPrivileges(
-        advanceLogicalClockPrivilege);
+        advanceClusterTimePrivilege);
 }
 
 bool LogicalTimeValidator::shouldGossipLogicalTime() {
     return _getKeyManagerCopy()->hasSeenKeys();
 }
 
-void LogicalTimeValidator::forceKeyRefreshNow(OperationContext* opCtx) {
-    _getKeyManagerCopy()->refreshNow(opCtx);
-}
-
-void LogicalTimeValidator::resetKeyManagerCache(ServiceContext* service) {
-    log() << "XXX resetting key manager cache";
-    if (auto keyManager = _getKeyManagerCopy()) {
-        keyManager->stopMonitoring();
-        keyManager->startMonitoring(service);
-        _lastSeenValidTime = SignedLogicalTime();
-        _timeProofService.resetCache();
+void LogicalTimeValidator::resetKeyManagerCache() {
+    log() << "Resetting key manager cache";
+    {
+        stdx::lock_guard<stdx::mutex> keyManagerLock(_mutexKeyManager);
+        invariant(_keyManager);
+        _keyManager->clearCache();
     }
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _lastSeenValidTime = SignedLogicalTime();
+    _timeProofService.resetCache();
 }
 
-void LogicalTimeValidator::resetKeyManager() {
-    log() << "XXX resetting key manager";
-    stdx::lock_guard<stdx::mutex> lk(_mutexKeyManager);
+void LogicalTimeValidator::stopKeyManager() {
+    stdx::lock_guard<stdx::mutex> keyManagerLock(_mutexKeyManager);
     if (_keyManager) {
+        log() << "Stopping key manager";
         _keyManager->stopMonitoring();
-        _keyManager.reset();
+        _keyManager->clearCache();
+
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         _lastSeenValidTime = SignedLogicalTime();
         _timeProofService.resetCache();
+    } else {
+        log() << "Stopping key manager: no key manager exists.";
     }
 }
 
-std::shared_ptr<KeysCollectionManagerSharding> LogicalTimeValidator::_getKeyManagerCopy() {
+std::shared_ptr<KeysCollectionManager> LogicalTimeValidator::_getKeyManagerCopy() {
     stdx::lock_guard<stdx::mutex> lk(_mutexKeyManager);
     invariant(_keyManager);
     return _keyManager;

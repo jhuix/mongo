@@ -1,25 +1,27 @@
 // kv_collection_catalog_entry.cpp
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -55,7 +57,7 @@ public:
     AddIndexChange(OperationContext* opCtx, KVCollectionCatalogEntry* cce, StringData ident)
         : _opCtx(opCtx), _cce(cce), _ident(ident.toString()) {}
 
-    virtual void commit() {}
+    virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
         // Intentionally ignoring failure.
         _cce->_engine->dropIdent(_opCtx, _ident).transitional_ignore();
@@ -72,7 +74,7 @@ public:
         : _opCtx(opCtx), _cce(cce), _ident(ident.toString()) {}
 
     virtual void rollback() {}
-    virtual void commit() {
+    virtual void commit(boost::optional<Timestamp>) {
         // Intentionally ignoring failure here. Since we've removed the metadata pointing to the
         // index, we should never see it again anyway.
         _cce->_engine->dropIdent(_opCtx, _ident).transitional_ignore();
@@ -151,6 +153,15 @@ bool KVCollectionCatalogEntry::setIndexIsMultikey(OperationContext* opCtx,
     return true;
 }
 
+void KVCollectionCatalogEntry::setIndexKeyStringWithLongTypeBitsExistsOnDisk(
+    OperationContext* opCtx) {
+    const auto feature =
+        KVCatalog::FeatureTracker::RepairableFeature::kIndexKeyStringWithLongTypeBits;
+    if (!_catalog->getFeatureTracker()->isRepairableFeatureInUse(opCtx, feature)) {
+        _catalog->getFeatureTracker()->markRepairableFeatureAsInUse(opCtx, feature);
+    }
+}
+
 void KVCollectionCatalogEntry::setIndexHead(OperationContext* opCtx,
                                             StringData indexName,
                                             const RecordId& newHead) {
@@ -178,11 +189,13 @@ Status KVCollectionCatalogEntry::removeIndex(OperationContext* opCtx, StringData
 }
 
 Status KVCollectionCatalogEntry::prepareForIndexBuild(OperationContext* opCtx,
-                                                      const IndexDescriptor* spec) {
+                                                      const IndexDescriptor* spec,
+                                                      bool isBackgroundSecondaryBuild) {
     MetaData md = _getMetaData(opCtx);
 
     KVPrefix prefix = KVPrefix::getNextPrefix(ns());
-    IndexMetaData imd(spec->infoObj(), false, RecordId(), false, prefix);
+    IndexMetaData imd(
+        spec->infoObj(), false, RecordId(), false, prefix, isBackgroundSecondaryBuild);
     if (indexTypeSupportsPathLevelMultikeyTracking(spec->getAccessMethodName())) {
         const auto feature =
             KVCatalog::FeatureTracker::RepairableFeature::kPathLevelMultikeyTracking;
@@ -231,44 +244,17 @@ void KVCollectionCatalogEntry::updateTTLSetting(OperationContext* opCtx,
     _catalog->putMetaData(opCtx, ns().toString(), md);
 }
 
-void KVCollectionCatalogEntry::addUUID(OperationContext* opCtx,
-                                       CollectionUUID uuid,
-                                       Collection* coll) {
-    // Add a UUID to CollectionOptions if a UUID does not yet exist.
-    MetaData md = _getMetaData(opCtx);
-    if (!md.options.uuid) {
-        md.options.uuid = uuid;
-        _catalog->putMetaData(opCtx, ns().toString(), md);
-        UUIDCatalog& catalog = UUIDCatalog::get(opCtx->getServiceContext());
-        catalog.onCreateCollection(opCtx, coll, uuid);
-    } else {
-        fassert(40564, md.options.uuid.get() == uuid);
-    }
-}
-
-void KVCollectionCatalogEntry::removeUUID(OperationContext* opCtx) {
-    // Remove the UUID from CollectionOptions if a UUID exists.
-    MetaData md = _getMetaData(opCtx);
-    if (md.options.uuid) {
-        CollectionUUID uuid = md.options.uuid.get();
-        md.options.uuid = boost::none;
-        _catalog->putMetaData(opCtx, ns().toString(), md);
-        UUIDCatalog& catalog = UUIDCatalog::get(opCtx->getServiceContext());
-        Collection* coll = catalog.lookupCollectionByUUID(uuid);
-        if (coll) {
-            catalog.onDropCollection(opCtx, uuid);
-        }
-    }
+void KVCollectionCatalogEntry::updateIndexMetadata(OperationContext* opCtx,
+                                                   const IndexDescriptor* desc) {
+    // Update any metadata Ident has for this index
+    const string ident = _catalog->getIndexIdent(opCtx, ns().ns(), desc->indexName());
+    _engine->alterIdentMetadata(opCtx, ident, desc);
 }
 
 bool KVCollectionCatalogEntry::isEqualToMetadataUUID(OperationContext* opCtx,
                                                      OptionalCollectionUUID uuid) {
     MetaData md = _getMetaData(opCtx);
-    if (uuid) {
-        return md.options.uuid && md.options.uuid.get() == uuid.get();
-    } else {
-        return !md.options.uuid;
-    }
+    return md.options.uuid && md.options.uuid == uuid;
 }
 
 void KVCollectionCatalogEntry::updateFlags(OperationContext* opCtx, int newValue) {

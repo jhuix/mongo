@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +43,8 @@ using std::vector;
 
 namespace str = mongoutils::str;
 
+constexpr DepsTracker::MetadataAvailable DepsTracker::kAllGeoNearDataAvailable;
+
 bool DepsTracker::_appendMetaProjections(BSONObjBuilder* projectionBuilder) const {
     if (_needTextScore) {
         projectionBuilder->append(Document::metaFieldTextScore,
@@ -52,7 +56,17 @@ bool DepsTracker::_appendMetaProjections(BSONObjBuilder* projectionBuilder) cons
                                   BSON("$meta"
                                        << "sortKey"));
     }
-    return (_needTextScore || _needSortKey);
+    if (_needGeoNearDistance) {
+        projectionBuilder->append(Document::metaFieldGeoNearDistance,
+                                  BSON("$meta"
+                                       << "geoNearDistance"));
+    }
+    if (_needGeoNearPoint) {
+        projectionBuilder->append(Document::metaFieldGeoNearPoint,
+                                  BSON("$meta"
+                                       << "geoNearPoint"));
+    }
+    return (_needTextScore || _needSortKey || _needGeoNearDistance || _needGeoNearPoint);
 }
 
 BSONObj DepsTracker::toProjection() const {
@@ -132,6 +146,81 @@ boost::optional<ParsedDeps> DepsTracker::toParsedDeps() const {
     }
 
     return ParsedDeps(md.freeze());
+}
+
+bool DepsTracker::getNeedsMetadata(MetadataType type) const {
+    switch (type) {
+        case MetadataType::TEXT_SCORE:
+            return _needTextScore;
+        case MetadataType::SORT_KEY:
+            return _needSortKey;
+        case MetadataType::GEO_NEAR_DISTANCE:
+            return _needGeoNearDistance;
+        case MetadataType::GEO_NEAR_POINT:
+            return _needGeoNearPoint;
+    }
+    MONGO_UNREACHABLE;
+}
+
+bool DepsTracker::isMetadataAvailable(MetadataType type) const {
+    switch (type) {
+        case MetadataType::TEXT_SCORE:
+            return _metadataAvailable & MetadataAvailable::kTextScore;
+        case MetadataType::SORT_KEY:
+            MONGO_UNREACHABLE;
+        case MetadataType::GEO_NEAR_DISTANCE:
+            return _metadataAvailable & MetadataAvailable::kGeoNearDistance;
+        case MetadataType::GEO_NEAR_POINT:
+            return _metadataAvailable & MetadataAvailable::kGeoNearPoint;
+    }
+    MONGO_UNREACHABLE;
+}
+
+void DepsTracker::setNeedsMetadata(MetadataType type, bool required) {
+    switch (type) {
+        case MetadataType::TEXT_SCORE:
+            uassert(40218,
+                    "pipeline requires text score metadata, but there is no text score available",
+                    !required || isMetadataAvailable(type));
+            _needTextScore = required;
+            return;
+        case MetadataType::SORT_KEY:
+            invariant(required || !_needSortKey);
+            _needSortKey = required;
+            return;
+        case MetadataType::GEO_NEAR_DISTANCE:
+            uassert(50860,
+                    "pipeline requires $geoNear distance metadata, but it is not available",
+                    !required || isMetadataAvailable(type));
+            invariant(required || !_needGeoNearDistance);
+            _needGeoNearDistance = required;
+            return;
+        case MetadataType::GEO_NEAR_POINT:
+            uassert(50859,
+                    "pipeline requires $geoNear point metadata, but it is not available",
+                    !required || isMetadataAvailable(type));
+            invariant(required || !_needGeoNearPoint);
+            _needGeoNearPoint = required;
+            return;
+    }
+    MONGO_UNREACHABLE;
+}
+
+std::vector<DepsTracker::MetadataType> DepsTracker::getAllRequiredMetadataTypes() const {
+    std::vector<MetadataType> reqs;
+    if (_needTextScore) {
+        reqs.push_back(MetadataType::TEXT_SCORE);
+    }
+    if (_needSortKey) {
+        reqs.push_back(MetadataType::SORT_KEY);
+    }
+    if (_needGeoNearDistance) {
+        reqs.push_back(MetadataType::GEO_NEAR_DISTANCE);
+    }
+    if (_needGeoNearPoint) {
+        reqs.push_back(MetadataType::GEO_NEAR_POINT);
+    }
+    return reqs;
 }
 
 namespace {

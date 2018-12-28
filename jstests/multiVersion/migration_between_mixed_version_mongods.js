@@ -4,6 +4,9 @@
 // Migrations should be successful.
 //
 
+// Checking UUID consistency involves talking to a shard node, which in this test is shutdown
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+
 load("./jstests/multiVersion/libs/verify_versions.js");
 
 (function() {
@@ -17,7 +20,7 @@ load("./jstests/multiVersion/libs/verify_versions.js");
             {binVersion: "latest"}
         ],
         mongos: 1,
-        other: {mongosOptions: {binVersion: "last-stable"}}
+        other: {mongosOptions: {binVersion: "last-stable"}, shardAsReplicaSet: false}
     };
 
     var st = new ShardingTest(options);

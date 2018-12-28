@@ -1,3 +1,5 @@
+// @tags: [does_not_support_stepdowns, requires_getmore, requires_profiling]
+
 // Confirms that profiled getMore execution contains all expected metrics with proper values.
 
 (function() {

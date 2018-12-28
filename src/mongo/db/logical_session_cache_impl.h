@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -31,7 +33,7 @@
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/refresh_sessions_gen.h"
-#include "mongo/db/service_liason.h"
+#include "mongo/db/service_liaison.h"
 #include "mongo/db/sessions_collection.h"
 #include "mongo/db/time_proof_service.h"
 #include "mongo/db/transaction_reaper.h"
@@ -45,17 +47,17 @@ class Client;
 class OperationContext;
 class ServiceContext;
 
-extern int logicalSessionRefreshMinutes;
+extern int logicalSessionRefreshMillis;
 
 /**
  * A thread-safe cache structure for logical session records.
  *
- * The cache takes ownership of the passed-in ServiceLiason and
+ * The cache takes ownership of the passed-in ServiceLiaison and
  * SessionsCollection helper types.
  */
 class LogicalSessionCacheImpl final : public LogicalSessionCache {
 public:
-    static constexpr Minutes kLogicalSessionDefaultRefresh = Minutes(5);
+    static constexpr Milliseconds kLogicalSessionDefaultRefresh = Milliseconds(5 * 60 * 1000);
 
     /**
      * An Options type to support the LogicalSessionCacheImpl.
@@ -75,19 +77,19 @@ public:
         /**
          * The interval over which the cache will refresh session records.
          *
-         * By default, this is set to every 5 minutes. If the caller is
-         * setting the sessionTimeout by hand, it is suggested that they
+         * By default, this is set to every 5 minutes (300,000). If the caller
+         * is setting the sessionTimeout by hand, it is suggested that they
          * consider also setting the refresh interval accordingly.
          *
-         * May be set with --setParameter logicalSessionRefreshMinutes=X.
+         * May be set with --setParameter logicalSessionRefreshMillis=X.
          */
-        Minutes refreshInterval = Minutes(logicalSessionRefreshMinutes);
+        Milliseconds refreshInterval = Milliseconds(logicalSessionRefreshMillis);
     };
 
     /**
      * Construct a new session cache.
      */
-    explicit LogicalSessionCacheImpl(std::unique_ptr<ServiceLiason> service,
+    explicit LogicalSessionCacheImpl(std::unique_ptr<ServiceLiaison> service,
                                      std::shared_ptr<SessionsCollection> collection,
                                      std::shared_ptr<TransactionReaper> transactionReaper,
                                      Options options = Options{});
@@ -99,16 +101,14 @@ public:
 
     Status promote(LogicalSessionId lsid) override;
 
-    void startSession(OperationContext* opCtx, LogicalSessionRecord record) override;
+    Status startSession(OperationContext* opCtx, LogicalSessionRecord record) override;
 
     Status refreshSessions(OperationContext* opCtx,
                            const RefreshSessionsCmdFromClient& cmd) override;
     Status refreshSessions(OperationContext* opCtx,
                            const RefreshSessionsCmdFromClusterMember& cmd) override;
 
-    void vivify(OperationContext* opCtx, const LogicalSessionId& lsid) override;
-
-    void clear() override;
+    Status vivify(OperationContext* opCtx, const LogicalSessionId& lsid) override;
 
     Status refreshNow(Client* client) override;
 
@@ -126,6 +126,8 @@ public:
     boost::optional<LogicalSessionRecord> peekCached(const LogicalSessionId& id) const override;
 
     void endSessions(const LogicalSessionIdSet& sessions) override;
+
+    LogicalSessionCacheStats getStats() override;
 
 private:
     /**
@@ -146,12 +148,16 @@ private:
     /**
      * Takes the lock and inserts the given record into the cache.
      */
-    void _addToCache(LogicalSessionRecord record);
+    Status _addToCache(LogicalSessionRecord record);
 
-    const Minutes _refreshInterval;
+    const Milliseconds _refreshInterval;
     const Minutes _sessionTimeout;
 
-    std::unique_ptr<ServiceLiason> _service;
+    // This value is only modified under the lock, and is modified
+    // automatically by the background jobs.
+    LogicalSessionCacheStats _stats;
+
+    std::unique_ptr<ServiceLiaison> _service;
     std::shared_ptr<SessionsCollection> _sessionsColl;
 
     mutable stdx::mutex _reaperMutex;

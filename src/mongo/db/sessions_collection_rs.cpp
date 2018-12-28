@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -33,12 +35,11 @@
 #include <boost/optional.hpp>
 #include <utility>
 
+#include "mongo/client/authenticate.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
-#include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
@@ -48,7 +49,6 @@
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
-
 namespace {
 
 BSONObj lsidQuery(const LogicalSessionId& lsid) {
@@ -75,8 +75,8 @@ Status makePrimaryConnection(OperationContext* opCtx, boost::optional<ScopedDbCo
     // Make a connection to the primary, auth, then send
     try {
         conn->emplace(hostname);
-        if (isInternalAuthSet()) {
-            (*conn)->get()->auth(getInternalUserAuthParams());
+        if (auth::isInternalAuthSet()) {
+            uassertStatusOK((*conn)->get()->authenticateInternalUser());
         }
         return Status::OK();
     } catch (...) {
@@ -85,16 +85,25 @@ Status makePrimaryConnection(OperationContext* opCtx, boost::optional<ScopedDbCo
 }
 
 template <typename Callback>
-auto runIfStandaloneOrPrimary(const NamespaceString& ns,
-                              LockMode mode,
-                              OperationContext* opCtx,
-                              Callback callback)
+auto runIfStandaloneOrPrimary(const NamespaceString& ns, OperationContext* opCtx, Callback callback)
     -> boost::optional<decltype(std::declval<Callback>()())> {
-    Lock::DBLock lk(opCtx, ns.db(), mode);
-    Lock::CollectionLock lock(opCtx->lockState(), SessionsCollection::kSessionsFullNS, mode);
+    bool isStandaloneOrPrimary;
+    {
+        Lock::DBLock lk(opCtx, ns.db(), MODE_IS);
+        Lock::CollectionLock lock(
+            opCtx->lockState(), NamespaceString::kLogicalSessionsNamespace.ns(), MODE_IS);
 
-    auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
-    if (coord->canAcceptWritesForDatabase(opCtx, ns.db())) {
+        auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
+
+        // There is a window here where we may transition from Primary to
+        // Secondary after we release the locks we take above. In this case,
+        // the callback we run below may return a NotMaster error, or a stale
+        // read. However, this is preferable to running the callback while
+        // we hold locks, since that can lead to a deadlock.
+        isStandaloneOrPrimary = coord->canAcceptWritesForDatabase(opCtx, ns.db());
+    }
+
+    if (isStandaloneOrPrimary) {
         return callback();
     }
 
@@ -110,18 +119,25 @@ auto sendToPrimary(OperationContext* opCtx, Callback callback)
         return res;
     }
 
-    return callback(conn->get());
+    auto val = callback(conn->get());
+
+    if (val.isOK()) {
+        conn->done();
+    } else {
+        conn->kill();
+    }
+
+    return std::move(val);
 }
 
 template <typename LocalCallback, typename RemoteCallback>
 auto dispatch(const NamespaceString& ns,
-              LockMode mode,
               OperationContext* opCtx,
               LocalCallback localCallback,
               RemoteCallback remoteCallback)
     -> decltype(std::declval<RemoteCallback>()(static_cast<DBClientBase*>(nullptr))) {
     // If we are the primary, write directly to ourself.
-    auto result = runIfStandaloneOrPrimary(ns, mode, opCtx, [&] { return localCallback(); });
+    auto result = runIfStandaloneOrPrimary(ns, opCtx, [&] { return localCallback(); });
 
     if (result) {
         return *result;
@@ -133,88 +149,125 @@ auto dispatch(const NamespaceString& ns,
 }  // namespace
 
 Status SessionsCollectionRS::setupSessionsCollection(OperationContext* opCtx) {
-    return dispatch(kSessionsNamespaceString,
-                    MODE_IX,
-                    opCtx,
-                    [&] {
-                        // Creating the TTL index will auto-generate the collection.
-                        DBDirectClient client(opCtx);
-                        BSONObj info;
-                        auto cmd = generateCreateIndexesCmd();
-                        if (!client.runCommand(kSessionsDb.toString(), cmd, info)) {
-                            return getStatusFromCommandResult(info);
-                        }
+    return dispatch(
+        NamespaceString::kLogicalSessionsNamespace,
+        opCtx,
+        [&] {
+            auto existsStatus = checkSessionsCollectionExists(opCtx);
+            if (existsStatus.isOK()) {
+                return Status::OK();
+            }
 
-                        return Status::OK();
-                    },
-                    [&](DBClientBase*) {
-                        // If we are not the primary, we aren't going to do writes
-                        // anyway, so just return ok.
-                        return Status::OK();
-                    });
+            DBDirectClient client(opCtx);
+            BSONObj cmd;
+
+            if (existsStatus.code() == ErrorCodes::IndexOptionsConflict) {
+                cmd = generateCollModCmd();
+            } else {
+                // Creating the TTL index will auto-generate the collection.
+                cmd = generateCreateIndexesCmd();
+            }
+
+            BSONObj info;
+            if (!client.runCommand(
+                    NamespaceString::kLogicalSessionsNamespace.db().toString(), cmd, info)) {
+                return getStatusFromCommandResult(info);
+            }
+
+            return Status::OK();
+        },
+        [&](DBClientBase*) { return checkSessionsCollectionExists(opCtx); });
+}
+
+Status SessionsCollectionRS::checkSessionsCollectionExists(OperationContext* opCtx) {
+    DBDirectClient client(opCtx);
+
+    auto indexes = client.getIndexSpecs(NamespaceString::kLogicalSessionsNamespace.toString());
+
+    if (indexes.size() == 0u) {
+        return Status{ErrorCodes::NamespaceNotFound, "config.system.sessions does not exist"};
+    }
+
+    auto index = std::find_if(indexes.begin(), indexes.end(), [](const BSONObj& index) {
+        return index.getField("name").String() == kSessionsTTLIndex;
+    });
+
+    if (index == indexes.end()) {
+        return Status{ErrorCodes::IndexNotFound,
+                      "config.system.sessions does not have the required TTL index"};
+    }
+
+    if (!index->hasField("expireAfterSeconds") ||
+        index->getField("expireAfterSeconds").Int() != (localLogicalSessionTimeoutMinutes * 60)) {
+        return Status{
+            ErrorCodes::IndexOptionsConflict,
+            "config.system.sessions currently has the incorrect timeout for the TTL index"};
+    }
+
+    return Status::OK();
 }
 
 Status SessionsCollectionRS::refreshSessions(OperationContext* opCtx,
                                              const LogicalSessionRecordSet& sessions) {
-    return dispatch(
-        kSessionsNamespaceString,
-        MODE_IX,
-        opCtx,
-        [&] {
-            DBDirectClient client(opCtx);
-            return doRefresh(kSessionsNamespaceString,
-                             sessions,
-                             makeSendFnForBatchWrite(kSessionsNamespaceString, &client));
-        },
-        [&](DBClientBase* client) {
-            return doRefreshExternal(kSessionsNamespaceString,
-                                     sessions,
-                                     makeSendFnForCommand(kSessionsNamespaceString, client));
-        });
+    return dispatch(NamespaceString::kLogicalSessionsNamespace,
+                    opCtx,
+                    [&] {
+                        DBDirectClient client(opCtx);
+                        return doRefresh(NamespaceString::kLogicalSessionsNamespace,
+                                         sessions,
+                                         makeSendFnForBatchWrite(
+                                             NamespaceString::kLogicalSessionsNamespace, &client));
+                    },
+                    [&](DBClientBase* client) {
+                        return doRefresh(NamespaceString::kLogicalSessionsNamespace,
+                                         sessions,
+                                         makeSendFnForBatchWrite(
+                                             NamespaceString::kLogicalSessionsNamespace, client));
+                    });
 }
 
 Status SessionsCollectionRS::removeRecords(OperationContext* opCtx,
                                            const LogicalSessionIdSet& sessions) {
-    return dispatch(kSessionsNamespaceString,
-                    MODE_IX,
+    return dispatch(NamespaceString::kLogicalSessionsNamespace,
                     opCtx,
                     [&] {
                         DBDirectClient client(opCtx);
-                        return doRemove(kSessionsNamespaceString,
+                        return doRemove(NamespaceString::kLogicalSessionsNamespace,
                                         sessions,
-                                        makeSendFnForBatchWrite(kSessionsNamespaceString, &client));
+                                        makeSendFnForBatchWrite(
+                                            NamespaceString::kLogicalSessionsNamespace, &client));
                     },
                     [&](DBClientBase* client) {
-                        return doRemoveExternal(
-                            kSessionsNamespaceString,
-                            sessions,
-                            makeSendFnForCommand(kSessionsNamespaceString, client));
+                        return doRemove(NamespaceString::kLogicalSessionsNamespace,
+                                        sessions,
+                                        makeSendFnForBatchWrite(
+                                            NamespaceString::kLogicalSessionsNamespace, client));
                     });
 }
 
 StatusWith<LogicalSessionIdSet> SessionsCollectionRS::findRemovedSessions(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
-    return dispatch(kSessionsNamespaceString,
-                    MODE_IS,
+    return dispatch(NamespaceString::kLogicalSessionsNamespace,
                     opCtx,
                     [&] {
                         DBDirectClient client(opCtx);
-                        return doFetch(kSessionsNamespaceString,
+                        return doFetch(NamespaceString::kLogicalSessionsNamespace,
                                        sessions,
-                                       makeFindFnForCommand(kSessionsNamespaceString, &client));
+                                       makeFindFnForCommand(
+                                           NamespaceString::kLogicalSessionsNamespace, &client));
                     },
                     [&](DBClientBase* client) {
-                        return doFetch(kSessionsNamespaceString,
+                        return doFetch(NamespaceString::kLogicalSessionsNamespace,
                                        sessions,
-                                       makeFindFnForCommand(kSessionsNamespaceString, client));
+                                       makeFindFnForCommand(
+                                           NamespaceString::kLogicalSessionsNamespace, client));
                     });
 }
 
 Status SessionsCollectionRS::removeTransactionRecords(OperationContext* opCtx,
                                                       const LogicalSessionIdSet& sessions) {
     return dispatch(
-        kSessionsNamespaceString,
-        MODE_IX,
+        NamespaceString::kSessionTransactionsTableNamespace,
         opCtx,
         [&] {
             DBDirectClient client(opCtx);

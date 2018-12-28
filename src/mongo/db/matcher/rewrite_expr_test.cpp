@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -68,81 +70,35 @@ void testExprRewrite(BSONObj expr, BSONObj expectedMatch) {
 //
 TEST(RewriteExpr, EqWithOneFieldPathRewritesToMatch) {
     BSONObj expr = fromjson("{$expr: {$eq: ['$x', 3]}}");
-    const BSONObj expectedMatch = fromjson("{x: {$eq: 3}}");
+    const BSONObj expectedMatch = fromjson("{x: {$_internalExprEq: 3}}");
     testExprRewrite(expr, expectedMatch);
 
     expr = fromjson("{$expr: {$eq: [3, '$x']}}");
     testExprRewrite(expr, expectedMatch);
 }
 
-TEST(RewriteExpr, NeWithOneFieldPathRewritesToMatch) {
-    BSONObj expr = fromjson("{$expr: {$ne: ['$x', 3]}}");
-    BSONObj expectedMatch = fromjson("{$nor: [{x: {$eq: 3}}]}");
-    testExprRewrite(expr, expectedMatch);
-
-    expr = fromjson("{$expr: {$ne: [3, '$x']}}");
-    testExprRewrite(expr, expectedMatch);
-}
-
-TEST(RewriteExpr, GtWithOneFieldPathRewritesToMatch) {
-    BSONObj expr = fromjson("{$expr: {$gt: ['$x', 3]}}");
-    BSONObj expectedMatch = fromjson("{x: {$gt: 3}}");
-    testExprRewrite(expr, expectedMatch);
-
-    expr = fromjson("{$expr: {$gt: [3, '$x']}}");
-    expectedMatch = fromjson("{x: {$lt: 3}}");
-    testExprRewrite(expr, expectedMatch);
-}
-
-TEST(RewriteExpr, GteWithOneFieldPathRewritesToMatch) {
-    BSONObj expr = fromjson("{$expr: {$gte: ['$x', 3]}}");
-    BSONObj expectedMatch = fromjson("{x: {$gte: 3}}");
-    testExprRewrite(expr, expectedMatch);
-
-    expr = fromjson("{$expr: {$gte: [3, '$x']}}");
-    expectedMatch = fromjson("{x: {$lte: 3}}");
-    testExprRewrite(expr, expectedMatch);
-}
-
-TEST(RewriteExpr, LtWithOneFieldPathRewritesToMatch) {
-    BSONObj expr = fromjson("{$expr: {$lt: ['$x', 3]}}");
-    BSONObj expectedMatch = fromjson("{x: {$lt: 3}}");
-    testExprRewrite(expr, expectedMatch);
-
-    expr = fromjson("{$expr: {$lt: [3, '$x']}}");
-    expectedMatch = fromjson("{x: {$gt: 3}}");
-    testExprRewrite(expr, expectedMatch);
-}
-
-TEST(RewriteExpr, LteWithOneFieldPathRewritesToMatch) {
-    BSONObj expr = fromjson("{$expr: {$lte: ['$x', 3]}}");
-    BSONObj expectedMatch = fromjson("{x: {$lte: 3}}");
-    testExprRewrite(expr, expectedMatch);
-
-    expr = fromjson("{$expr: {$lte: [3, '$x']}}");
-    expectedMatch = fromjson("{x: {$gte: 3}}");
-    testExprRewrite(expr, expectedMatch);
-}
-
 TEST(RewriteExpr, AndRewritesToMatch) {
-    const BSONObj expr = fromjson("{$expr: {$and: [{$eq: ['$x', 3]}, {$ne: ['$y', 4]}]}}");
-    const BSONObj expectedMatch = fromjson("{$and: [{x: {$eq: 3}}, {$nor: [{y: {$eq: 4}}]}]}");
+    const BSONObj expr = fromjson("{$expr: {$and: [{$eq: ['$x', 3]}, {$eq: ['$y', 4]}]}}");
+    const BSONObj expectedMatch =
+        fromjson("{$and: [{x: {$_internalExprEq: 3}}, {y: {$_internalExprEq: 4}}]}");
 
     testExprRewrite(expr, expectedMatch);
 }
 
 TEST(RewriteExpr, OrRewritesToMatch) {
-    const BSONObj expr = fromjson("{$expr: {$or: [{$lte: ['$x', 3]}, {$gte: ['$y', 4]}]}}");
-    const BSONObj expectedMatch = fromjson("{$or: [{x: {$lte: 3}}, {y: {$gte: 4}}]}");
+    const BSONObj expr = fromjson("{$expr: {$or: [{$eq: ['$x', 3]}, {$eq: ['$y', 4]}]}}");
+    const BSONObj expectedMatch =
+        fromjson("{$or: [{x: {$_internalExprEq: 3}}, {y: {$_internalExprEq: 4}}]}");
 
     testExprRewrite(expr, expectedMatch);
 }
 
 TEST(RewriteExpr, AndNestedWithinOrRewritesToMatch) {
     const BSONObj expr = fromjson(
-        "{$expr: {$or: [{$and: [{$eq: ['$x', 3]}, {$gt: ['$z', 5]}]}, {$lt: ['$y', 4]}]}}");
-    const BSONObj expectedMatch =
-        fromjson("{$or: [{$and: [{x: {$eq: 3}}, {z: {$gt: 5}}]}, {y: {$lt: 4}}]}");
+        "{$expr: {$or: [{$and: [{$eq: ['$x', 3]}, {$eq: ['$z', 5]}]}, {$eq: ['$y', 4]}]}}");
+    const BSONObj expectedMatch = fromjson(
+        "{$or: [{$and: [{x: {$_internalExprEq: 3}}, {z: {$_internalExprEq: 5}}]}, "
+        "{y: {$_internalExprEq: 4}}]}");
 
     testExprRewrite(expr, expectedMatch);
 }
@@ -150,26 +106,19 @@ TEST(RewriteExpr, AndNestedWithinOrRewritesToMatch) {
 TEST(RewriteExpr, OrNestedWithinAndRewritesToMatch) {
     const BSONObj expr = fromjson(
         "{$expr: {$and: [{$or: [{$eq: ['$x', 3]}, {$eq: ['$z', 5]}]}, {$eq: ['$y', 4]}]}}");
-    const BSONObj expectedMatch =
-        fromjson("{$and: [{$or: [{x: {$eq: 3}}, {z: {$eq: 5}}]}, {y: {$eq: 4}}]}");
+    const BSONObj expectedMatch = fromjson(
+        "{$and: [{$or: [{x: {$_internalExprEq: 3}}, {z: {$_internalExprEq: 5}}]}, "
+        "{y: {$_internalExprEq: 4}}]}");
 
     testExprRewrite(expr, expectedMatch);
 }
 
-TEST(RewriteExpr, InWithLhsFieldPathRewritesToMatch) {
-    const BSONObj expr = fromjson("{$expr: {$in: ['$x', [1, 2, 3]]}}");
-    const BSONObj expectedMatch = fromjson("{x: {$in: [1, 2, 3]}}");
+TEST(RewriteExpr, EqWithDottedFieldPathRewritesToMatch) {
+    const BSONObj expr = fromjson("{$expr: {$eq: ['$x.y', 3]}}");
+    const BSONObj expectedMatch = fromjson("{'x.y': {$_internalExprEq: 3}}");
 
     testExprRewrite(expr, expectedMatch);
 }
-
-TEST(RewriteExpr, InWithLhsFieldPathAndArrayAsConstRewritesToMatch) {
-    const BSONObj expr = fromjson("{$expr: {$in: ['$x', {$const: [1, 2, 3]}]}}");
-    const BSONObj expectedMatch = fromjson("{x: {$in: [1, 2, 3]}}");
-
-    testExprRewrite(expr, expectedMatch);
-}
-
 
 //
 // Expressions that cannot be rewritten (partially or fully) to MatchExpression.
@@ -203,17 +152,30 @@ TEST(RewriteExpr, EqWithTwoConstantsDoesNotRewriteToMatch) {
     testExprRewrite(expr, expectedMatch);
 }
 
-TEST(RewriteExpr, EqWithDottedFieldPathDoesNotRewriteToMatch) {
-    const BSONObj expr = fromjson("{$expr: {$eq: ['$x.y', 3]}}");
+TEST(RewriteExpr, EqWithComparisonToUndefinedDoesNotRewriteToMatch) {
+    BSONObj expr = fromjson("{$expr: {$eq: ['$x', undefined]}}");
     const BSONObj expectedMatch;
-
     testExprRewrite(expr, expectedMatch);
 }
 
-TEST(RewriteExpr, InWithDottedFieldPathDoesNotRewriteToMatch) {
-    const BSONObj expr = fromjson("{$expr: {$in: ['$x.y', [1, 2, 3]]}}");
+TEST(RewriteExpr, EqWithComparisonToMissingDoesNotRewriteToMatch) {
+    BSONObj expr = fromjson("{$expr: {$eq: ['$x', '$$REMOVE']}}");
     const BSONObj expectedMatch;
+    testExprRewrite(expr, expectedMatch);
+}
 
+TEST(RewriteExpr, EqWithComparisonToArrayDoesNotRewriteToMatch) {
+    BSONObj expr = fromjson("{$expr: {$eq: ['$x', [1, 2, 3]]}}");
+    const BSONObj expectedMatch;
+    testExprRewrite(expr, expectedMatch);
+}
+
+TEST(RewriteExpr, NeWithOneFieldPathDoesNotRewriteToMatch) {
+    BSONObj expr = fromjson("{$expr: {$ne: ['$x', 3]}}");
+    BSONObj expectedMatch;
+    testExprRewrite(expr, expectedMatch);
+
+    expr = fromjson("{$expr: {$ne: [3, '$x']}}");
     testExprRewrite(expr, expectedMatch);
 }
 
@@ -231,13 +193,6 @@ TEST(RewriteExpr, OrWithDistinctMatchAndNonMatchSubTreeDoesNotRewriteToMatch) {
     testExprRewrite(expr, expectedMatch);
 }
 
-TEST(RewriteExpr, InWithoutLhsFieldPathDoesNotRewriteToMatch) {
-    const BSONObj expr = fromjson("{$expr: {$in: [2, [1, 2, 3]]}}");
-    const BSONObj expectedMatch;
-
-    testExprRewrite(expr, expectedMatch);
-}
-
 //
 // Expressions that can be partially rewritten to MatchExpression. Partial rewrites are expected to
 // match against a superset of documents.
@@ -246,14 +201,15 @@ TEST(RewriteExpr, InWithoutLhsFieldPathDoesNotRewriteToMatch) {
 TEST(RewriteExpr, NestedAndWithTwoFieldPathsWithinOrPartiallyRewriteToMatch) {
     const BSONObj expr = fromjson(
         "{$expr: {$or: [{$and: [{$eq: ['$x', '$w']}, {$eq: ['$z', 5]}]}, {$eq: ['$y', 4]}]}}");
-    const BSONObj expectedMatch = fromjson("{$or: [{z: {$eq: 5}}, {y: {$eq: 4}}]}");
+    const BSONObj expectedMatch =
+        fromjson("{$or: [{z: {$_internalExprEq: 5}}, {y: {$_internalExprEq: 4}}]}");
 
     testExprRewrite(expr, expectedMatch);
 }
 
 TEST(RewriteExpr, AndWithDistinctMatchAndNonMatchSubTreeSplitsOnRewrite) {
     const BSONObj expr = fromjson("{$expr: {$and: [{$eq: ['$x', 1]}, {$eq: ['$y', '$z']}]}}");
-    const BSONObj expectedMatch = fromjson("{x: {$eq: 1}}");
+    const BSONObj expectedMatch = fromjson("{x: {$_internalExprEq: 1}}");
 
     testExprRewrite(expr, expectedMatch);
 }
@@ -286,12 +242,12 @@ TEST(RewriteExpr, ComplexSupersetMatchRewritesToMatchSuperset) {
     const BSONObj expectedMatch = fromjson(
         "{"
         "  $and: ["
-        "      {a: {$eq: 1}},"
+        "      {a: {$_internalExprEq: 1}},"
         "      {"
         "        $or: ["
-        "            {d: {$eq: 1}},"
-        "            {e: {$eq: 3}},"
-        "            {f: {$eq: 1}}"
+        "            {d: {$_internalExprEq: 1}},"
+        "            {e: {$_internalExprEq: 3}},"
+        "            {f: {$_internalExprEq: 1}}"
         "        ]"
         "      }"
         "  ]"
@@ -303,7 +259,8 @@ TEST(RewriteExpr, ComplexSupersetMatchRewritesToMatchSuperset) {
 TEST(RewriteExpr, OrWithAndContainingMatchAndNonMatchChildPartiallyRewritesToMatch) {
     const BSONObj expr = fromjson(
         "{$expr: {$or: [{$eq: ['$x', 3]}, {$and: [{$eq: ['$y', 4]}, {$eq: ['$y', '$z']}]}]}}");
-    const BSONObj expectedMatch = fromjson("{$or: [{x: {$eq: 3}}, {y: {$eq: 4}}]}");
+    const BSONObj expectedMatch =
+        fromjson("{$or: [{x: {$_internalExprEq: 3}}, {y: {$_internalExprEq: 4}}]}");
 
     testExprRewrite(expr, expectedMatch);
 }

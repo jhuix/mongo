@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -81,7 +83,7 @@ Status BalancerConfiguration::setBalancerMode(OperationContext* opCtx,
                                               BalancerSettingsType::BalancerMode mode) {
     auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
         opCtx,
-        kSettingsNamespace.ns(),
+        kSettingsNamespace,
         BSON("_id" << BalancerSettingsType::kKey),
         BSON("$set" << BSON(kStopped << (mode == BalancerSettingsType::kOff) << kMode
                                      << BalancerSettingsType::kBalancerModes[mode])),
@@ -94,9 +96,7 @@ Status BalancerConfiguration::setBalancerMode(OperationContext* opCtx,
     }
 
     if (!updateStatus.isOK() && (getBalancerMode() != mode)) {
-        return {updateStatus.getStatus().code(),
-                str::stream() << "Failed to update balancer configuration due to "
-                              << updateStatus.getStatus().reason()};
+        return updateStatus.getStatus().withContext("Failed to update balancer configuration");
     }
 
     return Status::OK();
@@ -135,25 +135,19 @@ Status BalancerConfiguration::refreshAndCheck(OperationContext* opCtx) {
     // Balancer configuration
     Status balancerSettingsStatus = _refreshBalancerSettings(opCtx);
     if (!balancerSettingsStatus.isOK()) {
-        return {balancerSettingsStatus.code(),
-                str::stream() << "Failed to refresh the balancer settings due to "
-                              << balancerSettingsStatus.toString()};
+        return balancerSettingsStatus.withContext("Failed to refresh the balancer settings");
     }
 
     // Chunk size settings
     Status chunkSizeStatus = _refreshChunkSizeSettings(opCtx);
     if (!chunkSizeStatus.isOK()) {
-        return {chunkSizeStatus.code(),
-                str::stream() << "Failed to refresh the chunk sizes settings due to "
-                              << chunkSizeStatus.toString()};
+        return chunkSizeStatus.withContext("Failed to refresh the chunk sizes settings");
     }
 
     // AutoSplit settings
     Status autoSplitStatus = _refreshAutoSplitSettings(opCtx);
     if (!autoSplitStatus.isOK()) {
-        return {autoSplitStatus.code(),
-                str::stream() << "Failed to refresh the autoSplit settings due to "
-                              << autoSplitStatus.toString()};
+        return autoSplitStatus.withContext("Failed to refresh the autoSplit settings");
     }
 
     return Status::OK();
@@ -185,7 +179,7 @@ Status BalancerConfiguration::_refreshChunkSizeSettings(OperationContext* opCtx)
     ChunkSizeSettingsType settings = ChunkSizeSettingsType::createDefault();
 
     auto settingsObjStatus =
-        grid.catalogClient()->getGlobalSettings(opCtx, ChunkSizeSettingsType::kKey);
+        Grid::get(opCtx)->catalogClient()->getGlobalSettings(opCtx, ChunkSizeSettingsType::kKey);
     if (settingsObjStatus.isOK()) {
         auto settingsStatus = ChunkSizeSettingsType::fromBSON(settingsObjStatus.getValue());
         if (!settingsStatus.isOK()) {
@@ -211,7 +205,7 @@ Status BalancerConfiguration::_refreshAutoSplitSettings(OperationContext* opCtx)
     AutoSplitSettingsType settings = AutoSplitSettingsType::createDefault();
 
     auto settingsObjStatus =
-        grid.catalogClient()->getGlobalSettings(opCtx, AutoSplitSettingsType::kKey);
+        Grid::get(opCtx)->catalogClient()->getGlobalSettings(opCtx, AutoSplitSettingsType::kKey);
     if (settingsObjStatus.isOK()) {
         auto settingsStatus = AutoSplitSettingsType::fromBSON(settingsObjStatus.getValue());
         if (!settingsStatus.isOK()) {

@@ -23,7 +23,7 @@
     assert.writeOK(master.getDB("test").foo.insert({x: 2}, options));
     // lock secondary, to pause replication
     print("\nlock secondary");
-    var locked = replTest.liveNodes.slaves[0];
+    var locked = replTest._slaves[0];
     printjson(locked.getDB("admin").runCommand({fsync: 1, lock: 1}));
 
     // do a write
@@ -40,7 +40,7 @@
         var result =
             master.getDB("test").runCommand({getLastError: 1, w: 2, wtimeout: 10 * 60 * 1000});
         if (result.errmsg === "not master" || result.code == ErrorCodes.NotMaster ||
-            result.code == ErrorCodes.InterruptedDueToReplStateChange) {
+            result.code == ErrorCodes.InterruptedDueToStepDown) {
             throw new Error("satisfy assert.throws()");
         }
         print("failed to throw exception; GLE returned: ");

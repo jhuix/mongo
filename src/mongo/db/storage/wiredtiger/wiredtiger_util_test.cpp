@@ -1,25 +1,27 @@
 // wiredtiger_util_test.cpp
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,6 +38,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
@@ -81,14 +84,20 @@ public:
         return &_sessionCache;
     }
 
+    WiredTigerOplogManager* getOplogManager() {
+        return &_oplogManager;
+    }
+
     OperationContext* newOperationContext() {
-        return new OperationContextNoop(new WiredTigerRecoveryUnit(getSessionCache()));
+        return new OperationContextNoop(
+            new WiredTigerRecoveryUnit(getSessionCache(), &_oplogManager));
     }
 
 private:
     unittest::TempDir _dbpath;
     WiredTigerConnection _connection;
     WiredTigerSessionCache _sessionCache;
+    WiredTigerOplogManager _oplogManager;
 };
 
 class WiredTigerUtilMetadataTest : public mongo::unittest::Test {
@@ -177,7 +186,7 @@ TEST_F(WiredTigerUtilMetadataTest, GetApplicationMetadataDuplicateKeys) {
     StatusWith<BSONObj> result =
         WiredTigerUtil::getApplicationMetadata(getOperationContext(), getURI());
     ASSERT_NOT_OK(result.getStatus());
-    ASSERT_EQUALS(ErrorCodes::DuplicateKey, result.getStatus().code());
+    ASSERT_EQUALS(50998, result.getStatus().code());
 }
 
 TEST_F(WiredTigerUtilMetadataTest, GetApplicationMetadataTypes) {
@@ -253,7 +262,8 @@ TEST_F(WiredTigerUtilMetadataTest, CheckApplicationMetadataFormatInvalidURI) {
 
 TEST(WiredTigerUtilTest, GetStatisticsValueMissingTable) {
     WiredTigerUtilHarnessHelper harnessHelper("statistics=(all)");
-    WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache());
+    WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache(),
+                                        harnessHelper.getOplogManager());
     WiredTigerSession* session = recoveryUnit.getSession();
     StatusWith<uint64_t> result =
         WiredTigerUtil::getStatisticsValue(session->getSession(),
@@ -266,7 +276,8 @@ TEST(WiredTigerUtilTest, GetStatisticsValueMissingTable) {
 
 TEST(WiredTigerUtilTest, GetStatisticsValueStatisticsDisabled) {
     WiredTigerUtilHarnessHelper harnessHelper("statistics=(none)");
-    WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache());
+    WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache(),
+                                        harnessHelper.getOplogManager());
     WiredTigerSession* session = recoveryUnit.getSession();
     WT_SESSION* wtSession = session->getSession();
     ASSERT_OK(wtRCToStatus(wtSession->create(wtSession, "table:mytable", NULL)));
@@ -280,7 +291,8 @@ TEST(WiredTigerUtilTest, GetStatisticsValueStatisticsDisabled) {
 
 TEST(WiredTigerUtilTest, GetStatisticsValueInvalidKey) {
     WiredTigerUtilHarnessHelper harnessHelper("statistics=(all)");
-    WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache());
+    WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache(),
+                                        harnessHelper.getOplogManager());
     WiredTigerSession* session = recoveryUnit.getSession();
     WT_SESSION* wtSession = session->getSession();
     ASSERT_OK(wtRCToStatus(wtSession->create(wtSession, "table:mytable", NULL)));
@@ -295,7 +307,8 @@ TEST(WiredTigerUtilTest, GetStatisticsValueInvalidKey) {
 
 TEST(WiredTigerUtilTest, GetStatisticsValueValidKey) {
     WiredTigerUtilHarnessHelper harnessHelper("statistics=(all)");
-    WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache());
+    WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache(),
+                                        harnessHelper.getOplogManager());
     WiredTigerSession* session = recoveryUnit.getSession();
     WT_SESSION* wtSession = session->getSession();
     ASSERT_OK(wtRCToStatus(wtSession->create(wtSession, "table:mytable", NULL)));
@@ -311,7 +324,8 @@ TEST(WiredTigerUtilTest, GetStatisticsValueValidKey) {
 
 TEST(WiredTigerUtilTest, GetStatisticsValueAsUInt8) {
     WiredTigerUtilHarnessHelper harnessHelper("statistics=(all)");
-    WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache());
+    WiredTigerRecoveryUnit recoveryUnit(harnessHelper.getSessionCache(),
+                                        harnessHelper.getOplogManager());
     WiredTigerSession* session = recoveryUnit.getSession();
     WT_SESSION* wtSession = session->getSession();
     ASSERT_OK(wtRCToStatus(wtSession->create(wtSession, "table:mytable", NULL)));

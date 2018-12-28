@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -85,7 +85,7 @@ __sweep_expire_one(WT_SESSION_IMPL *session)
 
 	/* Only sweep clean trees where all updates are visible. */
 	if (btree != NULL && (btree->modified || !__wt_txn_visible_all(session,
-	    btree->rec_max_txn, WT_TIMESTAMP_NULL(&btree->rec_max_timestamp))))
+	    btree->rec_max_txn, btree->rec_max_timestamp)))
 		goto err;
 
 	/*
@@ -159,9 +159,9 @@ __sweep_discard_trees(WT_SESSION_IMPL *session, u_int *dead_handlesp)
 	WT_DATA_HANDLE *dhandle;
 	WT_DECL_RET;
 
-	conn = S2C(session);
-
 	*dead_handlesp = 0;
+
+	conn = S2C(session);
 
 	TAILQ_FOREACH(dhandle, &conn->dhqh, q) {
 		if (WT_DHANDLE_CAN_DISCARD(dhandle))
@@ -259,7 +259,7 @@ __sweep_remove_handles(WT_SESSION_IMPL *session)
 
 /*
  * __sweep_server_run_chk --
- *	Check to decide if the checkpoint server should continue running.
+ *	Check to decide if the sweep server should continue running.
  */
 static bool
 __sweep_server_run_chk(WT_SESSION_IMPL *session)
@@ -277,19 +277,23 @@ __sweep_server(void *arg)
 	WT_CONNECTION_IMPL *conn;
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
-	time_t now;
+	time_t last, now;
+	uint64_t last_las_sweep_id, min_sleep, oldest_id;
 	u_int dead_handles;
 
 	session = arg;
 	conn = S2C(session);
+	last_las_sweep_id = WT_TXN_NONE;
+	min_sleep = WT_MIN(WT_LAS_SWEEP_SEC, conn->sweep_interval);
 
 	/*
 	 * Sweep for dead and excess handles.
 	 */
+	__wt_seconds(session, &last);
 	for (;;) {
 		/* Wait until the next event. */
 		__wt_cond_wait(session, conn->sweep_cond,
-		    conn->sweep_interval * WT_MILLION, __sweep_server_run_chk);
+		    min_sleep * WT_MILLION, __sweep_server_run_chk);
 
 		/* Check if we're quitting or being reconfigured. */
 		if (!__sweep_server_run_chk(session))
@@ -297,8 +301,35 @@ __sweep_server(void *arg)
 
 		__wt_seconds(session, &now);
 
-		WT_STAT_CONN_INCR(session, dh_sweeps);
+		/*
+		 * Sweep the lookaside table. If the lookaside table hasn't yet
+		 * been written, there's no work to do.
+		 *
+		 * Don't sweep the lookaside table if the cache is stuck full.
+		 * The sweep uses the cache and can exacerbate the problem.
+		 * If we try to sweep when the cache is full or we aren't
+		 * making progress in eviction, sweeping can wind up constantly
+		 * bringing in and evicting pages from the lookaside table,
+		 * which will stop the cache from moving into the stuck state.
+		 */
+		if (now - last >= WT_LAS_SWEEP_SEC &&
+		    !__wt_las_empty(session) &&
+		    !__wt_cache_stuck(session)) {
+			oldest_id = __wt_txn_oldest_id(session);
+			if (WT_TXNID_LT(last_las_sweep_id, oldest_id)) {
+				WT_ERR(__wt_las_sweep(session));
+				last_las_sweep_id = oldest_id;
+			}
+		}
 
+		/*
+		 * See if it is time to sweep the data handles. Those are swept
+		 * less frequently than the lookaside table by default and the
+		 * frequency is controlled by a user setting.
+		 */
+		if ((uint64_t)(now - last) < conn->sweep_interval)
+			continue;
+		WT_STAT_CONN_INCR(session, dh_sweeps);
 		/*
 		 * Mark handles with a time of death, and report whether any
 		 * handles are marked dead.  If sweep_idle_time is 0, handles
@@ -379,14 +410,20 @@ __wt_sweep_create(WT_SESSION_IMPL *session)
 
 	/*
 	 * Handle sweep does enough I/O it may be called upon to perform slow
-	 * operations for the block manager.
-	 *
-	 * Don't tap the sweep thread for eviction.
+	 * operations for the block manager.  Sweep should not block due to the
+	 * cache being full.
 	 */
-	session_flags = WT_SESSION_CAN_WAIT | WT_SESSION_NO_EVICTION;
+	session_flags = WT_SESSION_CAN_WAIT | WT_SESSION_IGNORE_CACHE_SIZE;
 	WT_RET(__wt_open_internal_session(
 	    conn, "sweep-server", true, session_flags, &conn->sweep_session));
 	session = conn->sweep_session;
+
+	/*
+	 * Sweep should have it's own lookaside cursor to avoid blocking reads
+	 * and eviction when processing drops.
+	 */
+	if (F_ISSET(conn, WT_CONN_LOOKASIDE_OPEN))
+		WT_RET(__wt_las_cursor_open(session));
 
 	WT_RET(__wt_cond_alloc(
 	    session, "handle sweep server", &conn->sweep_cond));
@@ -414,7 +451,7 @@ __wt_sweep_destroy(WT_SESSION_IMPL *session)
 	F_CLR(conn, WT_CONN_SERVER_SWEEP);
 	if (conn->sweep_tid_set) {
 		__wt_cond_signal(session, conn->sweep_cond);
-		WT_TRET(__wt_thread_join(session, conn->sweep_tid));
+		WT_TRET(__wt_thread_join(session, &conn->sweep_tid));
 		conn->sweep_tid_set = 0;
 	}
 	__wt_cond_destroy(session, &conn->sweep_cond);

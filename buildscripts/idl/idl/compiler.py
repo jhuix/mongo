@@ -1,16 +1,29 @@
-# Copyright (C) 2017 MongoDB Inc.
+# Copyright (C) 2018-present MongoDB, Inc.
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# Server Side Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 #
 """
 IDL compiler driver.
@@ -23,6 +36,7 @@ from __future__ import absolute_import, print_function, unicode_literals
 import io
 import logging
 import os
+import platform
 from typing import Any, List
 
 from . import binder
@@ -35,11 +49,14 @@ from . import syntax
 class CompilerArgs(object):
     """Set of compiler arguments."""
 
+    # pylint: disable=too-many-instance-attributes
+
     def __init__(self):
         # type: () -> None
         """Create a container for compiler arguments."""
         self.import_directories = None  # type: List[unicode]
         self.input_file = None  # type: unicode
+        self.target_arch = None  # type: unicode
 
         self.output_source = None  # type: unicode
         self.output_header = None  # type: unicode
@@ -176,23 +193,26 @@ def compile_idl(args):
         source_file_name = args.output_source
         header_file_name = args.output_header
 
+    if args.target_arch is None:
+        args.target_arch = platform.machine()
+
     # Compile the IDL through the 3 passes
     with io.open(args.input_file, encoding='utf-8') as file_stream:
         parsed_doc = parser.parse(file_stream, args.input_file,
                                   CompilerImportResolver(args.import_directories))
 
-        # Stop compiling if we only need to scan import dependencies
-        if args.write_dependencies:
-            _write_dependencies(parsed_doc.spec)
-            return True
-
         if not parsed_doc.errors:
+            # Stop compiling if we only need to scan import dependencies
+            if args.write_dependencies:
+                _write_dependencies(parsed_doc.spec)
+                return True
+
             _update_import_includes(args, parsed_doc.spec, header_file_name)
 
             bound_doc = binder.bind(parsed_doc.spec)
             if not bound_doc.errors:
-                generator.generate_code(bound_doc.spec, args.output_base_dir, header_file_name,
-                                        source_file_name)
+                generator.generate_code(bound_doc.spec, args.target_arch, args.output_base_dir,
+                                        header_file_name, source_file_name)
 
                 return True
             else:

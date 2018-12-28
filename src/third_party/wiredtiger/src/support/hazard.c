@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -67,11 +67,12 @@ hazard_grow(WT_SESSION_IMPL *session)
 int
 __wt_hazard_set(WT_SESSION_IMPL *session, WT_REF *ref, bool *busyp
 #ifdef HAVE_DIAGNOSTIC
-    , const char *file, int line
+    , const char *func, int line
 #endif
     )
 {
 	WT_HAZARD *hp;
+	uint32_t current_state;
 
 	*busyp = false;
 
@@ -84,7 +85,8 @@ __wt_hazard_set(WT_SESSION_IMPL *session, WT_REF *ref, bool *busyp
 	 * eviction and splits, we re-check it after a barrier to make sure
 	 * we have a valid reference.
 	 */
-	if (ref->state != WT_REF_MEM) {
+	current_state = ref->state;
+	if (current_state != WT_REF_LIMBO && current_state != WT_REF_MEM) {
 		*busyp = true;
 		return (0);
 	}
@@ -132,8 +134,8 @@ __wt_hazard_set(WT_SESSION_IMPL *session, WT_REF *ref, bool *busyp
 	 * Do the dance:
 	 *
 	 * The memory location which makes a page "real" is the WT_REF's state
-	 * of WT_REF_MEM, which can be set to WT_REF_LOCKED at any time by the
-	 * page eviction server.
+	 * of WT_REF_LIMBO or WT_REF_MEM, which can be set to WT_REF_LOCKED
+	 * at any time by the page eviction server.
 	 *
 	 * Add the WT_REF reference to the session's hazard list and flush the
 	 * write, then see if the page's state is still valid.  If so, we can
@@ -144,7 +146,7 @@ __wt_hazard_set(WT_SESSION_IMPL *session, WT_REF *ref, bool *busyp
 	 */
 	hp->ref = ref;
 #ifdef HAVE_DIAGNOSTIC
-	hp->file = file;
+	hp->func = func;
 	hp->line = line;
 #endif
 	/* Publish the hazard pointer before reading page's state. */
@@ -152,9 +154,10 @@ __wt_hazard_set(WT_SESSION_IMPL *session, WT_REF *ref, bool *busyp
 
 	/*
 	 * Check if the page state is still valid, where valid means a
-	 * state of WT_REF_MEM.
+	 * state of WT_REF_LIMBO or WT_REF_MEM.
 	 */
-	if (ref->state == WT_REF_MEM) {
+	current_state = ref->state;
+	if (current_state == WT_REF_LIMBO || current_state == WT_REF_MEM) {
 		++session->nhazard;
 
 		/*
@@ -319,7 +322,8 @@ hazard_get_reference(
  *	Return if there's a hazard pointer to the page in the system.
  */
 WT_HAZARD *
-__wt_hazard_check(WT_SESSION_IMPL *session, WT_REF *ref)
+__wt_hazard_check(WT_SESSION_IMPL *session,
+    WT_REF *ref, WT_SESSION_IMPL **sessionp)
 {
 	WT_CONNECTION_IMPL *conn;
 	WT_HAZARD *hp;
@@ -363,6 +367,8 @@ __wt_hazard_check(WT_SESSION_IMPL *session, WT_REF *ref)
 			if (hp->ref == ref) {
 				WT_STAT_CONN_INCRV(session,
 				    cache_hazard_walks, walk_cnt);
+				if (sessionp != NULL)
+					*sessionp = s;
 				goto done;
 			}
 		}
@@ -398,6 +404,33 @@ __wt_hazard_count(WT_SESSION_IMPL *session, WT_REF *ref)
 
 #ifdef HAVE_DIAGNOSTIC
 /*
+ * __wt_hazard_check_assert --
+ *	Assert there's no hazard pointer to the page.
+ */
+bool
+__wt_hazard_check_assert(WT_SESSION_IMPL *session, void *ref, bool waitfor)
+{
+	WT_HAZARD *hp;
+	WT_SESSION_IMPL *s;
+	int i;
+
+	s = NULL;
+	for (i = 0;;) {
+		if ((hp = __wt_hazard_check(session, ref, &s)) == NULL)
+			return (true);
+		if (!waitfor || ++i > 100)
+			break;
+		__wt_sleep(0, 10000);
+	}
+	__wt_errx(session,
+	    "hazard pointer reference to discarded object: "
+	    "(%p: session %p name %s: %s, line %d)",
+	    (void *)hp->ref, (void *)s,
+	    s->name == NULL ? "UNKNOWN" : s->name, hp->func, hp->line);
+	return (false);
+}
+
+/*
  * __hazard_dump --
  *	Display the list of hazard pointers.
  */
@@ -412,6 +445,6 @@ __hazard_dump(WT_SESSION_IMPL *session)
 			__wt_errx(session,
 			    "session %p: hazard pointer %p: %s, line %d",
 			    (void *)session,
-			    (void *)hp->ref, hp->file, hp->line);
+			    (void *)hp->ref, hp->func, hp->line);
 }
 #endif

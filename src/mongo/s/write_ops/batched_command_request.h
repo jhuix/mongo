@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -31,9 +33,9 @@
 #include <boost/optional.hpp>
 
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/util/net/op_msg.h"
 
 namespace mongo {
 
@@ -68,12 +70,6 @@ public:
     }
 
     const NamespaceString& getNS() const;
-    NamespaceString getTargetingNS() const;
-
-    /**
-     * Index creation can be expressed as an insert into the 'system.indexes' namespace.
-     */
-    bool isInsertIndexRequest() const;
 
     const auto& getInsertRequest() const {
         invariant(_insertReq);
@@ -127,12 +123,41 @@ public:
     BSONObj toBSON() const;
     std::string toString() const;
 
+    void setAllowImplicitCreate(bool doAllow) {
+        _allowImplicitCollectionCreation = doAllow;
+    }
+
+    bool isImplicitCreateAllowed() const {
+        return _allowImplicitCollectionCreation;
+    }
+
     /**
      * Generates a new request, the same as the old, but with insert _ids if required.
      */
     static BatchedCommandRequest cloneInsertWithIds(BatchedCommandRequest origCmdRequest);
 
 private:
+    template <typename Req, typename F, typename... As>
+    static decltype(auto) _visitImpl(Req&& r, F&& f, As&&... as) {
+        switch (r._batchType) {
+            case BatchedCommandRequest::BatchType_Insert:
+                return std::forward<F>(f)(*r._insertReq, std::forward<As>(as)...);
+            case BatchedCommandRequest::BatchType_Update:
+                return std::forward<F>(f)(*r._updateReq, std::forward<As>(as)...);
+            case BatchedCommandRequest::BatchType_Delete:
+                return std::forward<F>(f)(*r._deleteReq, std::forward<As>(as)...);
+        }
+        MONGO_UNREACHABLE;
+    }
+    template <typename... As>
+    decltype(auto) _visit(As&&... as) {
+        return _visitImpl(*this, std::forward<As>(as)...);
+    }
+    template <typename... As>
+    decltype(auto) _visit(As&&... as) const {
+        return _visitImpl(*this, std::forward<As>(as)...);
+    }
+
     BatchType _batchType;
 
     std::unique_ptr<write_ops::Insert> _insertReq;
@@ -142,6 +167,7 @@ private:
     boost::optional<ChunkVersion> _shardVersion;
 
     boost::optional<BSONObj> _writeConcern;
+    bool _allowImplicitCollectionCreation = true;
 };
 
 /**

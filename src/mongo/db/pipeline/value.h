@@ -1,29 +1,31 @@
+
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -31,7 +33,6 @@
 #include "mongo/base/static_assert.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/pipeline/value_internal.h"
-#include "mongo/platform/unordered_set.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -128,6 +129,8 @@ public:
     /// Deep-convert from BSONElement to Value
     explicit Value(const BSONElement& elem);
 
+    static constexpr StringData kISOFormatString = "%Y-%m-%dT%H:%M:%S.%LZ"_sd;
+
     /** Construct a long or integer-valued Value.
      *
      *  Used when preforming arithmetic operations with int where the
@@ -168,6 +171,12 @@ public:
      */
     bool integral() const;
 
+    /**
+     * Returns true if this value is a numeric type that can be represented as a 64-bit integer,
+     * and false otherwise.
+     */
+    bool integral64Bit() const;
+
     /// Get the BSON type of the field.
     BSONType getType() const {
         return _storage.bsonType();
@@ -180,6 +189,9 @@ public:
     Decimal128 getDecimal() const;
     double getDouble() const;
     std::string getString() const;
+    // May contain embedded NUL bytes, the returned StringData is just a view into the string still
+    // owned by this Value.
+    StringData getStringData() const;
     Document getDocument() const;
     OID getOid() const;
     bool getBool() const;
@@ -351,8 +363,8 @@ private:
 
     explicit Value(const ValueStorage& storage) : _storage(storage) {}
 
-    // does no type checking
-    StringData getStringData() const;  // May contain embedded NUL bytes
+    // May contain embedded NUL bytes, does not check the type.
+    StringData getRawData() const;
 
     ValueStorage _storage;
     friend class MutableValue;  // gets and sets _storage.genericRCPtr
@@ -394,6 +406,11 @@ inline size_t Value::getArrayLength() const {
 }
 
 inline StringData Value::getStringData() const {
+    verify(getType() == String);
+    return getRawData();
+}
+
+inline StringData Value::getRawData() const {
     return _storage.getString();
 }
 
@@ -468,4 +485,4 @@ inline BSONBinData Value::getBinData() const {
     auto stringData = _storage.getString();
     return BSONBinData(stringData.rawData(), stringData.size(), _storage.binDataType());
 }
-};
+}  // namespace mongo

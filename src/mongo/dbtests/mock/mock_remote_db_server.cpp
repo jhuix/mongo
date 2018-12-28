@@ -1,28 +1,31 @@
-/*    Copyright 2012 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -32,9 +35,8 @@
 #include <tuple>
 
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
-#include "mongo/rpc/command_reply.h"
-#include "mongo/rpc/command_reply_builder.h"
 #include "mongo/rpc/metadata.h"
+#include "mongo/rpc/op_msg_rpc_impls.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
@@ -136,6 +138,11 @@ void MockRemoteDBServer::remove(const string& ns, Query query, int flags) {
     _dataMgr.erase(ns);
 }
 
+void MockRemoteDBServer::assignCollectionUuid(const std::string& ns, const mongo::UUID& uuid) {
+    scoped_spinlock sLock(_lock);
+    _uuidToNs[uuid] = ns;
+}
+
 rpc::UniqueReply MockRemoteDBServer::runCommand(InstanceID id, const OpMsgRequest& request) {
     checkIfUp(id);
     std::string cmdName = request.getCommandName().toString();
@@ -163,17 +170,14 @@ rpc::UniqueReply MockRemoteDBServer::runCommand(InstanceID id, const OpMsgReques
     }
 
     // We need to construct a reply message - it will always be read through a view so it
-    // doesn't matter whether we use CommandReplBuilder or LegacyReplyBuilder
-    auto message = rpc::CommandReplyBuilder{}
-                       .setCommandReply(reply)
-                       .setMetadata(rpc::makeEmptyMetadata())
-                       .done();
-    auto replyView = stdx::make_unique<rpc::CommandReply>(&message);
+    // doesn't matter whether we use OpMsgReplyBuilder or LegacyReplyBuilder
+    auto message = rpc::OpMsgReplyBuilder{}.setCommandReply(reply).done();
+    auto replyView = stdx::make_unique<rpc::OpMsgReply>(&message);
     return rpc::UniqueReply(std::move(message), std::move(replyView));
 }
 
 mongo::BSONArray MockRemoteDBServer::query(MockRemoteDBServer::InstanceID id,
-                                           const string& ns,
+                                           const NamespaceStringOrUUID& nsOrUuid,
                                            mongo::Query query,
                                            int nToReturn,
                                            int nToSkip,
@@ -191,6 +195,7 @@ mongo::BSONArray MockRemoteDBServer::query(MockRemoteDBServer::InstanceID id,
     scoped_spinlock sLock(_lock);
     _queryCount++;
 
+    auto ns = nsOrUuid.uuid() ? _uuidToNs[*nsOrUuid.uuid()] : nsOrUuid.nss()->ns();
     const vector<BSONObj>& coll = _dataMgr[ns];
     BSONArrayBuilder result;
     for (vector<BSONObj>::const_iterator iter = coll.begin(); iter != coll.end(); ++iter) {
@@ -232,7 +237,7 @@ void MockRemoteDBServer::checkIfUp(InstanceID id) const {
     scoped_spinlock sLock(_lock);
 
     if (!_isRunning || id < _instanceID) {
-        throw mongo::SocketException(mongo::SocketException::CLOSED, _hostAndPort);
+        throwSocketError(mongo::SocketErrorKind::CLOSED, _hostAndPort);
     }
 }
 }

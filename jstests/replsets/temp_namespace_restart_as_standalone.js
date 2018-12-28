@@ -2,7 +2,7 @@
  * Tests that temporary collections are not dropped when a member of a replica set is started up as
  * a stand-alone mongod, i.e. without the --replSet parameter.
  *
- * @tags: [requires_persistence]
+ * @tags: [requires_persistence, requires_majority_read_concern]
  */
 (function() {
     var rst = new ReplSetTest({nodes: 2});
@@ -55,7 +55,16 @@
     var secondaryNodeId = rst.getNodeId(secondaryDB.getMongo());
     rst.stop(secondaryNodeId);
 
-    secondaryConn = MongoRunner.runMongod({dbpath: secondaryConn.dbpath, noCleanData: true});
+    var storageEngine = jsTest.options().storageEngine || "wiredTiger";
+    if (storageEngine === "wiredTiger") {
+        secondaryConn = MongoRunner.runMongod({
+            dbpath: secondaryConn.dbpath,
+            noCleanData: true,
+            setParameter: {recoverFromOplogAsStandalone: true}
+        });
+    } else {
+        secondaryConn = MongoRunner.runMongod({dbpath: secondaryConn.dbpath, noCleanData: true});
+    }
     assert.neq(null, secondaryConn, "secondary failed to start up as a stand-alone mongod");
     secondaryDB = secondaryConn.getDB("test");
 

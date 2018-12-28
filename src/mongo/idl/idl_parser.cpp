@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include <algorithm>
@@ -33,7 +35,7 @@
 #include "mongo/idl/idl_parser.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/commands.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -63,29 +65,26 @@ std::string toCommaDelimitedList(const std::vector<BSONType>& types) {
 constexpr StringData IDLParserErrorContext::kOpMsgDollarDBDefault;
 constexpr StringData IDLParserErrorContext::kOpMsgDollarDB;
 
-bool IDLParserErrorContext::checkAndAssertType(const BSONElement& element, BSONType type) const {
+bool IDLParserErrorContext::checkAndAssertTypeSlowPath(const BSONElement& element,
+                                                       BSONType type) const {
     auto elementType = element.type();
 
-    if (elementType != type) {
-        // If the type is wrong, ignore Null and Undefined values
-        if (elementType == jstNULL || elementType == Undefined) {
-            return false;
-        }
-
-        std::string path = getElementPath(element);
-        uasserted(ErrorCodes::TypeMismatch,
-                  str::stream() << "BSON field '" << path << "' is the wrong type '"
-                                << typeName(element.type())
-                                << "', expected type '"
-                                << typeName(type)
-                                << "'");
+    // If the type is wrong, ignore Null and Undefined values
+    if (elementType == jstNULL || elementType == Undefined) {
+        return false;
     }
 
-    return true;
+    std::string path = getElementPath(element);
+    uasserted(ErrorCodes::TypeMismatch,
+              str::stream() << "BSON field '" << path << "' is the wrong type '"
+                            << typeName(elementType)
+                            << "', expected type '"
+                            << typeName(type)
+                            << "'");
 }
 
-bool IDLParserErrorContext::checkAndAssertBinDataType(const BSONElement& element,
-                                                      BinDataType type) const {
+bool IDLParserErrorContext::checkAndAssertBinDataTypeSlowPath(const BSONElement& element,
+                                                              BinDataType type) const {
     bool isBinDataType = checkAndAssertType(element, BinData);
     if (!isBinDataType) {
         return false;
@@ -250,7 +249,7 @@ void IDLParserErrorContext::appendGenericCommandArguments(
 
         StringData name = element.fieldNameStringData();
         // Include a passthrough field as long the IDL class has not defined it.
-        if (Command::isGenericArgument(name) &&
+        if (mongo::isGenericArgument(name) &&
             std::find(knownFields.begin(), knownFields.end(), name) == knownFields.end()) {
             builder->append(element);
         }

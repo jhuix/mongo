@@ -1,25 +1,27 @@
 // storage_engine.h
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,7 +37,8 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/storage/snapshot_name.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/storage/temporary_record_store.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -139,6 +142,11 @@ public:
     };
 
     /**
+    * The destructor should only be called if we are tearing down but not exiting the process.
+    */
+    virtual ~StorageEngine() {}
+
+    /**
      * Called after the globalStorageEngine pointer has been set up, before any other methods
      * are called. Any initialization work that requires the ability to create OperationContexts
      * should be done here rather than in the constructor.
@@ -186,6 +194,13 @@ public:
     }
 
     /**
+     * Returns whether the storage engine supports capped collections.
+     */
+    virtual bool supportsCappedCollections() const {
+        return true;
+    }
+
+    /**
      * Returns whether the engine supports a journalling concept or not.
      */
     virtual bool isDurable() const = 0;
@@ -196,11 +211,13 @@ public:
     virtual bool isEphemeral() const = 0;
 
     /**
-     * Only MMAPv1 should override this and return true to trigger MMAPv1-specific behavior.
+     * Populates and tears down in-memory data structures, respectively. Only required for storage
+     * engines that support recoverToStableTimestamp().
+     *
+     * Must be called with the global lock acquired in exclusive mode.
      */
-    virtual bool isMmapV1() const {
-        return false;
-    }
+    virtual void loadCatalog(OperationContext* opCtx) {}
+    virtual void closeCatalog(OperationContext* opCtx) {}
 
     /**
      * Closes all file handles associated with a database.
@@ -252,16 +269,37 @@ public:
         return;
     }
 
+    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine does not support a concurrent mode.");
+    }
+
+    virtual void endNonBlockingBackup(OperationContext* opCtx) {
+        return;
+    }
+
+    virtual StatusWith<std::vector<std::string>> extendBackupCursor(OperationContext* opCtx) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine does not support a concurrent mode.");
+    }
+
     /**
      * Recover as much data as possible from a potentially corrupt RecordStore.
      * This only recovers the record data, not indexes or anything else.
      *
      * Generally, this method should not be called directly except by the repairDatabase()
      * free function.
-     *
-     * NOTE: MMAPv1 does not support this method and has its own repairDatabase() method.
      */
     virtual Status repairRecordStore(OperationContext* opCtx, const std::string& ns) = 0;
+
+    /**
+     * Creates a temporary RecordStore on the storage engine. This record store will drop itself
+     * automatically when it goes out of scope. This means the TemporaryRecordStore should not exist
+     * any longer than the OperationContext used to create it. On startup, the storage engine will
+     * drop any un-dropped temporary record stores.
+     */
+    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(
+        OperationContext* opCtx) = 0;
 
     /**
      * This method will be called before there is a clean shutdown.  Storage engines should
@@ -289,17 +327,45 @@ public:
     virtual void setJournalListener(JournalListener* jl) = 0;
 
     /**
-     * Returns whether the storage engine supports "recover to stable timestamp". Returns false
-     * if the storage engine supports the "recover to stable timestamp" feature but does not have
-     * a stable timestamp, or if for some reason the storage engine is unable to recover to the
-     * last provided stable timestamp.
-     *
-     * It is illegal to call this concurrently with `setStableTimestamp` or
-     * `setInitialDataTimestamp`.
+     * Returns whether the storage engine supports "recover to stable timestamp". Returns true
+     * if the storage engine supports "recover to stable timestamp" but does not currently have
+     * a stable timestamp. In that case StorageEngine::recoverToStableTimestamp() will return
+     * a bad status.
      */
     virtual bool supportsRecoverToStableTimestamp() const {
         return false;
     }
+
+    /**
+     * Returns whether the storage engine can provide a recovery timestamp.
+     */
+    virtual bool supportsRecoveryTimestamp() const {
+        return false;
+    }
+
+    /**
+     * Returns true if the storage engine supports the readConcern level "snapshot".
+     */
+    virtual bool supportsReadConcernSnapshot() const {
+        return false;
+    }
+
+    virtual bool supportsReadConcernMajority() const {
+        return false;
+    }
+
+    /**
+     * Returns true if the storage engine supports deferring collection drops until the the storage
+     * engine determines that the storage layer artifacts for the pending drops are no longer needed
+     * based on the stable and oldest timestamps.
+     */
+    virtual bool supportsPendingDrops() const = 0;
+
+    /**
+     * Clears list of drop-pending idents in the storage engine.
+     * Used primarily by rollback after recovering to a stable timestamp.
+     */
+    virtual void clearDropPendingState() = 0;
 
     /**
      * Recovers the storage engine state to the last stable timestamp. "Stable" in this case
@@ -307,26 +373,101 @@ public:
      * used should be one provided by StorageEngine::setStableTimestamp().
      *
      * The "local" database is exempt and should not roll back any state except for
-     * "local.replset.minvalid" and "local.replset.checkpointTimestamp" which must roll back to
-     * the last stable timestamp.
+     * "local.replset.minvalid" which must roll back to the last stable timestamp.
      *
-     * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return false.
+     * If successful, returns the timestamp that the storage engine recovered to.
+     *
+     * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return
+     * false. Returns a bad status if there is no stable timestamp to recover to.
+     *
+     * It is illegal to call this concurrently with `setStableTimestamp` or
+     * `setInitialDataTimestamp`.
      */
-    virtual Status recoverToStableTimestamp() {
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) {
         fassertFailed(40547);
     }
 
     /**
-     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
-     * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
+     * Returns the stable timestamp that the storage engine recovered to on startup. If the
+     * recovery point was not stable, returns "none".
+     * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return false.
      */
-    virtual void setStableTimestamp(SnapshotName snapshotName) {}
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Returns a timestamp that is guaranteed to exist on storage engine recovery to a stable
+     * timestamp. This indicates when the storage engine can safely rollback to stable; and for
+     * durable engines, it is also the guaranteed minimum stable recovery point on server restart
+     * after crash or shutdown.
+     *
+     * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return false. Returns
+     * boost::none if the recovery time has not yet been established. Replication recoverable
+     * rollback may not succeed before establishment, and restart will require resync.
+     */
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint. This
+     * timestamp must not decrease unless force=true is set, in which case we force the stable
+     * timestamp, the oldest timestamp, and the commit timestamp backward.
+     *
+     * The maximumTruncationTimestamp (and newer) must not be truncated from the oplog in order to
+     * recover from the `stableTimestamp`.  `boost::none` implies there are no additional
+     * constraints to what may be truncated.
+     *
+     * For proper truncation of the oplog, this method requires min(stableTimestamp,
+     * maximumTruncationTimestamp) to be monotonically increasing (where `min(stableTimestamp,
+     * boost::none) => stableTimestamp`). Otherwise truncation can race and remove a document
+     * before a call to this method protects it.
+     */
+    virtual void setStableTimestamp(Timestamp stableTimestamp,
+                                    boost::optional<Timestamp> maximumTruncationTimestamp,
+                                    bool force = false) {}
 
     /**
      * Tells the storage engine the timestamp of the data at startup. This is necessary because
      * timestamps are not persisted in the storage layer.
      */
-    virtual void setInitialDataTimestamp(SnapshotName snapshotName) {}
+    virtual void setInitialDataTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Uses the current stable timestamp to set the oldest timestamp for which the storage engine
+     * must maintain snapshot history through.
+     *
+     * oldest_timestamp will be set to stable_timestamp adjusted by
+     * 'targetSnapshotHistoryWindowInSeconds' to create a window of available snapshots on the
+     * storage engine from oldest to stable. Furthermore, oldest_timestamp will never be set ahead
+     * of the oplog read timestamp, ensuring the oplog reader's 'read_timestamp' can always be
+     * serviced.
+     */
+    virtual void setOldestTimestampFromStable() {}
+
+    /**
+     * Sets the oldest timestamp for which the storage engine must maintain snapshot history
+     * through. Additionally, all future writes must be newer or equal to this value.
+     */
+    virtual void setOldestTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Indicates whether the storage engine cache is under pressure.
+     *
+     * Retrieves a cache pressure value in the range [0, 100] from the storage engine, and compares
+     * it against storageGlobalParams.cachePressureThreshold, a dynamic server parameter, to
+     * determine whether cache pressure is too high.
+     */
+    virtual bool isCacheUnderPressure(OperationContext* opCtx) const {
+        return false;
+    }
+
+    /**
+     * For unit tests only. Sets the cache pressure value with which isCacheUnderPressure()
+     * evalutates to 'pressure'.
+     */
+    virtual void setCachePressureForTest(int pressure) {}
 
     /**
      *  Notifies the storage engine that a replication batch has completed.
@@ -349,11 +490,25 @@ public:
         return std::vector<CollectionIndexNamePair>();
     };
 
-protected:
     /**
-     * The destructor will never be called. See cleanShutdown instead.
+     * Returns the all committed timestamp. All transactions with timestamps earlier than the
+     * all committed timestamp are committed. Only storage engines that support document level
+     * locking must provide an implementation. Other storage engines may provide a no-op
+     * implementation.
      */
-    virtual ~StorageEngine() {}
+    virtual Timestamp getAllCommittedTimestamp() const = 0;
+
+    /**
+     * Returns the oldest read timestamp in use by an open transaction. Storage engines that support
+     * the 'snapshot' ReadConcern must provide an implementation. Other storage engines may provide
+     * a no-op implementation.
+     */
+    virtual Timestamp getOldestOpenReadTimestamp() const = 0;
+
+    /**
+     * Returns the path to the directory which has the data files of database with `dbName`.
+     */
+    virtual std::string getFilesystemPathForDb(const std::string& dbName) const = 0;
 };
 
 }  // namespace mongo

@@ -1,29 +1,31 @@
+
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -45,6 +47,7 @@
 #include "mongo/platform/decimal128.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/represent_as.h"
 
 namespace mongo {
 using namespace mongoutils;
@@ -56,9 +59,7 @@ using std::string;
 using std::stringstream;
 using std::vector;
 
-namespace {
-constexpr StringData kISOFormatString = "%Y-%m-%dT%H:%M:%S.%LZ"_sd;
-}
+constexpr StringData Value::kISOFormatString;
 
 void ValueStorage::verifyRefCountingIfShould() const {
     switch (type) {
@@ -354,9 +355,9 @@ BSONObjBuilder& operator<<(BSONObjBuilderValueStream& builder, const Value& val)
         case Object:
             return builder << val.getDocument();
         case Symbol:
-            return builder << BSONSymbol(val.getStringData());
+            return builder << BSONSymbol(val.getRawData());
         case Code:
-            return builder << BSONCode(val.getStringData());
+            return builder << BSONCode(val.getRawData());
         case RegEx:
             return builder << BSONRegEx(val.getRegex(), val.getRegexFlags());
 
@@ -364,8 +365,8 @@ BSONObjBuilder& operator<<(BSONObjBuilderValueStream& builder, const Value& val)
             return builder << BSONDBRef(val._storage.getDBRef()->ns, val._storage.getDBRef()->oid);
 
         case BinData:
-            return builder << BSONBinData(val.getStringData().rawData(),  // looking for void*
-                                          val.getStringData().size(),
+            return builder << BSONBinData(val.getRawData().rawData(),  // looking for void*
+                                          val.getRawData().size(),
                                           val._storage.binDataType());
 
         case CodeWScope:
@@ -597,13 +598,13 @@ string Value::coerceToString() const {
         case Code:
         case Symbol:
         case String:
-            return getStringData().toString();
+            return getRawData().toString();
 
         case bsonTimestamp:
             return getTimestamp().toStringPretty();
 
         case Date:
-            return TimeZoneDatabase::utcZone().formatDate(kISOFormatString, getDate());
+            return TimeZoneDatabase::utcZone().formatDate(Value::kISOFormatString, getDate());
 
         case EOO:
         case jstNULL:
@@ -694,7 +695,7 @@ int Value::compare(const Value& rL,
                     return compareDecimalToDouble(rL._storage.getDecimal(),
                                                   rR._storage.doubleValue);
                 default:
-                    invariant(false);
+                    MONGO_UNREACHABLE;
             }
         }
 
@@ -711,7 +712,7 @@ int Value::compare(const Value& rL,
                 case NumberDecimal:
                     return compareIntToDecimal(rL._storage.intValue, rR._storage.getDecimal());
                 default:
-                    invariant(false);
+                    MONGO_UNREACHABLE;
             }
         }
 
@@ -726,7 +727,7 @@ int Value::compare(const Value& rL,
                 case NumberDecimal:
                     return compareLongToDecimal(rL._storage.longValue, rR._storage.getDecimal());
                 default:
-                    invariant(false);
+                    MONGO_UNREACHABLE;
             }
         }
 
@@ -742,7 +743,7 @@ int Value::compare(const Value& rL,
                     return compareDoubleToDecimal(rL._storage.doubleValue,
                                                   rR._storage.getDecimal());
                 default:
-                    invariant(false);
+                    MONGO_UNREACHABLE;
             }
         }
 
@@ -751,15 +752,15 @@ int Value::compare(const Value& rL,
 
         case String: {
             if (!stringComparator) {
-                return rL.getStringData().compare(rR.getStringData());
+                return rL.getStringData().compare(rR.getRawData());
             }
 
-            return stringComparator->compare(rL.getStringData(), rR.getStringData());
+            return stringComparator->compare(rL.getStringData(), rR.getRawData());
         }
 
         case Code:
         case Symbol:
-            return rL.getStringData().compare(rR.getStringData());
+            return rL.getRawData().compare(rR.getRawData());
 
         case Object:
             return Document::compare(rL.getDocument(), rR.getDocument(), stringComparator);
@@ -791,7 +792,7 @@ int Value::compare(const Value& rL,
         }
 
         case BinData: {
-            ret = cmp(rL.getStringData().size(), rR.getStringData().size());
+            ret = cmp(rL.getRawData().size(), rR.getRawData().size());
             if (ret)
                 return ret;
 
@@ -800,13 +801,13 @@ int Value::compare(const Value& rL,
             if (ret)
                 return ret;
 
-            return rL.getStringData().compare(rR.getStringData());
+            return rL.getRawData().compare(rR.getRawData());
         }
 
         case RegEx:
             // same as String in this impl but keeping order same as
             // BSONElement::compareElements().
-            return rL.getStringData().compare(rR.getStringData());
+            return rL.getRawData().compare(rR.getRawData());
 
         case CodeWScope: {
             intrusive_ptr<const RCCodeWScope> l = rL._storage.getCodeWScope();
@@ -891,7 +892,7 @@ void Value::hash_combine(size_t& seed,
 
         case Code:
         case Symbol: {
-            StringData sd = getStringData();
+            StringData sd = getRawData();
             MurmurHash3_x86_32(sd.rawData(), sd.size(), seed, &seed);
             break;
         }
@@ -924,14 +925,14 @@ void Value::hash_combine(size_t& seed,
 
 
         case BinData: {
-            StringData sd = getStringData();
+            StringData sd = getRawData();
             MurmurHash3_x86_32(sd.rawData(), sd.size(), seed, &seed);
             boost::hash_combine(seed, _storage.binDataType());
             break;
         }
 
         case RegEx: {
-            StringData sd = getStringData();
+            StringData sd = getRawData();
             MurmurHash3_x86_32(sd.rawData(), sd.size(), seed, &seed);
             break;
         }
@@ -1013,17 +1014,33 @@ bool Value::integral() const {
         case NumberInt:
             return true;
         case NumberLong:
-            return (_storage.longValue <= numeric_limits<int>::max() &&
-                    _storage.longValue >= numeric_limits<int>::min());
+            return bool(representAs<int>(_storage.longValue));
         case NumberDouble:
-            return (_storage.doubleValue <= numeric_limits<int>::max() &&
-                    _storage.doubleValue >= numeric_limits<int>::min() &&
-                    _storage.doubleValue == static_cast<int>(_storage.doubleValue));
+            return bool(representAs<int>(_storage.doubleValue));
         case NumberDecimal: {
-            // If we are able to convert the decimal to an int32_t without an rounding errors,
+            // If we are able to convert the decimal to an int32_t without any rounding errors,
             // then it is integral.
             uint32_t signalingFlags = Decimal128::kNoFlag;
             (void)_storage.getDecimal().toIntExact(&signalingFlags);
+            return signalingFlags == Decimal128::kNoFlag;
+        }
+        default:
+            return false;
+    }
+}
+
+bool Value::integral64Bit() const {
+    switch (getType()) {
+        case NumberInt:
+        case NumberLong:
+            return true;
+        case NumberDouble:
+            return bool(representAs<int64_t>(_storage.doubleValue));
+        case NumberDecimal: {
+            // If we are able to convert the decimal to an int64_t without any rounding errors,
+            // then it is a 64-bit.
+            uint32_t signalingFlags = Decimal128::kNoFlag;
+            (void)_storage.getDecimal().toLongExact(&signalingFlags);
             return signalingFlags == Decimal128::kNoFlag;
         }
         default:
@@ -1123,7 +1140,7 @@ ostream& operator<<(ostream& out, const Value& val) {
         case Undefined:
             return out << "undefined";
         case Date:
-            return out << TimeZoneDatabase::utcZone().formatDate(kISOFormatString,
+            return out << TimeZoneDatabase::utcZone().formatDate(Value::kISOFormatString,
                                                                  val.coerceToDate());
         case bsonTimestamp:
             return out << val.getTimestamp().toString();
@@ -1200,14 +1217,14 @@ void Value::serializeForSorter(BufBuilder& buf) const {
         case String:
         case Symbol:
         case Code: {
-            StringData str = getStringData();
+            StringData str = getRawData();
             buf.appendNum(int(str.size()));
             buf.appendStr(str, /*NUL byte*/ false);
             break;
         }
 
         case BinData: {
-            StringData str = getStringData();
+            StringData str = getRawData();
             buf.appendChar(_storage.binDataType());
             buf.appendNum(int(str.size()));
             buf.appendStr(str, /*NUL byte*/ false);

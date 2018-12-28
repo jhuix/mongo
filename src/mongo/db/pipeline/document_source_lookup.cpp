@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -65,10 +67,12 @@ std::string pipelineToString(const vector<BSONObj>& pipeline) {
 }
 }  // namespace
 
+constexpr size_t DocumentSourceLookUp::kMaxSubPipelineDepth;
+
 DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
                                            std::string as,
                                            const boost::intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSourceNeedsMongoProcessInterface(pExpCtx),
+    : DocumentSource(pExpCtx),
       _fromNs(std::move(fromNs)),
       _as(std::move(as)),
       _variables(pExpCtx->variables),
@@ -77,6 +81,12 @@ DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
     _resolvedNs = resolvedNamespace.ns;
     _resolvedPipeline = resolvedNamespace.pipeline;
     _fromExpCtx = pExpCtx->copyWith(_resolvedNs);
+
+    _fromExpCtx->subPipelineDepth += 1;
+    uassert(ErrorCodes::MaxSubPipelineDepthExceeded,
+            str::stream() << "Maximum number of nested $lookup sub-pipelines exceeded. Limit is "
+                          << kMaxSubPipelineDepth,
+            _fromExpCtx->subPipelineDepth <= kMaxSubPipelineDepth);
 }
 
 DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
@@ -172,6 +182,38 @@ const char* DocumentSourceLookUp::getSourceName() const {
     return "$lookup";
 }
 
+StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
+    // By default, $lookup is allowed in a transaction and does not use disk.
+    auto diskRequirement = DiskUseRequirement::kNoDiskUse;
+    auto txnRequirement = TransactionRequirement::kAllowed;
+
+    // However, if $lookup is specified with a pipeline, it inherits the strictest disk use and
+    // transaction requirement from the children in its pipeline.
+    if (wasConstructedWithPipelineSyntax()) {
+        const auto resolvedRequirements = StageConstraints::resolveDiskUseAndTransactionRequirement(
+            _parsedIntrospectionPipeline->getSources());
+        diskRequirement = resolvedRequirements.first;
+        txnRequirement = resolvedRequirements.second;
+    }
+
+    // If executing on mongos and the foreign collection is sharded, then this stage can run on
+    // mongos.
+    HostTypeRequirement hostRequirement =
+        (pExpCtx->inMongos && pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _fromNs))
+        ? HostTypeRequirement::kMongoS
+        : HostTypeRequirement::kPrimaryShard;
+
+    StageConstraints constraints(StreamType::kStreaming,
+                                 PositionRequirement::kNone,
+                                 hostRequirement,
+                                 diskRequirement,
+                                 FacetRequirement::kAllowed,
+                                 txnRequirement);
+
+    constraints.canSwapWithMatch = true;
+    return constraints;
+}
+
 namespace {
 
 /**
@@ -224,16 +266,21 @@ DocumentSource::GetNextResult DocumentSourceLookUp::getNext() {
 
     std::vector<Value> results;
     int objsize = 0;
-
+    const auto maxBytes = internalLookupStageIntermediateDocumentMaxSizeBytes.load();
     while (auto result = pipeline->getNext()) {
         objsize += result->getApproximateSize();
         uassert(4568,
                 str::stream() << "Total size of documents in " << _fromNs.coll()
-                              << " matching pipeline "
-                              << getUserPipelineDefinition()
-                              << " exceeds maximum document size",
-                objsize <= BSONObjMaxInternalSize);
+                              << " matching pipeline's $lookup stage exceeds "
+                              << maxBytes
+                              << " bytes",
+
+                objsize <= maxBytes);
         results.emplace_back(std::move(*result));
+    }
+    for (auto&& source : pipeline->getSources()) {
+        if (source->usedDisk())
+            _usedDisk = true;
     }
 
     MutableDocument output(std::move(inputDoc));
@@ -241,7 +288,7 @@ DocumentSource::GetNextResult DocumentSourceLookUp::getNext() {
     return output.freeze();
 }
 
-std::unique_ptr<Pipeline, Pipeline::Deleter> DocumentSourceLookUp::buildPipeline(
+std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
     const Document& inputDoc) {
     // Copy all 'let' variables into the foreign pipeline's expression context.
     copyVariablesToExpCtx(_variables, _variablesParseState, _fromExpCtx.get());
@@ -251,22 +298,18 @@ std::unique_ptr<Pipeline, Pipeline::Deleter> DocumentSourceLookUp::buildPipeline
 
     // If we don't have a cache, build and return the pipeline immediately.
     if (!_cache || _cache->isAbandoned()) {
-        return uassertStatusOK(
-            _mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx));
+        return pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx);
     }
 
     // Tailor the pipeline construction for our needs. We want a non-optimized pipeline without a
-    // cursor source. If the cache is present and serving, then we will not be adding a cursor
-    // source later, so inject a MongoProcessInterface into all stages that need one.
+    // cursor source.
     MongoProcessInterface::MakePipelineOptions pipelineOpts;
-
     pipelineOpts.optimize = false;
     pipelineOpts.attachCursorSource = false;
-    pipelineOpts.forceInjectMongoProcessInterface = _cache->isServing();
 
     // Construct the basic pipeline without a cache stage.
-    auto pipeline = uassertStatusOK(
-        _mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts));
+    auto pipeline =
+        pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts);
 
     // Add the cache stage at the end and optimize. During the optimization process, the cache will
     // either move itself to the correct position in the pipeline, or will abandon itself if no
@@ -278,8 +321,8 @@ std::unique_ptr<Pipeline, Pipeline::Deleter> DocumentSourceLookUp::buildPipeline
 
     if (!_cache->isServing()) {
         // The cache has either been abandoned or has not yet been built. Attach a cursor.
-        uassertStatusOK(
-            _mongoProcessInterface->attachCursorSourceToPipeline(_fromExpCtx, pipeline.get()));
+        pipeline = pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(_fromExpCtx,
+                                                                                pipeline.release());
     }
 
     // If the cache has been abandoned, release it.
@@ -423,8 +466,15 @@ std::string DocumentSourceLookUp::getUserPipelineDefinition() {
     return _resolvedPipeline.back().toString();
 }
 
+bool DocumentSourceLookUp::usedDisk() {
+    if (_pipeline)
+        _usedDisk = _usedDisk || _pipeline->usedDisk();
+    return _usedDisk;
+}
+
 void DocumentSourceLookUp::doDispose() {
     if (_pipeline) {
+        _usedDisk = _usedDisk || _pipeline->usedDisk();
         _pipeline->dispose(pExpCtx->opCtx);
         _pipeline.reset();
     }
@@ -537,6 +587,7 @@ DocumentSource::GetNextResult DocumentSourceLookUp::unwindResult() {
         }
 
         if (_pipeline) {
+            _usedDisk = _usedDisk || _pipeline->usedDisk();
             _pipeline->dispose(pExpCtx->opCtx);
         }
 
@@ -592,7 +643,7 @@ void DocumentSourceLookUp::resolveLetVariables(const Document& localDoc, Variabl
 
     for (auto& letVar : _letVariables) {
         auto value = letVar.expression->evaluate(localDoc);
-        variables->setValue(letVar.id, value);
+        variables->setConstantValue(letVar.id, value);
     }
 }
 
@@ -674,7 +725,7 @@ void DocumentSourceLookUp::serializeToArray(
     }
 }
 
-DocumentSource::GetDepsReturn DocumentSourceLookUp::getDependencies(DepsTracker* deps) const {
+DepsTracker::State DocumentSourceLookUp::getDependencies(DepsTracker* deps) const {
     if (wasConstructedWithPipelineSyntax()) {
         // We will use the introspection pipeline which we prebuilt during construction.
         invariant(_parsedIntrospectionPipeline);
@@ -701,10 +752,10 @@ DocumentSource::GetDepsReturn DocumentSourceLookUp::getDependencies(DepsTracker*
     } else {
         deps->fields.insert(_localField->fullPath());
     }
-    return SEE_NEXT;
+    return DepsTracker::State::SEE_NEXT;
 }
 
-void DocumentSourceLookUp::doDetachFromOperationContext() {
+void DocumentSourceLookUp::detachFromOperationContext() {
     if (_pipeline) {
         // We have a pipeline we're going to be executing across multiple calls to getNext(), so we
         // use Pipeline::detachFromOperationContext() to take care of updating '_fromExpCtx->opCtx'.
@@ -715,7 +766,7 @@ void DocumentSourceLookUp::doDetachFromOperationContext() {
     }
 }
 
-void DocumentSourceLookUp::doReattachToOperationContext(OperationContext* opCtx) {
+void DocumentSourceLookUp::reattachToOperationContext(OperationContext* opCtx) {
     if (_pipeline) {
         // We have a pipeline we're going to be executing across multiple calls to getNext(), so we
         // use Pipeline::reattachToOperationContext() to take care of updating '_fromExpCtx->opCtx'.

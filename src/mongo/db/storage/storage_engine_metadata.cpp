@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -40,9 +42,17 @@
 #include <ostream>
 #include <vector>
 
+#ifdef __linux__  // Only needed by flushDirectory for Linux
+#include <boost/filesystem/path.hpp>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
+#include "mongo/base/data_type_validated.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/storage/mmap_v1/paths.h"
+#include "mongo/rpc/object_check.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
@@ -55,15 +65,6 @@ namespace dps = ::mongo::dotted_path_support;
 namespace {
 
 const std::string kMetadataBasename = "storage.bson";
-
-/**
- * Returns true if local.ns is found in 'directory' or 'directory'/local/.
- */
-bool containsMMapV1LocalNsFile(const std::string& directory) {
-    boost::filesystem::path directoryPath(directory);
-    return boost::filesystem::exists(directoryPath / "local.ns") ||
-        boost::filesystem::exists((directoryPath / "local") / "local.ns");
-}
 
 bool fsyncFile(boost::filesystem::path path) {
     invariant(path.has_filename());
@@ -86,7 +87,7 @@ std::unique_ptr<StorageEngineMetadata> StorageEngineMetadata::forPath(const std:
         Status status = metadata->read();
         if (!status.isOK()) {
             error() << "Unable to read the storage engine metadata file: " << status;
-            fassertFailed(28661);
+            fassertFailedNoTrace(28661);
         }
     }
     return metadata;
@@ -99,11 +100,6 @@ boost::optional<std::string> StorageEngineMetadata::getStorageEngineForPath(
         return {metadata->getStorageEngine()};
     }
 
-    // Fallback to checking for MMAPv1-specific files to handle upgrades from before the
-    // storage.bson metadata file was introduced in 3.0.
-    if (containsMMapV1LocalNsFile(dbpath)) {
-        return {std::string("mmapv1")};
-    }
     return {};
 }
 
@@ -180,15 +176,13 @@ Status StorageEngineMetadata::read() {
                                     << ex.what());
     }
 
-    BSONObj obj;
-    try {
-        obj = BSONObj(&buffer[0]);
-    } catch (DBException& ex) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream() << "Failed to convert data in " << metadataPath.string()
-                                    << " to BSON: "
-                                    << ex.what());
+    ConstDataRange cdr(&buffer[0], buffer.size());
+    auto swObj = cdr.read<Validated<BSONObj>>();
+    if (!swObj.isOK()) {
+        return swObj.getStatus();
     }
+
+    BSONObj obj = swObj.getValue();
 
     // Validate 'storage.engine' field.
     BSONElement storageEngineElement = dps::extractElementAtPath(obj, "storage.engine");
@@ -219,6 +213,51 @@ Status StorageEngineMetadata::read() {
     }
 
     return Status::OK();
+}
+
+void flushMyDirectory(const boost::filesystem::path& file) {
+#ifdef __linux__  // this isn't needed elsewhere
+    static bool _warnedAboutFilesystem = false;
+    // if called without a fully qualified path it asserts; that makes mongoperf fail.
+    // so make a warning. need a better solution longer term.
+    // massert(13652, str::stream() << "Couldn't find parent dir for file: " << file.string(),);
+    if (!file.has_branch_path()) {
+        log() << "warning flushMyDirectory couldn't find parent dir for file: " << file.string();
+        return;
+    }
+
+
+    boost::filesystem::path dir = file.branch_path();  // parent_path in new boosts
+
+    LOG(1) << "flushing directory " << dir.string();
+
+    int fd = ::open(dir.string().c_str(), O_RDONLY);  // DO NOT THROW OR ASSERT BEFORE CLOSING
+    massert(13650,
+            str::stream() << "Couldn't open directory '" << dir.string() << "' for flushing: "
+                          << errnoWithDescription(),
+            fd >= 0);
+    if (fsync(fd) != 0) {
+        int e = errno;
+        if (e == EINVAL) {  // indicates filesystem does not support synchronization
+            if (!_warnedAboutFilesystem) {
+                log() << "\tWARNING: This file system is not supported. For further information"
+                      << " see:" << startupWarningsLog;
+                log() << "\t\t\thttp://dochub.mongodb.org/core/unsupported-filesystems"
+                      << startupWarningsLog;
+                log() << "\t\tPlease notify MongoDB, Inc. if an unlisted filesystem generated "
+                      << "this warning." << startupWarningsLog;
+                _warnedAboutFilesystem = true;
+            }
+        } else {
+            close(fd);
+            massert(13651,
+                    str::stream() << "Couldn't fsync directory '" << dir.string() << "': "
+                                  << errnoWithDescription(e),
+                    false);
+        }
+    }
+    close(fd);
+#endif
 }
 
 Status StorageEngineMetadata::write() const {

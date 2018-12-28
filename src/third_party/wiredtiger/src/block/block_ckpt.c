@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -53,8 +53,6 @@ __wt_block_checkpoint_load(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	WT_DECL_RET;
 	uint8_t *endp;
 
-	ci = NULL;
-
 	/*
 	 * Sometimes we don't find a root page (we weren't given a checkpoint,
 	 * or the checkpoint was empty).  In that case we return an empty root
@@ -62,7 +60,8 @@ __wt_block_checkpoint_load(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	 */
 	*root_addr_sizep = 0;
 
-#ifdef HAVE_VERBOSE
+	ci = NULL;
+
 	if (WT_VERBOSE_ISSET(session, WT_VERB_CHECKPOINT)) {
 		if (addr != NULL) {
 			WT_ERR(__wt_scr_alloc(session, 0, &tmp));
@@ -72,7 +71,6 @@ __wt_block_checkpoint_load(WT_SESSION_IMPL *session, WT_BLOCK *block,
 		    "%s: load-checkpoint: %s", block->name,
 		    addr == NULL ? "[Empty]" : (const char *)tmp->data);
 	}
-#endif
 
 	/*
 	 * There's a single checkpoint in the file that can be written, all of
@@ -223,10 +221,11 @@ __wt_block_checkpoint_start(WT_SESSION_IMPL *session, WT_BLOCK *block)
 	case WT_CKPT_INPROGRESS:
 	case WT_CKPT_PANIC_ON_FAILURE:
 	case WT_CKPT_SALVAGE:
-		ret = __wt_block_panic(session, EINVAL,
+		__wt_err(session, EINVAL,
 		    "%s: an unexpected checkpoint start: the checkpoint "
 		    "has already started or was configured for salvage",
 		    block->name);
+		ret = __wt_block_panic(session);
 		break;
 	case WT_CKPT_NONE:
 		block->ckpt_state = WT_CKPT_INPROGRESS;
@@ -374,8 +373,7 @@ __ckpt_verify(WT_SESSION_IMPL *session, WT_CKPT *ckptbase)
 			 * on some gcc compilers because they don't understand
 			 * FALLTHROUGH as part of a macro.
 			 */
-			return (
-			    __wt_illegal_value(session, "checkpoint array"));
+			return (__wt_illegal_value(session, ckpt->flags));
 		}
 	return (0);
 }
@@ -435,10 +433,11 @@ __ckpt_process(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_CKPT *ckptbase)
 		break;
 	case WT_CKPT_NONE:
 	case WT_CKPT_PANIC_ON_FAILURE:
-		ret = __wt_block_panic(session, EINVAL,
+		__wt_err(session, EINVAL,
 		    "%s: an unexpected checkpoint attempt: the checkpoint "
 		    "was never started or has already completed",
 		    block->name);
+		ret = __wt_block_panic(session);
 		break;
 	case WT_CKPT_SALVAGE:
 		/* Salvage doesn't use the standard checkpoint APIs. */
@@ -545,7 +544,6 @@ __ckpt_process(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_CKPT *ckptbase)
 		    !F_ISSET(ckpt, WT_CKPT_DELETE))
 			continue;
 
-#ifdef HAVE_VERBOSE
 		if (WT_VERBOSE_ISSET(session, WT_VERB_CHECKPOINT)) {
 			if (tmp == NULL)
 				WT_ERR(__wt_scr_alloc(session, 0, &tmp));
@@ -555,7 +553,6 @@ __ckpt_process(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_CKPT *ckptbase)
 			    "%s: delete-checkpoint: %s: %s",
 			    block->name, ckpt->name, (const char *)tmp->data);
 		}
-#endif
 		/*
 		 * Find the checkpoint into which we'll roll this checkpoint's
 		 * blocks: it's the next real checkpoint in the list, and it
@@ -722,9 +719,11 @@ live_update:
 		    "list");
 #endif
 
-err:	if (ret != 0 && fatal)
-		ret = __wt_block_panic(session, ret,
+err:	if (ret != 0 && fatal) {
+		__wt_err(session, ret,
 		    "%s: fatal checkpoint failure", block->name);
+		ret = __wt_block_panic(session);
+	}
 
 	if (locked)
 		__wt_spin_unlock(session, &block->live_lock);
@@ -846,26 +845,30 @@ __wt_block_checkpoint_resolve(
 		goto done;
 	case WT_CKPT_NONE:
 	case WT_CKPT_SALVAGE:
-		ret = __wt_block_panic(session, EINVAL,
+		__wt_err(session, EINVAL,
 		    "%s: an unexpected checkpoint resolution: the checkpoint "
 		    "was never started or completed, or configured for salvage",
 		    block->name);
+		ret = __wt_block_panic(session);
 		break;
 	case WT_CKPT_PANIC_ON_FAILURE:
 		if (!failed)
 			break;
-		ret = __wt_block_panic(session, EINVAL,
+		__wt_err(session, EINVAL,
 		    "%s: the checkpoint failed, the system must restart",
 		    block->name);
+		ret = __wt_block_panic(session);
 		break;
 	}
 	WT_ERR(ret);
 
 	if ((ret = __wt_block_extlist_merge(
-	    session, block, &ci->ckpt_avail, &ci->avail)) != 0)
-		WT_ERR(__wt_block_panic(session, ret,
+	    session, block, &ci->ckpt_avail, &ci->avail)) != 0) {
+		__wt_err(session, ret,
 		    "%s: fatal checkpoint failure during extent list merge",
-		    block->name));
+		    block->name);
+		ret = __wt_block_panic(session);
+	}
 	__wt_spin_unlock(session, &block->live_lock);
 
 	/* Discard the lists remaining after the checkpoint call. */

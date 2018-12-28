@@ -215,6 +215,9 @@ var DB;
             delete optcpy['useCursor'];
         }
 
+        const maxAwaitTimeMS = optcpy.maxAwaitTimeMS;
+        delete optcpy.maxAwaitTimeMS;
+
         // Reassign the cleaned-up options.
         aggregateOptions = optcpy;
 
@@ -263,7 +266,7 @@ var DB;
                 batchSizeValue = cmdObj["cursor"]["batchSize"];
             }
 
-            return new DBCommandCursor(this, res, batchSizeValue);
+            return new DBCommandCursor(this, res, batchSizeValue, maxAwaitTimeMS);
         }
 
         return res;
@@ -322,10 +325,8 @@ var DB;
         var options = opt || {};
 
         // We have special handling for the 'flags' field, and provide sugar for specific flags. If
-        // the
-        // user specifies any flags we send the field in the command. Otherwise, we leave it blank
-        // and
-        // use the server's defaults.
+        // the user specifies any flags we send the field in the command. Otherwise, we leave it
+        // blank and use the server's defaults.
         var sendFlags = false;
         var flags = 0;
         if (options.usePowerOf2Sizes != undefined) {
@@ -464,7 +465,8 @@ var DB;
     };
 
     /**
-      Clone database on another server to here.
+      Clone database on another server to here. This functionality was removed as of MongoDB 4.2.
+      The shell helper is kept to maintain compatibility with previous versions of MongoDB.
       <p>
       Generally, you should dropDatabase() first as otherwise the cloned information will MERGE
       into whatever data is already present in this database.  (That is however a valid way to use
@@ -479,6 +481,8 @@ var DB;
      * See also: db.copyDatabase()
      */
     DB.prototype.cloneDatabase = function(from) {
+        print(
+            "WARNING: db.cloneDatabase will only function with MongoDB 4.0 and below. See http://dochub.mongodb.org/core/4.2-copydb-clone");
         assert(isString(from) && from.length);
         return this._dbCommand({clone: from});
     };
@@ -501,6 +505,8 @@ var DB;
      * See also: db.cloneDatabase()
      */
     DB.prototype.cloneCollection = function(from, collection, query) {
+        print(
+            "WARNING: db.cloneCollection is deprecated. See http://dochub.mongodb.org/core/clonecollection-deprecation");
         assert(isString(from) && from.length);
         assert(isString(collection) && collection.length);
         collection = this._name + "." + collection;
@@ -509,7 +515,9 @@ var DB;
     };
 
     /**
-      Copy database from one server or name to another server or name.
+      Copy database from one server or name to another server or name. This functionality was
+      removed as of MongoDB 4.2. The shell helper is kept to maintain compatibility with previous
+      versions of MongoDB.
 
       Generally, you should dropDatabase() first as otherwise the copied information will MERGE
       into whatever data is already present in this database (and you will get duplicate objects
@@ -530,6 +538,8 @@ var DB;
     */
     DB.prototype.copyDatabase = function(
         fromdb, todb, fromhost, username, password, mechanism, slaveOk) {
+        print(
+            "WARNING: db.copyDatabase will only function with MongoDB 4.0 and below. See http://dochub.mongodb.org/core/4.2-copydb-clone");
         assert(isString(fromdb) && fromdb.length);
         assert(isString(todb) && todb.length);
         fromhost = fromhost || "";
@@ -543,9 +553,10 @@ var DB;
         }
 
         if (!mechanism) {
-            mechanism = this._getDefaultAuthenticationMechanism();
+            mechanism = this._getDefaultAuthenticationMechanism(username, fromdb);
         }
-        assert(mechanism == "SCRAM-SHA-1" || mechanism == "MONGODB-CR");
+        assert(mechanism == "SCRAM-SHA-1" || mechanism == "SCRAM-SHA-256" ||
+               mechanism == "MONGODB-CR");
 
         // Check for no auth or copying from localhost
         if (!username || !password || fromhost == "") {
@@ -553,15 +564,15 @@ var DB;
                 {copydb: 1, fromhost: fromhost, fromdb: fromdb, todb: todb, slaveOk: slaveOk});
         }
 
-        // Use the copyDatabase native helper for SCRAM-SHA-1
-        if (mechanism == "SCRAM-SHA-1") {
+        // Use the copyDatabase native helper for SCRAM-SHA-1/256
+        if (mechanism != "MONGODB-CR") {
             // TODO SERVER-30886: Add session support for Mongo.prototype.copyDatabaseWithSCRAM().
             return this.getMongo().copyDatabaseWithSCRAM(
                 fromdb, todb, fromhost, username, password, slaveOk);
         }
 
         // Fall back to MONGODB-CR
-        var n = this._adminCommand({copydbgetnonce: 1, fromhost: fromhost});
+        var n = assert.commandWorked(this._adminCommand({copydbgetnonce: 1, fromhost: fromhost}));
         return this._adminCommand({
             copydb: 1,
             fromhost: fromhost,
@@ -574,15 +585,6 @@ var DB;
         });
     };
 
-    /**
-      Repair database.
-
-     * @return Object returned has member ok set to true if operation succeeds, false otherwise.
-    */
-    DB.prototype.repairDatabase = function() {
-        return this._dbCommand({repairDatabase: 1});
-    };
-
     DB.prototype.help = function() {
         print("DB methods:");
         print(
@@ -590,14 +592,16 @@ var DB;
         print(
             "\tdb.aggregate([pipeline], {options}) - performs a collectionless aggregation on this database; returns a cursor");
         print("\tdb.auth(username, password)");
-        print("\tdb.cloneDatabase(fromhost)");
+        print("\tdb.cloneDatabase(fromhost) - will only function with MongoDB 4.0 and below");
         print("\tdb.commandHelp(name) returns the help for the command");
-        print("\tdb.copyDatabase(fromdb, todb, fromhost)");
+        print(
+            "\tdb.copyDatabase(fromdb, todb, fromhost) - will only function with MongoDB 4.0 and below");
         print("\tdb.createCollection(name, {size: ..., capped: ..., max: ...})");
-        print("\tdb.createView(name, viewOn, [{$operator: {...}}, ...], {viewOptions})");
         print("\tdb.createUser(userDocument)");
+        print("\tdb.createView(name, viewOn, [{$operator: {...}}, ...], {viewOptions})");
         print("\tdb.currentOp() displays currently executing operations in the db");
         print("\tdb.dropDatabase()");
+        print("\tdb.dropUser(username)");
         print("\tdb.eval() - deprecated");
         print("\tdb.fsyncLock() flush data to disk and lock server for backups");
         print("\tdb.fsyncUnlock() unlocks server following a db.fsyncLock()");
@@ -629,23 +633,20 @@ var DB;
         print("\tdb.printReplicationInfo()");
         print("\tdb.printShardingStatus()");
         print("\tdb.printSlaveReplicationInfo()");
-        print("\tdb.dropUser(username)");
-        print("\tdb.repairDatabase()");
         print("\tdb.resetError()");
         print(
             "\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into {cmdObj: 1}");
         print("\tdb.serverStatus()");
         print("\tdb.setLogLevel(level,<component>)");
         print("\tdb.setProfilingLevel(level,slowms) 0=off 1=slow 2=all");
+        print("\tdb.setVerboseShell(flag) display extra information in shell output");
         print(
             "\tdb.setWriteConcern(<write concern doc>) - sets the write concern for writes to the db");
-        print(
-            "\tdb.unsetWriteConcern(<write concern doc>) - unsets the write concern for writes to the db");
-        print("\tdb.setVerboseShell(flag) display extra information in shell output");
         print("\tdb.shutdownServer()");
         print("\tdb.stats()");
+        print(
+            "\tdb.unsetWriteConcern(<write concern doc>) - unsets the write concern for writes to the db");
         print("\tdb.version() current version of the server");
-
         return __magicNoPrint;
     };
 
@@ -751,29 +752,6 @@ var DB;
     DB.prototype.dbEval = DB.prototype.eval;
 
     /**
-     *
-     *  <p>
-     *   Similar to SQL group by.  For example: </p>
-     *
-     *  <code>select a,b,sum(c) csum from coll where active=1 group by a,b</code>
-     *
-     *  <p>
-     *    corresponds to the following in 10gen:
-     *  </p>
-     *
-     *  <code>
-        db.group(
-            {
-                ns: "coll",
-                key: { a:true, b:true },
-                // keyf: ...,
-                cond: { active:1 },
-                reduce: function(obj,prev) { prev.csum += obj.c; },
-                initial: { csum: 0 }
-            });
-        </code>
-     *
-     *
      * <p>
      *  An array of grouped items is returned.  The array must fit in RAM, thus this function is not
      * suitable when the return set is extremely large.
@@ -822,16 +800,6 @@ var DB;
 
         return this.eval(groupFunction, this._groupFixParms(parmsObj));
     };
-
-    DB.prototype.groupcmd = function(parmsObj) {
-        var ret = this.runCommand({"group": this._groupFixParms(parmsObj)});
-        if (!ret.ok) {
-            throw _getErrorWithCode(ret, "group command failed: " + tojson(ret));
-        }
-        return ret.retval;
-    };
-
-    DB.prototype.group = DB.prototype.groupcmd;
 
     DB.prototype._groupFixParms = function(parmsObj) {
         var parms = Object.extend({}, parmsObj);
@@ -891,76 +859,94 @@ var DB;
         return this.runCommand({getpreverror: 1});
     };
 
-    DB.prototype._getCollectionInfosSystemNamespaces = function(filter) {
-        var all = [];
-
-        var dbNamePrefix = this._name + ".";
-
-        // Create a shallow copy of 'filter' in case we modify its 'name' property. Also defaults
-        // 'filter' to {} if the parameter was not specified.
-        filter = Object.extend({}, filter);
-        if (typeof filter.name === "string") {
-            // Queries on the 'name' field need to qualify the namespace with the database name for
-            // consistency with the command variant.
-            filter.name = dbNamePrefix + filter.name;
-        }
-
-        var c = this.getCollection("system.namespaces").find(filter);
-        while (c.hasNext()) {
-            var infoObj = c.next();
-
-            if (infoObj.name.indexOf("$") >= 0 && infoObj.name.indexOf(".oplog.$") < 0)
-                continue;
-
-            // Remove the database name prefix from the collection info object.
-            infoObj.name = infoObj.name.substring(dbNamePrefix.length);
-
-            all.push(infoObj);
-        }
-
-        // Return list of objects sorted by collection name.
-        return all.sort(function(coll1, coll2) {
-            return coll1.name.localeCompare(coll2.name);
-        });
-    };
-
-    DB.prototype._getCollectionInfosCommand = function(filter) {
+    DB.prototype._getCollectionInfosCommand = function(
+        filter, nameOnly = false, authorizedCollections = false) {
         filter = filter || {};
-        var res = this.runCommand({listCollections: 1, filter: filter});
-        if (res.code == 59) {
-            // command doesn't exist, old mongod
-            return null;
-        }
-
+        var res = this.runCommand({
+            listCollections: 1,
+            filter: filter,
+            nameOnly: nameOnly,
+            authorizedCollections: authorizedCollections
+        });
         if (!res.ok) {
-            if (res.errmsg && res.errmsg.startsWith("no such cmd")) {
-                return null;
-            }
-
             throw _getErrorWithCode(res, "listCollections failed: " + tojson(res));
         }
 
         return new DBCommandCursor(this, res).toArray().sort(compareOn("name"));
     };
 
-    /**
-     * Returns a list that contains the names and options of this database's collections, sorted by
-     * collection name. An optional filter can be specified to match only collections with certain
-     * metadata.
-     */
-    DB.prototype.getCollectionInfos = function(filter) {
-        var res = this._getCollectionInfosCommand(filter);
-        if (res) {
-            return res;
+    DB.prototype._getCollectionInfosFromPrivileges = function() {
+        let ret = this.runCommand({connectionStatus: 1, showPrivileges: 1});
+        if (!ret.ok) {
+            throw _getErrorWithCode(res,
+                                    "Failed to acquire collection information from privileges");
         }
-        return this._getCollectionInfosSystemNamespaces(filter);
+
+        // Parse apart collection information.
+        let result = [];
+
+        let privileges = ret.authInfo.authenticatedUserPrivileges;
+        if (privileges === undefined) {
+            return result;
+        }
+
+        privileges.forEach(privilege => {
+            let resource = privilege.resource;
+            if (resource === undefined) {
+                return;
+            }
+            let db = resource.db;
+            if (db === undefined || db !== this.getName()) {
+                return;
+            }
+            let collection = resource.collection;
+            if (collection === undefined || typeof collection !== "string" || collection === "") {
+                return;
+            }
+
+            result.push({name: collection});
+        });
+
+        return result.sort(compareOn("name"));
+    };
+
+    /**
+     * Returns a list that contains the names and options of this database's collections, sorted
+     * by collection name. An optional filter can be specified to match only collections with
+     * certain metadata.
+     */
+    DB.prototype.getCollectionInfos = function(
+        filter, nameOnly = false, authorizedCollections = false) {
+        try {
+            return this._getCollectionInfosCommand(filter, nameOnly, authorizedCollections);
+        } catch (ex) {
+            if (ex.code !== ErrorCodes.Unauthorized) {
+                // We cannot recover from this error, propagate it.
+                throw ex;
+            }
+
+            // We may be able to compute a set of *some* collections which exist and we have access
+            // to from our privileges. For this to work, the previous operation must have failed due
+            // to authorization, we must be attempting to recover the names of our own collections,
+            // and no filter can have been provided.
+
+            if (nameOnly && authorizedCollections &&
+                Object.getOwnPropertyNames(filter).length === 0 &&
+                ex.code === ErrorCodes.Unauthorized) {
+                print(
+                    "Warning: unable to run listCollections, attempting to approximate collection names by parsing connectionStatus");
+                return this._getCollectionInfosFromPrivileges();
+            }
+
+            throw ex;
+        }
     };
 
     /**
      * Returns this database's list of collection names in sorted order.
      */
     DB.prototype.getCollectionNames = function() {
-        return this.getCollectionInfos().map(function(infoObj) {
+        return this.getCollectionInfos({}, true, true).map(function(infoObj) {
             return infoObj.name;
         });
     };
@@ -1044,11 +1030,6 @@ var DB;
            use local
            db.getReplicationInfo();
       </pre>
-      It is assumed that this database is a replication master -- the information returned is
-      about the operation log stored at local.oplog.$main on the replication master.  (It also
-      works on a machine in a replica pair: for replica pairs, both machines are "masters" from
-      an internal database perspective.
-      <p>
       * @return Object timeSpan: time span of the oplog from start to end  if slave is more out
       *                          of date than that, it can't recover without a complete resync
     */
@@ -1060,10 +1041,8 @@ var DB;
         var localCollections = localdb.getCollectionNames();
         if (localCollections.indexOf('oplog.rs') >= 0) {
             oplog = 'oplog.rs';
-        } else if (localCollections.indexOf('oplog.$main') >= 0) {
-            oplog = 'oplog.$main';
         } else {
-            result.errmsg = "neither master/slave nor replica set replication detected";
+            result.errmsg = "replication not detected";
             return result;
         }
 
@@ -1207,12 +1186,6 @@ var DB;
             for (i in status.members) {
                 r(status.members[i]);
             }
-        } else if (L.sources.count() != 0) {
-            startOptimeDate = new Date();
-            L.sources.find().forEach(g);
-        } else {
-            print("local.sources is empty; is this db a --slave?");
-            return;
         }
     };
 
@@ -1385,7 +1358,7 @@ var DB;
                 "Cannot specify 'digestPassword' through the user management shell helpers, " +
                 "use 'passwordDigestor' instead");
         }
-        var passwordDigestor = cmdObj["passwordDigestor"] ? cmdObj["passwordDigestor"] : "client";
+        var passwordDigestor = cmdObj["passwordDigestor"] ? cmdObj["passwordDigestor"] : "server";
         if (passwordDigestor == "server") {
             cmdObj["digestPassword"] = true;
         } else if (passwordDigestor == "client") {
@@ -1562,16 +1535,38 @@ var DB;
 
     DB.prototype._defaultAuthenticationMechanism = null;
 
-    DB.prototype._getDefaultAuthenticationMechanism = function() {
+    DB.prototype._getDefaultAuthenticationMechanism = function(username, database) {
+        if (username !== undefined) {
+            const userid = database + "." + username;
+            const result = this.runCommand({isMaster: 1, saslSupportedMechs: userid});
+            if (result.ok && (result.saslSupportedMechs !== undefined)) {
+                const mechs = result.saslSupportedMechs;
+                if (!Array.isArray(mechs)) {
+                    throw Error("Server replied with invalid saslSupportedMechs response");
+                }
+
+                if ((this._defaultAuthenticationMechanism != null) &&
+                    mechs.includes(this._defaultAuthenticationMechanism)) {
+                    return this._defaultAuthenticationMechanism;
+                }
+
+                // Never include PLAIN in auto-negotiation.
+                const priority = ["GSSAPI", "SCRAM-SHA-256", "SCRAM-SHA-1"];
+                for (var i = 0; i < priority.length; ++i) {
+                    if (mechs.includes(priority[i])) {
+                        return priority[i];
+                    }
+                }
+            }
+            // If isMaster doesn't support saslSupportedMechs,
+            // or if we couldn't agree on a mechanism,
+            // then fallthrough to configured default or SCRAM-SHA-1.
+        }
+
         // Use the default auth mechanism if set on the command line.
         if (this._defaultAuthenticationMechanism != null)
             return this._defaultAuthenticationMechanism;
 
-        // Use MONGODB-CR for v2.6 and earlier.
-        maxWireVersion = this.isMaster().maxWireVersion;
-        if (maxWireVersion == undefined || maxWireVersion < 3) {
-            return "MONGODB-CR";
-        }
         return "SCRAM-SHA-1";
     };
 
@@ -1590,8 +1585,9 @@ var DB;
                 "auth expects either (username, password) or ({ user: username, pwd: password })");
         }
 
-        if (params.mechanism === undefined)
-            params.mechanism = this._getDefaultAuthenticationMechanism();
+        if (params.mechanism === undefined) {
+            params.mechanism = this._getDefaultAuthenticationMechanism(params.user, this.getName());
+        }
 
         if (params.db !== undefined) {
             throw Error("Do not override db field on db.auth(). Use getMongo().auth(), instead.");
@@ -1848,6 +1844,59 @@ var DB;
 
     DB.prototype.setLogLevel = function(logLevel, component) {
         return this.getMongo().setLogLevel(logLevel, component, this.getSession());
+    };
+
+    DB.prototype.watch = function(pipeline, options) {
+        pipeline = pipeline || [];
+        assert(pipeline instanceof Array, "'pipeline' argument must be an array");
+
+        let changeStreamStage;
+        [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
+        pipeline.unshift(changeStreamStage);
+        return this._runAggregate({aggregate: 1, pipeline: pipeline}, aggOptions);
+    };
+
+    DB.prototype.getFreeMonitoringStatus = function() {
+        'use strict';
+        return assert.commandWorked(this.adminCommand({getFreeMonitoringStatus: 1}));
+    };
+
+    DB.prototype.enableFreeMonitoring = function() {
+        'use strict';
+        const isMaster = this.isMaster();
+        if (isMaster.ismaster == false) {
+            print("ERROR: db.enableFreeMonitoring() may only be run on a primary");
+            return;
+        }
+
+        assert.commandWorked(this.adminCommand({setFreeMonitoring: 1, action: 'enable'}));
+
+        const cmd = this.adminCommand({getFreeMonitoringStatus: 1});
+        if (!cmd.ok && (cmd.code == ErrorCode.Unauthorized)) {
+            // Edge case: It's technically possible that a user can change free-mon state,
+            // but is not allowed to inspect it.
+            print("Successfully initiated free monitoring, but unable to determine status " +
+                  "as you lack the 'checkFreeMonitoringStatus' privilege.");
+            return;
+        }
+        assert.commandWorked(cmd);
+
+        if (cmd.state !== 'enabled') {
+            const url = this.adminCommand({'getParameter': 1, 'cloudFreeMonitoringEndpointURL': 1})
+                            .cloudFreeMonitoringEndpointURL;
+
+            print("Unable to get immediate response from the Cloud Monitoring service. We will" +
+                  "continue to retry in the background. Please check your firewall " +
+                  "settings to ensure that mongod can communicate with \"" + url + "\"");
+            return;
+        }
+
+        print(tojson(cmd));
+    };
+
+    DB.prototype.disableFreeMonitoring = function() {
+        'use strict';
+        assert.commandWorked(this.adminCommand({setFreeMonitoring: 1, action: 'disable'}));
     };
 
     // Writing `this.hasOwnProperty` would cause DB.prototype.getCollection() to be called since the

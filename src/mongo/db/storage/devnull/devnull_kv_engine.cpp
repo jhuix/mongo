@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,6 +33,7 @@
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/snapshot_window_options.h"
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_record_store.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
@@ -66,6 +69,10 @@ public:
         return "devnull";
     }
 
+    const std::string& getIdent() const override {
+        MONGO_UNREACHABLE;
+    }
+
     virtual void setCappedCallback(CappedCallback*) {}
 
     virtual long long dataSize(OperationContext* opCtx) const {
@@ -86,20 +93,20 @@ public:
         return 0;
     }
 
-    virtual RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const {
-        return RecordData(_dummy.objdata(), _dummy.objsize());
-    }
-
     virtual bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const {
         return false;
     }
 
     virtual void deleteRecord(OperationContext* opCtx, const RecordId& dl) {}
 
-    virtual StatusWith<RecordId> insertRecord(
-        OperationContext* opCtx, const char* data, int len, Timestamp, bool enforceQuota) {
-        _numInserts++;
-        return StatusWith<RecordId>(RecordId(6, 4));
+    virtual Status insertRecords(OperationContext* opCtx,
+                                 std::vector<Record>* inOutRecords,
+                                 const std::vector<Timestamp>& timestamps) {
+        _numInserts += inOutRecords->size();
+        for (auto& record : *inOutRecords) {
+            record.id = RecordId(6, 4);
+        }
+        return Status::OK();
     }
 
     virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
@@ -119,9 +126,7 @@ public:
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& oldLocation,
                                 const char* data,
-                                int len,
-                                bool enforceQuota,
-                                UpdateNotifier* notifier) {
+                                int len) {
         return Status::OK();
     }
 
@@ -134,7 +139,7 @@ public:
                                                      const RecordData& oldRec,
                                                      const char* damageSource,
                                                      const mutablebson::DamageVector& damages) {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
 
@@ -185,8 +190,8 @@ class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
 public:
     DevNullSortedDataBuilderInterface() {}
 
-    virtual Status addKey(const BSONObj& key, const RecordId& loc) {
-        return Status::OK();
+    virtual StatusWith<SpecialFormatInserted> addKey(const BSONObj& key, const RecordId& loc) {
+        return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
     }
 };
 
@@ -198,11 +203,11 @@ public:
         return new DevNullSortedDataBuilderInterface();
     }
 
-    virtual Status insert(OperationContext* opCtx,
-                          const BSONObj& key,
-                          const RecordId& loc,
-                          bool dupsAllowed) {
-        return Status::OK();
+    virtual StatusWith<SpecialFormatInserted> insert(OperationContext* opCtx,
+                                                     const BSONObj& key,
+                                                     const RecordId& loc,
+                                                     bool dupsAllowed) {
+        return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
     }
 
     virtual void unindex(OperationContext* opCtx,
@@ -210,7 +215,7 @@ public:
                          const RecordId& loc,
                          bool dupsAllowed) {}
 
-    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key, const RecordId& loc) {
+    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key) {
         return Status::OK();
     }
 
@@ -253,9 +258,35 @@ std::unique_ptr<RecordStore> DevNullKVEngine::getRecordStore(OperationContext* o
     return stdx::make_unique<DevNullRecordStore>(ns, options);
 }
 
+std::unique_ptr<RecordStore> DevNullKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                       StringData ident) {
+    return stdx::make_unique<DevNullRecordStore>("", CollectionOptions());
+}
+
 SortedDataInterface* DevNullKVEngine::getSortedDataInterface(OperationContext* opCtx,
                                                              StringData ident,
                                                              const IndexDescriptor* desc) {
     return new DevNullSortedDataInterface();
 }
+
+bool DevNullKVEngine::isCacheUnderPressure(OperationContext* opCtx) const {
+    return (_cachePressureForTest >= snapshotWindowParams.cachePressureThreshold.load());
 }
+
+void DevNullKVEngine::setCachePressureForTest(int pressure) {
+    invariant(pressure >= 0 && pressure <= 100);
+    _cachePressureForTest = pressure;
+}
+
+StatusWith<std::vector<std::string>> DevNullKVEngine::beginNonBlockingBackup(
+    OperationContext* opCtx) {
+    std::vector<std::string> filesToCopy = {"filename.wt"};
+    return filesToCopy;
+}
+
+StatusWith<std::vector<std::string>> DevNullKVEngine::extendBackupCursor(OperationContext* opCtx) {
+    std::vector<std::string> filesToCopy = {"journal/WiredTigerLog.999"};
+    return filesToCopy;
+}
+
+}  // namespace mongo

@@ -1,26 +1,27 @@
 // wiredtiger_session_cache.h
 
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -92,16 +93,60 @@ public:
         return _session;
     }
 
-    WT_CURSOR* getCursor(const std::string& uri, uint64_t id, bool forRecordStore);
+    /**
+     * Get a cursor on the table id 'id'. If 'allowOverwrite' is true, insert operations will not
+     * return an error if the record already exists, and update/remove operations will not return
+     * error if the record does not exist.
+     *
+     * This may return a cursor from the cursor cache and these cursors should *always* be released
+     * into the cache by calling releaseCursor().
+     */
+    WT_CURSOR* getCursor(const std::string& uri, uint64_t id, bool allowOverwrite);
 
+    /**
+     * Get a cursor with the 'read_once=true' configuration. This is intended for operations that
+     * will be sequentially scanning large amounts of data. If 'allowOverwrite' is true, insert
+     * operations will not return an error if the record already exists, and update/remove
+     * operations will not return error if the record does not exist.
+     *
+     * This will never return a cursor from the cursor cache, and these cursors should *never* be
+     * released into the cache by calling releaseCursor(). Use closeCursor() instead.
+     */
+    WT_CURSOR* getReadOnceCursor(const std::string& uri, bool allowOverwrite);
+
+    /**
+     * Release a cursor into the cursor cache and close old cursors if the number of cursors in the
+     * cache exceeds kWiredTigerCursorCacheSize.
+     */
     void releaseCursor(uint64_t id, WT_CURSOR* cursor);
+
+    /**
+     * Close a cursor without releasing it into the cursor cache.
+     */
+    void closeCursor(WT_CURSOR* cursor);
 
     void closeCursorsForQueuedDrops(WiredTigerKVEngine* engine);
 
+    /**
+     * Closes all cached cursors matching the uri.  If the uri is empty,
+     * all cached cursors are closed.
+     */
     void closeAllCursors(const std::string& uri);
 
     int cursorsOut() const {
         return _cursorsOut;
+    }
+
+    int cachedCursors() const {
+        return _cursors.size();
+    }
+
+    bool isDropQueuedIdentsAtSessionEndAllowed() const {
+        return _dropQueuedIdentsAtSessionEnd;
+    }
+
+    void dropQueuedIdentsAtSessionEndAllowed(bool dropQueuedIdentsAtSessionEnd) {
+        _dropQueuedIdentsAtSessionEnd = dropQueuedIdentsAtSessionEnd;
     }
 
     static uint64_t genTableId();
@@ -133,7 +178,8 @@ private:
     WT_SESSION* _session;            // owned
     CursorCache _cursors;            // owned
     uint64_t _cursorGen;
-    int _cursorsCached, _cursorsOut;
+    int _cursorsOut;
+    bool _dropQueuedIdentsAtSessionEnd = true;
 };
 
 /**
@@ -155,6 +201,11 @@ public:
     };
 
     /**
+     * Indicates that WiredTiger should be configured to cache cursors.
+     */
+    static bool isEngineCachingCursors();
+
+    /**
      * Returns a smart pointer to a previously released session for reuse, or creates a new session.
      * This method must only be called while holding the global lock to avoid races with
      * shuttingDown, but otherwise is thread safe.
@@ -173,8 +224,8 @@ public:
     void closeCursorsForQueuedDrops();
 
     /**
-     * Closes all cached cursors and ensures that previously opened cursors will be closed on
-     * release.
+     * Closes all cached cursors matching the uri.  If the uri is empty,
+     * all cached cursors are closed.
      */
     void closeAllCursors(const std::string& uri);
 
@@ -192,6 +243,26 @@ public:
      * Uses a temporary session. Safe to call without any locks, even during shutdown.
      */
     void waitUntilDurable(bool forceCheckpoint, bool stableCheckpoint);
+
+    /**
+     * Waits until a prepared unit of work has ended (either been commited or aborted). This
+     * should be used when encountering WT_PREPARE_CONFLICT errors. The caller is required to retry
+     * the conflicting WiredTiger API operation. A return from this function does not guarantee that
+     * the conflicting transaction has ended, only that one prepared unit of work in the process has
+     * signaled that it has ended.
+     * Accepts an OperationContext that will throw an AssertionException when interrupted.
+     *
+     * This method is provided in WiredTigerSessionCache and not RecoveryUnit because all recovery
+     * units share the same session cache, and we want a recovery unit on one thread to signal all
+     * recovery units waiting for prepare conflicts across all other threads.
+     */
+    void waitUntilPreparedUnitOfWorkCommitsOrAborts(OperationContext* opCtx);
+
+    /**
+     * Notifies waiters that the caller's perpared unit of work has ended (either committed or
+     * aborted).
+     */
+    void notifyPreparedUnitOfWorkHasCommittedOrAborted();
 
     WT_CONNECTION* conn() const {
         return _conn;
@@ -239,10 +310,18 @@ private:
     AtomicUInt32 _lastSyncTime;
     stdx::mutex _lastSyncMutex;
 
+    // Mutex and cond var for waiting on prepare commit or abort.
+    stdx::mutex _prepareCommittedOrAbortedMutex;
+    stdx::condition_variable _prepareCommittedOrAbortedCond;
+    std::uint64_t _lastCommitOrAbortCounter;
+
     // Protects _journalListener.
     stdx::mutex _journalListenerMutex;
     // Notified when we commit to the journal.
     JournalListener* _journalListener = &NoOpJournalListener::instance;
+
+    WT_SESSION* _waitUntilDurableSession = nullptr;  // owned, and never explicitly closed
+                                                     // (uses connection close to clean up)
 
     /**
      * Returns a session to the cache for later reuse. If closeAll was called between getting this
@@ -257,4 +336,6 @@ private:
 typedef std::unique_ptr<WiredTigerSession,
                         typename WiredTigerSessionCache::WiredTigerSessionDeleter>
     UniqueWiredTigerSession;
+
+extern const std::string kWTRepairMsg;
 }  // namespace

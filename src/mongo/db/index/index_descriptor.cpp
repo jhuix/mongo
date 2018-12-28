@@ -1,32 +1,34 @@
 // index_descriptor.cpp
 
+
 /**
-*    Copyright (C) 2014 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
 
@@ -90,6 +92,7 @@ constexpr StringData IndexDescriptor::kKeyPatternFieldName;
 constexpr StringData IndexDescriptor::kLanguageOverrideFieldName;
 constexpr StringData IndexDescriptor::kNamespaceFieldName;
 constexpr StringData IndexDescriptor::kPartialFilterExprFieldName;
+constexpr StringData IndexDescriptor::kPathProjectionFieldName;
 constexpr StringData IndexDescriptor::kSparseFieldName;
 constexpr StringData IndexDescriptor::kStorageEngineFieldName;
 constexpr StringData IndexDescriptor::kTextVersionFieldName;
@@ -98,7 +101,6 @@ constexpr StringData IndexDescriptor::kWeightsFieldName;
 
 bool IndexDescriptor::isIndexVersionSupported(IndexVersion indexVersion) {
     switch (indexVersion) {
-        case IndexVersion::kV0:
         case IndexVersion::kV1:
         case IndexVersion::kV2:
             return true;
@@ -107,7 +109,7 @@ bool IndexDescriptor::isIndexVersionSupported(IndexVersion indexVersion) {
 }
 
 std::set<IndexVersion> IndexDescriptor::getSupportedIndexVersions() {
-    return {IndexVersion::kV0, IndexVersion::kV1, IndexVersion::kV2};
+    return {IndexVersion::kV1, IndexVersion::kV2};
 }
 
 Status IndexDescriptor::isIndexVersionAllowedForCreation(
@@ -115,8 +117,6 @@ Status IndexDescriptor::isIndexVersionAllowedForCreation(
     const ServerGlobalParams::FeatureCompatibility& featureCompatibility,
     const BSONObj& indexSpec) {
     switch (indexVersion) {
-        case IndexVersion::kV0:
-            break;
         case IndexVersion::kV1:
         case IndexVersion::kV2:
             return Status::OK();
@@ -127,8 +127,7 @@ Status IndexDescriptor::isIndexVersionAllowedForCreation(
                           << static_cast<int>(indexVersion)};
 }
 
-IndexVersion IndexDescriptor::getDefaultIndexVersion(
-    ServerGlobalParams::FeatureCompatibility::Version featureCompatibilityVersion) {
+IndexVersion IndexDescriptor::getDefaultIndexVersion() {
     return IndexVersion::kV2;
 }
 
@@ -173,4 +172,25 @@ bool IndexDescriptor::areIndexOptionsEquivalent(const IndexDescriptor* other) co
                                                                            rhs.second);
                    });
 }
+
+void IndexDescriptor::setNs(NamespaceString ns) {
+    _parentNS = ns.toString();
+    _indexNamespace = makeIndexNamespace(_parentNS, _indexName);
+
+    // Construct a new infoObj with the namespace field replaced.
+    _infoObj = renameNsInIndexSpec(_infoObj, ns);
 }
+
+BSONObj IndexDescriptor::renameNsInIndexSpec(BSONObj spec, const NamespaceString& newNs) {
+    BSONObjBuilder builder;
+    for (auto&& elt : spec) {
+        if (elt.fieldNameStringData() == kNamespaceFieldName) {
+            builder.append(kNamespaceFieldName, newNs.ns());
+        } else {
+            builder.append(elt);
+        }
+    }
+    return builder.obj();
+}
+
+}  // namespace mongo

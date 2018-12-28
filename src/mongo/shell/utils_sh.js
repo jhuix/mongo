@@ -24,6 +24,10 @@ sh._getConfigDB = function() {
     return db.getSiblingDB("config");
 };
 
+sh._getBalancerStatus = function() {
+    return assert.commandWorked(sh._getConfigDB().adminCommand({balancerStatus: 1}));
+};
+
 sh._dataFormat = function(bytes) {
     if (bytes < 1024)
         return Math.floor(bytes) + "B";
@@ -132,6 +136,7 @@ sh.moveChunk = function(fullName, find, to) {
 };
 
 sh.setBalancerState = function(isOn) {
+    assert(typeof(isOn) == "boolean", "Must pass boolean to setBalancerState");
     if (isOn) {
         return sh.startBalancer();
     } else {
@@ -231,6 +236,21 @@ sh.waitForPingChange = function(activePings, timeout, interval) {
     }
 
     return remainingPings;
+};
+
+sh.waitForBalancer = function(wait, timeout, interval) {
+    if (typeof(wait) === 'undefined') {
+        wait = false;
+    }
+    var initialStatus = sh._getBalancerStatus();
+    if (!initialStatus.inBalancerRound && !wait) {
+        return;
+    }
+    var currentStatus;
+    assert.soon(function() {
+        currentStatus = sh._getBalancerStatus();
+        return (currentStatus.numBalancerRounds - initialStatus.numBalancerRounds) != 0;
+    }, 'Latest balancer status: ' + tojson(currentStatus), timeout, interval);
 };
 
 sh.disableBalancing = function(coll) {
@@ -763,9 +783,7 @@ function printShardingSizes(configDB) {
     output(1, "sharding version: " + tojson(configDB.getCollection("version").findOne()));
 
     output(1, "shards:");
-    var shards = {};
     configDB.shards.find().forEach(function(z) {
-        shards[z._id] = new Mongo(z.host);
         output(2, tojson(z));
     });
 
@@ -780,8 +798,7 @@ function printShardingSizes(configDB) {
                 .forEach(function(coll) {
                     output(3, coll._id + " chunks:");
                     configDB.chunks.find({"ns": coll._id}).sort({min: 1}).forEach(function(chunk) {
-                        var mydb = shards[chunk.shard].getDB(db._id);
-                        var out = mydb.runCommand({
+                        var out = saveDB.adminCommand({
                             dataSize: coll._id,
                             keyPattern: coll.key,
                             min: chunk.min,

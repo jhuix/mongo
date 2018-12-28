@@ -1,17 +1,31 @@
 #!/usr/bin/env python2
-# Copyright (C) 2017 MongoDB Inc.
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# Copyright (C) 2018-present MongoDB, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# Server Side Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 #
 """Test cases for IDL binder."""
 
@@ -236,8 +250,7 @@ class TestImport(testcase.IDLTestcase):
                 strict: false
                 fields:
                     foo: string
-            """),
-            resolver=resolver)
+            """), resolver=resolver)
 
         # Test nested import
         self.assert_bind(
@@ -256,8 +269,7 @@ class TestImport(testcase.IDLTestcase):
                     foo: string
                     foo1: int
                     foo2: double
-            """),
-            resolver=resolver)
+            """), resolver=resolver)
 
         # Test diamond import
         self.assert_bind(
@@ -278,8 +290,7 @@ class TestImport(testcase.IDLTestcase):
                     foo1: int
                     foo2: double
                     foo3: bool
-            """),
-            resolver=resolver)
+            """), resolver=resolver)
 
         # Test cycle import
         self.assert_bind(
@@ -297,8 +308,7 @@ class TestImport(testcase.IDLTestcase):
                 fields:
                     foo: string
                     foo1: bool
-            """),
-            resolver=resolver)
+            """), resolver=resolver)
 
         # Test self cycle import
         self.assert_bind(
@@ -315,8 +325,7 @@ class TestImport(testcase.IDLTestcase):
                 strict: false
                 fields:
                     foo: string
-            """),
-            resolver=resolver)
+            """), resolver=resolver)
 
     def test_import_negative(self):
         # type: () -> None
@@ -373,9 +382,7 @@ class TestImport(testcase.IDLTestcase):
             textwrap.dedent("""
         imports:
             - "notfound.idl"
-            """),
-            idl.errors.ERROR_ID_BAD_IMPORT,
-            resolver=resolver)
+            """), idl.errors.ERROR_ID_BAD_IMPORT, resolver=resolver)
 
         # Duplicate types
         self.assert_parse_fail(
@@ -388,9 +395,7 @@ class TestImport(testcase.IDLTestcase):
                 description: foo
                 cpp_type: foo
                 bson_serialization_type: string
-            """),
-            idl.errors.ERROR_ID_DUPLICATE_SYMBOL,
-            resolver=resolver)
+            """), idl.errors.ERROR_ID_DUPLICATE_SYMBOL, resolver=resolver)
 
         # Duplicate structs
         self.assert_parse_fail(
@@ -403,9 +408,7 @@ class TestImport(testcase.IDLTestcase):
                 description: foo
                 fields:
                     foo1: string
-            """),
-            idl.errors.ERROR_ID_DUPLICATE_SYMBOL,
-            resolver=resolver)
+            """), idl.errors.ERROR_ID_DUPLICATE_SYMBOL, resolver=resolver)
 
         # Duplicate struct and type
         self.assert_parse_fail(
@@ -418,9 +421,7 @@ class TestImport(testcase.IDLTestcase):
                 description: foo
                 fields:
                     foo1: string
-            """),
-            idl.errors.ERROR_ID_DUPLICATE_SYMBOL,
-            resolver=resolver)
+            """), idl.errors.ERROR_ID_DUPLICATE_SYMBOL, resolver=resolver)
 
         # Duplicate type and struct
         self.assert_parse_fail(
@@ -433,9 +434,7 @@ class TestImport(testcase.IDLTestcase):
                 description: foo
                 cpp_type: foo
                 bson_serialization_type: string
-            """),
-            idl.errors.ERROR_ID_DUPLICATE_SYMBOL,
-            resolver=resolver)
+            """), idl.errors.ERROR_ID_DUPLICATE_SYMBOL, resolver=resolver)
 
         # Duplicate enums
         self.assert_parse_fail(
@@ -450,9 +449,7 @@ class TestImport(testcase.IDLTestcase):
                 values:
                     a0: 0
                     b1: 1
-            """),
-            idl.errors.ERROR_ID_DUPLICATE_SYMBOL,
-            resolver=resolver)
+            """), idl.errors.ERROR_ID_DUPLICATE_SYMBOL, resolver=resolver)
 
         # Import a file with errors
         self.assert_parse_fail(
@@ -466,9 +463,7 @@ class TestImport(testcase.IDLTestcase):
                 description: foo
                 cpp_type: foo
                 bson_serialization_type: string
-            """),
-            idl.errors.ERROR_ID_MISSING_REQUIRED_FIELD,
-            resolver=resolver)
+            """), idl.errors.ERROR_ID_MISSING_REQUIRED_FIELD, resolver=resolver)
 
 
 if __name__ == '__main__':

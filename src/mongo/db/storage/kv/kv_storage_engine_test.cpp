@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/db_raii.h"
@@ -35,35 +38,32 @@
 #include "mongo/db/index_names.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context_noop.h"
-#include "mongo/db/repair_database.h"
 #include "mongo/db/repl/repl_settings.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/storage/devnull/devnull_kv_engine.h"
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_engine.h"
 #include "mongo/db/storage/kv/kv_database_catalog_entry.h"
 #include "mongo/db/storage/kv/kv_database_catalog_entry_mock.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/db/unclean_shutdown.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/periodic_runner_factory.h"
 
 namespace mongo {
+namespace {
 
-class KVStorageEngineTest : public unittest::Test {
+class KVStorageEngineTest : public ServiceContextMongoDTest {
 public:
-    KVStorageEngineTest()
-        : _storageEngine(stdx::make_unique<KVStorageEngine>(new EphemeralForTestEngine(),
-                                                            KVStorageEngineOptions())) {}
+    KVStorageEngineTest(RepairAction repair)
+        : ServiceContextMongoDTest("ephemeralForTest", repair),
+          _storageEngine(checked_cast<KVStorageEngine*>(getServiceContext()->getStorageEngine())) {}
 
-    void setUp() final {
-        _serviceContext.setUp();
-    }
-
-    void tearDown() final {
-        _storageEngine->cleanShutdown();
-        _serviceContext.tearDown();
-    }
+    KVStorageEngineTest() : KVStorageEngineTest(RepairAction::kNoRepair) {}
 
     /**
      * Create a collection in the catalog and in the KVEngine. Return the storage engine's `ident`.
@@ -79,6 +79,9 @@ public:
         return _storageEngine->getCatalog()->getCollectionIdent(ns.ns());
     }
 
+    std::unique_ptr<TemporaryRecordStore> makeTemporary(OperationContext* opCtx) {
+        return _storageEngine->makeTemporaryRecordStore(opCtx);
+    }
 
     /**
      * Create a collection table in the KVEngine not reflected in the KVCatalog.
@@ -108,6 +111,17 @@ public:
         return _storageEngine->getEngine()->getAllIdents(opCtx);
     }
 
+    bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
+        std::vector<std::string> allCollections;
+        _storageEngine->getCatalog()->getAllCollections(&allCollections);
+        return std::find(allCollections.begin(), allCollections.end(), nss.toString()) !=
+            allCollections.end();
+    }
+    bool identExists(OperationContext* opCtx, const std::string& ident) {
+        auto idents = getAllKVEngineIdents(opCtx);
+        return std::find(idents.begin(), idents.end(), ident) != idents.end();
+    }
+
     /**
      * Create an index with a key of `{<key>: 1}` and a `name` of <key>.
      */
@@ -125,7 +139,8 @@ public:
 
         DatabaseCatalogEntry* dbce = _storageEngine->getDatabaseCatalogEntry(opCtx, collNs.db());
         CollectionCatalogEntry* cce = dbce->getCollectionCatalogEntry(collNs.ns());
-        auto ret = cce->prepareForIndexBuild(opCtx, descriptor.get());
+        const bool isBackgroundSecondaryBuild = false;
+        auto ret = cce->prepareForIndexBuild(opCtx, descriptor.get(), isBackgroundSecondaryBuild);
         if (!ret.isOK()) {
             return ret;
         }
@@ -134,8 +149,22 @@ public:
         return Status::OK();
     }
 
-    ServiceContextMongoDTest _serviceContext;
-    std::unique_ptr<KVStorageEngine> _storageEngine;
+    KVStorageEngine* _storageEngine;
+};
+
+class KVStorageEngineRepairTest : public KVStorageEngineTest {
+public:
+    KVStorageEngineRepairTest() : KVStorageEngineTest(RepairAction::kRepair) {}
+
+    void tearDown() {
+        auto repairObserver = StorageRepairObserver::get(getGlobalServiceContext());
+        ASSERT(repairObserver->isDone());
+
+        unittest::log() << "Modifications: ";
+        for (const auto& mod : repairObserver->getModifications()) {
+            unittest::log() << "  " << mod;
+        }
+    }
 };
 
 TEST_F(KVStorageEngineTest, ReconcileIdentsTest) {
@@ -177,54 +206,322 @@ TEST_F(KVStorageEngineTest, ReconcileIdentsTest) {
     ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, reconcileStatus.getStatus());
 }
 
-TEST_F(KVStorageEngineTest, RecreateIndexes) {
-    repl::setGlobalReplicationCoordinator(
-        new repl::ReplicationCoordinatorMock(getGlobalServiceContext(), repl::ReplSettings()));
-
+TEST_F(KVStorageEngineTest, LoadCatalogDropsOrphansAfterUncleanShutdown) {
     auto opCtx = cc().makeOperationContext();
 
-    // Create two indexes for `db.coll1` in the catalog named `foo` and `bar`. Verify the indexes
-    // appear as idents in the KVEngine.
-    ASSERT_OK(createCollection(opCtx.get(), NamespaceString("db.coll1")).getStatus());
-    ASSERT_OK(createIndex(opCtx.get(), NamespaceString("db.coll1"), "foo"));
-    ASSERT_OK(createIndex(opCtx.get(), NamespaceString("db.coll1"), "bar"));
-    auto kvIdents = getAllKVEngineIdents(opCtx.get());
-    ASSERT_EQUALS(2, std::count_if(kvIdents.begin(), kvIdents.end(), [](const std::string& str) {
-                      return str.find("index-") == 0;
-                  }));
+    const NamespaceString collNs("db.coll1");
+    auto swIdentName = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swIdentName);
 
-    // Use the `getIndexNameObjs` to find the `foo` index in the IndexCatalog.
-    DatabaseCatalogEntry* dbce = _storageEngine->getDatabaseCatalogEntry(opCtx.get(), "db");
-    CollectionCatalogEntry* cce = dbce->getCollectionCatalogEntry("db.coll1");
-    auto swIndexNameObjs = getIndexNameObjs(
-        opCtx.get(), dbce, cce, [](const std::string& indexName) { return indexName == "foo"; });
-    ASSERT_OK(swIndexNameObjs.getStatus());
-    auto& indexNameObjs = swIndexNameObjs.getValue();
-    // There's one index that matched the name `foo`.
-    ASSERT_EQUALS(static_cast<const unsigned long>(1), indexNameObjs.first.size());
-    // Assert the parallel vectors have matching sizes.
-    ASSERT_EQUALS(static_cast<const unsigned long>(1), indexNameObjs.second.size());
-    // The index that matched should be named `foo`.
-    ASSERT_EQUALS("foo", indexNameObjs.first[0]);
-    ASSERT_EQUALS("db.coll1"_sd, indexNameObjs.second[0].getStringField("ns"));
-    ASSERT_EQUALS("foo"_sd, indexNameObjs.second[0].getStringField("name"));
-    ASSERT_EQUALS(2, indexNameObjs.second[0].getIntField("v"));
-    ASSERT_EQUALS(1, indexNameObjs.second[0].getObjectField("key").getIntField("foo"));
+    ASSERT_OK(dropIdent(opCtx.get(), swIdentName.getValue()));
+    ASSERT(collectionExists(opCtx.get(), collNs));
 
-    // Drop the `foo` index table. Count one remaining index ident according to the KVEngine.
-    ASSERT_OK(dropIndexTable(opCtx.get(), NamespaceString("db.coll1"), "foo"));
-    kvIdents = getAllKVEngineIdents(opCtx.get());
-    ASSERT_EQUALS(1, std::count_if(kvIdents.begin(), kvIdents.end(), [](const std::string& str) {
-                      return str.find("index-") == 0;
-                  }));
+    // After the catalog is reloaded, we expect that the collection has been dropped because the
+    // KVEngine was started after an unclean shutdown but not in a repair context.
+    {
+        Lock::GlobalWrite writeLock(opCtx.get(), Date_t::max(), Lock::InterruptBehavior::kThrow);
+        _storageEngine->closeCatalog(opCtx.get());
+        startingAfterUncleanShutdown(getGlobalServiceContext()) = true;
+        _storageEngine->loadCatalog(opCtx.get());
+    }
 
-    AutoGetCollection coll(opCtx.get(), NamespaceString("db.coll1"), LockMode::MODE_X);
-    // Find the `foo` index in the catalog. Rebuild it. Count two indexes in the KVEngine.
-    ASSERT_OK(rebuildIndexesOnCollection(opCtx.get(), dbce, cce, indexNameObjs));
-    ASSERT_TRUE(cce->isIndexReady(opCtx.get(), "foo"));
-    kvIdents = getAllKVEngineIdents(opCtx.get());
-    ASSERT_EQUALS(2, std::count_if(kvIdents.begin(), kvIdents.end(), [](const std::string& str) {
-                      return str.find("index-") == 0;
-                  }));
+    ASSERT(!identExists(opCtx.get(), swIdentName.getValue()));
+    ASSERT(!collectionExists(opCtx.get(), collNs));
 }
+
+TEST_F(KVStorageEngineTest, ReconcileDropsTemporary) {
+    auto opCtx = cc().makeOperationContext();
+
+    auto rs = makeTemporary(opCtx.get());
+    ASSERT(rs.get());
+    const std::string ident = rs->rs()->getIdent();
+
+    ASSERT(identExists(opCtx.get(), ident));
+
+    ASSERT_OK(reconcile(opCtx.get()).getStatus());
+
+    // The storage engine is responsible for dropping its temporary idents.
+    ASSERT(!identExists(opCtx.get(), ident));
+}
+
+TEST_F(KVStorageEngineTest, TemporaryDropsItself) {
+    auto opCtx = cc().makeOperationContext();
+
+    std::string ident;
+    {
+        auto rs = makeTemporary(opCtx.get());
+        ASSERT(rs.get());
+        ident = rs->rs()->getIdent();
+
+        ASSERT(identExists(opCtx.get(), ident));
+    }
+
+    // The temporary record store RAII class should drop itself.
+    ASSERT(!identExists(opCtx.get(), ident));
+}
+
+TEST_F(KVStorageEngineRepairTest, LoadCatalogRecoversOrphans) {
+    auto opCtx = cc().makeOperationContext();
+
+    const NamespaceString collNs("db.coll1");
+    auto swIdentName = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swIdentName);
+
+    ASSERT_OK(dropIdent(opCtx.get(), swIdentName.getValue()));
+    ASSERT(collectionExists(opCtx.get(), collNs));
+
+    // After the catalog is reloaded, we expect that the ident has been recovered because the
+    // KVEngine was started in a repair context.
+    {
+        Lock::GlobalWrite writeLock(opCtx.get(), Date_t::max(), Lock::InterruptBehavior::kThrow);
+        _storageEngine->closeCatalog(opCtx.get());
+        _storageEngine->loadCatalog(opCtx.get());
+    }
+
+    ASSERT(identExists(opCtx.get(), swIdentName.getValue()));
+    ASSERT(collectionExists(opCtx.get(), collNs));
+    StorageRepairObserver::get(getGlobalServiceContext())->onRepairDone(opCtx.get());
+    ASSERT_EQ(1U, StorageRepairObserver::get(getGlobalServiceContext())->getModifications().size());
+}
+
+TEST_F(KVStorageEngineRepairTest, ReconcileSucceeds) {
+    auto opCtx = cc().makeOperationContext();
+
+    const NamespaceString collNs("db.coll1");
+    auto swIdentName = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swIdentName);
+
+    ASSERT_OK(dropIdent(opCtx.get(), swIdentName.getValue()));
+    ASSERT(collectionExists(opCtx.get(), collNs));
+
+    // Reconcile would normally return an error if a collection existed with a missing ident in the
+    // storage engine. When in a repair context, that should not be the case.
+    ASSERT_OK(reconcile(opCtx.get()).getStatus());
+
+    ASSERT(!identExists(opCtx.get(), swIdentName.getValue()));
+    ASSERT(collectionExists(opCtx.get(), collNs));
+    StorageRepairObserver::get(getGlobalServiceContext())->onRepairDone(opCtx.get());
+    ASSERT_EQ(0U, StorageRepairObserver::get(getGlobalServiceContext())->getModifications().size());
+}
+
+TEST_F(KVStorageEngineRepairTest, LoadCatalogRecoversOrphansInCatalog) {
+    auto opCtx = cc().makeOperationContext();
+
+    const NamespaceString collNs("db.coll1");
+    auto swIdentName = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swIdentName);
+    ASSERT(collectionExists(opCtx.get(), collNs));
+
+    AutoGetDb db(opCtx.get(), collNs.db(), LockMode::MODE_X);
+    // Only drop the catalog entry; storage engine still knows about this ident.
+    // This simulates an unclean shutdown happening between dropping the catalog entry and
+    // the actual drop in storage engine.
+    ASSERT_OK(_storageEngine->getCatalog()->dropCollection(opCtx.get(), collNs.ns()));
+    ASSERT(!collectionExists(opCtx.get(), collNs));
+
+    // When in a repair context, loadCatalog() recreates catalog entries for orphaned idents.
+    _storageEngine->loadCatalog(opCtx.get());
+    auto identNs = swIdentName.getValue();
+    std::replace(identNs.begin(), identNs.end(), '-', '_');
+    NamespaceString orphanNs = NamespaceString("local.orphan." + identNs);
+
+    ASSERT(identExists(opCtx.get(), swIdentName.getValue()));
+    ASSERT(collectionExists(opCtx.get(), orphanNs));
+
+    StorageRepairObserver::get(getGlobalServiceContext())->onRepairDone(opCtx.get());
+    ASSERT_EQ(1U, StorageRepairObserver::get(getGlobalServiceContext())->getModifications().size());
+}
+
+TEST_F(KVStorageEngineTest, LoadCatalogDropsOrphans) {
+    auto opCtx = cc().makeOperationContext();
+
+    const NamespaceString collNs("db.coll1");
+    auto swIdentName = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swIdentName);
+    ASSERT(collectionExists(opCtx.get(), collNs));
+
+    AutoGetDb db(opCtx.get(), collNs.db(), LockMode::MODE_X);
+    // Only drop the catalog entry; storage engine still knows about this ident.
+    // This simulates an unclean shutdown happening between dropping the catalog entry and
+    // the actual drop in storage engine.
+    ASSERT_OK(_storageEngine->getCatalog()->dropCollection(opCtx.get(), collNs.ns()));
+    ASSERT(!collectionExists(opCtx.get(), collNs));
+
+    // When in a normal startup context, loadCatalog() does not recreate catalog entries for
+    // orphaned idents.
+    _storageEngine->loadCatalog(opCtx.get());
+    // reconcileCatalogAndIdents() drops orphaned idents.
+    ASSERT_OK(reconcile(opCtx.get()).getStatus());
+
+    ASSERT(!identExists(opCtx.get(), swIdentName.getValue()));
+    auto identNs = swIdentName.getValue();
+    std::replace(identNs.begin(), identNs.end(), '-', '_');
+    NamespaceString orphanNs = NamespaceString("local.orphan." + identNs);
+    ASSERT(!collectionExists(opCtx.get(), orphanNs));
+}
+
+/**
+ * A test-only mock storage engine supporting timestamps.
+ */
+class TimestampMockKVEngine final : public DevNullKVEngine {
+public:
+    bool supportsRecoveryTimestamp() const override {
+        return true;
+    }
+
+    // Increment the timestamps each time they are called for testing purposes.
+    virtual Timestamp getCheckpointTimestamp() const override {
+        checkpointTimestamp = std::make_unique<Timestamp>(checkpointTimestamp->getInc() + 1);
+        return *checkpointTimestamp;
+    }
+    virtual Timestamp getOldestTimestamp() const override {
+        oldestTimestamp = std::make_unique<Timestamp>(oldestTimestamp->getInc() + 1);
+        return *oldestTimestamp;
+    }
+    virtual Timestamp getStableTimestamp() const override {
+        stableTimestamp = std::make_unique<Timestamp>(stableTimestamp->getInc() + 1);
+        return *stableTimestamp;
+    }
+
+    // Mutable for testing purposes to increment the timestamp.
+    mutable std::unique_ptr<Timestamp> checkpointTimestamp = std::make_unique<Timestamp>();
+    mutable std::unique_ptr<Timestamp> oldestTimestamp = std::make_unique<Timestamp>();
+    mutable std::unique_ptr<Timestamp> stableTimestamp = std::make_unique<Timestamp>();
+};
+
+class TimestampKVEngineTest : public unittest::Test, ScopedGlobalServiceContextForTest {
+public:
+    using TimestampType = KVStorageEngine::TimestampMonitor::TimestampType;
+    using TimestampListener = KVStorageEngine::TimestampMonitor::TimestampListener;
+
+    /**
+     * Create an instance of the KV Storage Engine so that we have a timestamp monitor operating.
+     */
+    TimestampKVEngineTest() {
+        // Set up the periodic runner for background job execution.
+        auto runner = makePeriodicRunner(getServiceContext());
+        runner->startup();
+        getServiceContext()->setPeriodicRunner(std::move(runner));
+
+        KVStorageEngineOptions options{
+            /*directoryPerDB=*/false, /*directoryForIndexes=*/false, /*forRepair=*/false};
+        _storageEngine = std::make_unique<KVStorageEngine>(new TimestampMockKVEngine, options);
+        _storageEngine->finishInit();
+    }
+
+    ~TimestampKVEngineTest() {
+        // Shut down the background periodic task runner, before the storage engine.
+        auto runner = getServiceContext()->getPeriodicRunner();
+        runner->shutdown();
+
+        _storageEngine->cleanShutdown();
+        _storageEngine.reset();
+    }
+
+    std::unique_ptr<KVStorageEngine> _storageEngine;
+
+    TimestampType checkpoint = TimestampType::kCheckpoint;
+    TimestampType oldest = TimestampType::kOldest;
+    TimestampType stable = TimestampType::kStable;
+};
+
+TEST_F(TimestampKVEngineTest, TimestampMonitorRunning) {
+    // The timestamp monitor should only be running if the storage engine supports timestamps.
+    if (!_storageEngine->getEngine()->supportsRecoveryTimestamp())
+        return;
+
+    ASSERT_TRUE(_storageEngine->getTimestampMonitor()->isRunning_forTestOnly());
+}
+
+TEST_F(TimestampKVEngineTest, TimestampListeners) {
+    TimestampListener first(stable, [](Timestamp timestamp) {});
+    TimestampListener second(oldest, [](Timestamp timestamp) {});
+    TimestampListener third(stable, [](Timestamp timestamp) {});
+
+    // Can only register the listener once.
+    _storageEngine->getTimestampMonitor()->addListener(&first);
+
+    _storageEngine->getTimestampMonitor()->removeListener(&first);
+    _storageEngine->getTimestampMonitor()->addListener(&first);
+
+    // Can register all three types of listeners.
+    _storageEngine->getTimestampMonitor()->addListener(&second);
+    _storageEngine->getTimestampMonitor()->addListener(&third);
+
+    _storageEngine->getTimestampMonitor()->removeListener(&first);
+    _storageEngine->getTimestampMonitor()->removeListener(&second);
+    _storageEngine->getTimestampMonitor()->removeListener(&third);
+}
+
+TEST_F(TimestampKVEngineTest, TimestampMonitorNotifiesListeners) {
+    unittest::Barrier barrier(2);
+    bool changes[4] = {false, false, false, false};
+
+    TimestampListener first(checkpoint, [&](Timestamp timestamp) {
+        if (!changes[0]) {
+            changes[0] = true;
+            barrier.countDownAndWait();
+        }
+    });
+
+    TimestampListener second(oldest, [&](Timestamp timestamp) {
+        if (!changes[1]) {
+            changes[1] = true;
+            barrier.countDownAndWait();
+        }
+    });
+
+    TimestampListener third(stable, [&](Timestamp timestamp) {
+        if (!changes[2]) {
+            changes[2] = true;
+            barrier.countDownAndWait();
+        }
+    });
+
+    TimestampListener fourth(stable, [&](Timestamp timestamp) {
+        if (!changes[3]) {
+            changes[3] = true;
+            barrier.countDownAndWait();
+        }
+    });
+
+    _storageEngine->getTimestampMonitor()->addListener(&first);
+    _storageEngine->getTimestampMonitor()->addListener(&second);
+    _storageEngine->getTimestampMonitor()->addListener(&third);
+    _storageEngine->getTimestampMonitor()->addListener(&fourth);
+
+    // Wait until all 4 listeners get notified at least once.
+    size_t listenersNotified = 0;
+    while (listenersNotified < 4) {
+        barrier.countDownAndWait();
+        listenersNotified++;
+    }
+
+    _storageEngine->getTimestampMonitor()->removeListener(&first);
+    _storageEngine->getTimestampMonitor()->removeListener(&second);
+    _storageEngine->getTimestampMonitor()->removeListener(&third);
+    _storageEngine->getTimestampMonitor()->removeListener(&fourth);
+}
+
+TEST_F(TimestampKVEngineTest, TimestampAdvancesOnNotification) {
+    Timestamp previous = Timestamp();
+    int timesNotified = 0;
+
+    TimestampListener listener(stable, [&](Timestamp timestamp) {
+        ASSERT_TRUE(previous < timestamp);
+        previous = timestamp;
+        timesNotified++;
+    });
+    _storageEngine->getTimestampMonitor()->addListener(&listener);
+
+    // Let three rounds of notifications happen while ensuring that each new notification produces
+    // an increasing timestamp.
+    while (timesNotified < 3) {
+        sleepmillis(100);
+    }
+
+    _storageEngine->getTimestampMonitor()->removeListener(&listener);
+}
+
+}  // namespace
 }  // namespace mongo

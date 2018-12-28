@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,27 +36,53 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/find_and_modify_common.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
-#include "mongo/s/commands/cluster_write.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/multi_statement_transaction_requests_sender.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/s/transaction_router.h"
+#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 namespace {
 
+const ReadPreferenceSetting kPrimaryOnlyReadPreference(ReadPreference::PrimaryOnly);
+
+BSONObj getCollation(const BSONObj& cmdObj) {
+    BSONElement collationElement;
+    auto status = bsonExtractTypedField(cmdObj, "collation", BSONType::Object, &collationElement);
+    if (status.isOK()) {
+        return collationElement.Obj();
+    } else if (status != ErrorCodes::NoSuchKey) {
+        uassertStatusOK(status);
+    }
+
+    return BSONObj();
+}
+
+BSONObj getShardKey(OperationContext* opCtx, const ChunkManager& chunkMgr, const BSONObj& query) {
+    BSONObj shardKey =
+        uassertStatusOK(chunkMgr.getShardKeyPattern().extractShardKeyFromQuery(opCtx, query));
+    uassert(ErrorCodes::ShardKeyNotFound,
+            "Query for sharded findAndModify must contain the shard key",
+            !shardKey.isEmpty());
+    return shardKey;
+}
+
 class FindAndModifyCmd : public BasicCommand {
 public:
     FindAndModifyCmd() : BasicCommand("findAndModify", "findandmodify") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     bool adminOnly() const override {
@@ -65,18 +93,25 @@ public:
         return true;
     }
 
+    bool supportsReadConcern(const std::string& dbName,
+                             const BSONObj& cmdObj,
+                             repl::ReadConcernLevel level) const final {
+        return true;
+    }
+
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         find_and_modify::addPrivilegesRequiredForFindAndModify(this, dbname, cmdObj, out);
     }
 
     Status explain(OperationContext* opCtx,
-                   const std::string& dbName,
-                   const BSONObj& cmdObj,
+                   const OpMsgRequest& request,
                    ExplainOptions::Verbosity verbosity,
-                   BSONObjBuilder* out) const override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+                   rpc::ReplyBuilderInterface* result) const override {
+        std::string dbName = request.getDatabase().toString();
+        const BSONObj& cmdObj = request.body;
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
         auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
@@ -85,160 +120,130 @@ public:
         std::shared_ptr<Shard> shard;
 
         if (!routingInfo.cm()) {
-            shard = routingInfo.primary();
+            shard = routingInfo.db().primary();
         } else {
             chunkMgr = routingInfo.cm();
 
             const BSONObj query = cmdObj.getObjectField("query");
+            const BSONObj collation = getCollation(cmdObj);
+            const BSONObj shardKey = getShardKey(opCtx, *chunkMgr, query);
+            const auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
 
-            BSONObj collation;
-            BSONElement collationElement;
-            auto collationElementStatus =
-                bsonExtractTypedField(cmdObj, "collation", BSONType::Object, &collationElement);
-            if (collationElementStatus.isOK()) {
-                collation = collationElement.Obj();
-            } else if (collationElementStatus != ErrorCodes::NoSuchKey) {
-                return collationElementStatus;
-            }
-
-            StatusWith<BSONObj> status = _getShardKey(opCtx, *chunkMgr, query);
-            if (!status.isOK()) {
-                return status.getStatus();
-            }
-
-            BSONObj shardKey = status.getValue();
-            auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
-
-            auto shardStatus =
-                Grid::get(opCtx)->shardRegistry()->getShard(opCtx, chunk->getShardId());
-            if (!shardStatus.isOK()) {
-                return shardStatus.getStatus();
-            }
-
-            shard = shardStatus.getValue();
+            shard = uassertStatusOK(
+                Grid::get(opCtx)->shardRegistry()->getShard(opCtx, chunk.getShardId()));
         }
 
         const auto explainCmd = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
 
         // Time how long it takes to run the explain command on the shard.
         Timer timer;
-
-        BSONObjBuilder result;
-        bool ok = _runCommand(opCtx, chunkMgr, shard->getId(), nss, explainCmd, result);
-        long long millisElapsed = timer.millis();
-
-        if (!ok) {
-            BSONObj res = result.obj();
-            return Status(ErrorCodes::OperationFailed,
-                          str::stream() << "Explain for findAndModify failed: " << res);
-        }
+        BSONObjBuilder bob;
+        _runCommand(opCtx,
+                    shard->getId(),
+                    (chunkMgr ? chunkMgr->getVersion(shard->getId()) : ChunkVersion::UNSHARDED()),
+                    nss,
+                    explainCmd,
+                    &bob);
+        const auto millisElapsed = timer.millis();
 
         Strategy::CommandResult cmdResult;
         cmdResult.shardTargetId = shard->getId();
         cmdResult.target = shard->getConnString();
-        cmdResult.result = result.obj();
+        cmdResult.result = bob.obj();
 
         std::vector<Strategy::CommandResult> shardResults;
         shardResults.push_back(cmdResult);
 
+        auto bodyBuilder = result->getBodyBuilder();
         return ClusterExplain::buildExplainResult(
-            opCtx, shardResults, ClusterExplain::kSingleShard, millisElapsed, out);
+            opCtx, shardResults, ClusterExplain::kSingleShard, millisElapsed, &bodyBuilder);
     }
 
     bool run(OperationContext* opCtx,
              const std::string& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss = parseNsCollectionRequired(dbName, cmdObj);
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
         // findAndModify should only be creating database if upsert is true, but this would require
         // that the parsing be pulled into this function.
         uassertStatusOK(createShardDatabase(opCtx, nss.db()));
 
-        auto routingInfo =
-            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+        const auto routingInfo = uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, nss));
         if (!routingInfo.cm()) {
-            return _runCommand(opCtx, nullptr, routingInfo.primaryId(), nss, cmdObj, result);
+            _runCommand(opCtx,
+                        routingInfo.db().primaryId(),
+                        ChunkVersion::UNSHARDED(),
+                        nss,
+                        cmdObj,
+                        &result);
+            return true;
         }
 
         const auto chunkMgr = routingInfo.cm();
 
         const BSONObj query = cmdObj.getObjectField("query");
-
-        BSONObj collation;
-        BSONElement collationElement;
-        auto collationElementStatus =
-            bsonExtractTypedField(cmdObj, "collation", BSONType::Object, &collationElement);
-        if (collationElementStatus.isOK()) {
-            collation = collationElement.Obj();
-        } else if (collationElementStatus != ErrorCodes::NoSuchKey) {
-            return appendCommandStatus(result, collationElementStatus);
-        }
-
-        BSONObj shardKey = uassertStatusOK(_getShardKey(opCtx, *chunkMgr, query));
-
+        const BSONObj collation = getCollation(cmdObj);
+        const BSONObj shardKey = getShardKey(opCtx, *chunkMgr, query);
         auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
 
-        const bool ok = _runCommand(opCtx, chunkMgr, chunk->getShardId(), nss, cmdObj, result);
-        if (ok) {
-            updateChunkWriteStatsAndSplitIfNeeded(
-                opCtx, chunkMgr.get(), chunk.get(), cmdObj.getObjectField("update").objsize());
-        }
+        _runCommand(opCtx,
+                    chunk.getShardId(),
+                    chunkMgr->getVersion(chunk.getShardId()),
+                    nss,
+                    cmdObj,
+                    &result);
 
-        return ok;
+        return true;
     }
 
 private:
-    static StatusWith<BSONObj> _getShardKey(OperationContext* opCtx,
-                                            const ChunkManager& chunkMgr,
-                                            const BSONObj& query) {
-        // Verify that the query has an equality predicate using the shard key
-        StatusWith<BSONObj> status =
-            chunkMgr.getShardKeyPattern().extractShardKeyFromQuery(opCtx, query);
-
-        if (!status.isOK()) {
-            return status;
-        }
-
-        BSONObj shardKey = status.getValue();
-
-        if (shardKey.isEmpty()) {
-            return Status(ErrorCodes::ShardKeyNotFound,
-                          "query for sharded findAndModify must have shardkey");
-        }
-
-        return shardKey;
-    }
-
-    static bool _runCommand(OperationContext* opCtx,
-                            std::shared_ptr<ChunkManager> chunkManager,
+    static void _runCommand(OperationContext* opCtx,
                             const ShardId& shardId,
+                            const ChunkVersion& shardVersion,
                             const NamespaceString& nss,
                             const BSONObj& cmdObj,
-                            BSONObjBuilder& result) {
-        BSONObj res;
+                            BSONObjBuilder* result) {
+        const auto response = [&] {
+            std::vector<AsyncRequestsSender::Request> requests;
+            requests.emplace_back(
+                shardId,
+                appendShardVersion(CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+                                   shardVersion));
 
-        const auto shard =
-            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
+            bool isRetryableWrite = opCtx->getTxnNumber() && !TransactionRouter::get(opCtx);
 
-        ShardConnection conn(shard->getConnString(), nss.ns(), chunkManager);
-        bool ok =
-            conn->runCommand(nss.db().toString(), filterCommandRequestForPassthrough(cmdObj), res);
-        conn.done();
+            MultiStatementTransactionRequestsSender ars(
+                opCtx,
+                Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
+                nss.db().toString(),
+                requests,
+                kPrimaryOnlyReadPreference,
+                isRetryableWrite ? Shard::RetryPolicy::kIdempotent : Shard::RetryPolicy::kNoRetry);
 
-        if (!ok && res.getIntField("code") == ErrorCodes::StaleConfig) {
+            auto response = ars.next();
+            invariant(ars.done());
+
+            return uassertStatusOK(std::move(response.swResponse));
+        }();
+
+        uassertStatusOK(response.status);
+
+        const auto responseStatus = getStatusFromCommandResult(response.data);
+        if (ErrorCodes::isNeedRetargettingError(responseStatus.code()) ||
+            ErrorCodes::isSnapshotError(responseStatus.code())) {
             // Command code traps this exception and re-runs
-            throw StaleConfigException("FindAndModify", res);
+            uassertStatusOK(responseStatus.withContext("findAndModify"));
         }
 
-        // First append the properly constructed writeConcernError. It will then be skipped
-        // in appendElementsUnique.
-        if (auto wcErrorElem = res["writeConcernError"]) {
-            appendWriteConcernErrorToCmdResponse(shardId, wcErrorElem, result);
+        // First append the properly constructed writeConcernError. It will then be skipped in
+        // appendElementsUnique.
+        if (auto wcErrorElem = response.data["writeConcernError"]) {
+            appendWriteConcernErrorToCmdResponse(shardId, wcErrorElem, *result);
         }
 
-        result.appendElementsUnique(filterCommandReplyForPassthrough(res));
-        return ok;
+        result->appendElementsUnique(
+            CommandHelpers::filterCommandReplyForPassthrough(response.data));
     }
 
 } findAndModifyCmd;

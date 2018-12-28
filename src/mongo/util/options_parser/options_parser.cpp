@@ -1,28 +1,31 @@
-/* Copyright 2013 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
@@ -30,6 +33,7 @@
 #include "mongo/util/options_parser/options_parser.h"
 
 #include <algorithm>
+#include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
 #include <cerrno>
 #include <fstream>
@@ -41,13 +45,18 @@
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/http_client.h"
 #include "mongo/util/options_parser/constraints.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_description.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/shell_exec.h"
+#include "mongo/util/text.h"
 
 namespace mongo {
 namespace optionenvironment {
@@ -56,6 +65,7 @@ using namespace std;
 using std::shared_ptr;
 
 namespace po = boost::program_options;
+namespace fs = boost::filesystem;
 
 stdx::function<bool()> OptionsParser::useStrict;
 
@@ -190,6 +200,7 @@ Status boostAnyToValue(const boost::any& anyValue,
                        const OptionType& type,
                        const Key& key,
                        Value* value) {
+
     try {
         if (anyValue.type() == typeid(StringVector_t)) {
             *value = Value(boost::any_cast<StringVector_t>(anyValue));
@@ -237,6 +248,280 @@ bool OptionIsStringMap(const std::vector<OptionDescription>& options_vector, con
     return false;
 }
 
+Status parseYAMLConfigFile(const std::string&, YAML::Node*);
+/* Searches a YAML node for configuration expansion directives such as:
+ * __rest: https://example.com/path?query=val
+ * __exec: '/usr/bin/getConfig param'
+ *
+ * and optionally the fields `type` and `trim`.
+ *
+ * If the field pairing `trim: whitespace` is present,
+ * then the process() method will have standard ctype spaces removed from
+ * both the front end end of the returned value.
+ *
+ * If the field pairing `type: yaml` is present (valid only the top-level node)
+ * then the process() method will parse any string provided to it as YAML.
+ * If the field is not present, or is set to `string`, then process will
+ * encapsulate any provided string in a YAML String Node.
+ *
+ * If no configuration expansion directive is found, the constructor will
+ * uassert with ErrorCodes::NoSuchKey.
+ */
+class ConfigExpandNode {
+public:
+    ConfigExpandNode(const YAML::Node& node,
+                     const std::string& nodePath,
+                     const OptionsParser::ConfigExpand& configExpand) {
+        invariant(node.IsMap());
+
+        auto nodeName = nodePath;
+        auto prefix = nodePath;
+        if (nodePath.empty()) {
+            nodeName = "Top-level config node";
+        } else {
+            prefix += '.';
+        }
+
+        const auto getStringField = [&node, &prefix](const std::string& fieldName,
+                                                     bool allowed) -> boost::optional<std::string> {
+            try {
+                const auto& strField = node[fieldName];
+                if (!strField.IsDefined()) {
+                    return {boost::none};
+                }
+                uassert(ErrorCodes::BadValue,
+                        str::stream() << prefix << fieldName << " support has not been enabled",
+                        allowed);
+                uassert(ErrorCodes::BadValue,
+                        str::stream() << prefix << fieldName << " must be a string",
+                        strField.IsScalar());
+                return strField.Scalar();
+            } catch (const YAML::InvalidNode&) {
+                // Not this kind of expansion block.
+                return {boost::none};
+            }
+        };
+
+        _expansion = ExpansionType::kRest;
+        auto optRestAction = getStringField("__rest", configExpand.rest);
+        auto optExecAction = getStringField("__exec", configExpand.exec);
+        uassert(ErrorCodes::NoSuchKey,
+                "Neither __exec nor __rest specified for config expansion",
+                optRestAction || optExecAction);
+        uassert(ErrorCodes::BadValue,
+                "Must not specify both __rest and __exec in a single config expansion",
+                !optRestAction || !optExecAction);
+
+        if (optRestAction) {
+            invariant(!optExecAction);
+            _expansion = ExpansionType::kRest;
+            _action = std::move(*optRestAction);
+        } else {
+            invariant(optExecAction);
+            _expansion = ExpansionType::kExec;
+            _action = std::move(*optExecAction);
+        }
+
+        // Parse optional fields, keeping track of how many we've handled.
+        // If there are additional (unknown) fields beyond that, raise an error.
+        size_t numVisitedFields = 1;
+
+        auto optType = getStringField("type", true);
+        if (optType) {
+            ++numVisitedFields;
+            auto typeField = std::move(*optType);
+            if (typeField == "string") {
+                _type = ContentType::kString;
+            } else if (typeField == "yaml") {
+                _type = ContentType::kYAML;
+            } else {
+                uasserted(ErrorCodes::BadValue,
+                          str::stream() << prefix << "type must be either 'string' or 'yaml'");
+            }
+        }
+
+        auto optTrim = getStringField("trim", true);
+        if (optTrim) {
+            ++numVisitedFields;
+            auto trimField = std::move(*optTrim);
+            if (trimField == "none") {
+                _trim = Trim::kNone;
+            } else if (trimField == "whitespace") {
+                _trim = Trim::kWhitespace;
+            } else {
+                uasserted(ErrorCodes::BadValue,
+                          str::stream() << prefix << "trim must be either 'whitespace' or 'none'");
+            }
+        }
+
+        uassert(ErrorCodes::BadValue,
+                str::stream() << nodeName << " expansion block must contain only '"
+                              << getExpansionName()
+                              << "', and optionally 'type' and/or 'trim' fields",
+                node.size() == numVisitedFields);
+
+        uassert(ErrorCodes::BadValue,
+                "Specifying `type: yaml` is only permitted in top-level expansions",
+                nodePath.empty() || (_type == ContentType::kString));
+    }
+
+    std::string getExpansionName() const {
+        return isRestExpansion() ? "__rest" : "__exec";
+    }
+
+    bool isRestExpansion() const {
+        return _expansion == ExpansionType::kRest;
+    }
+
+    bool isExecExpansion() const {
+        return _expansion == ExpansionType::kExec;
+    }
+
+    std::string getAction() const {
+        return _action;
+    }
+
+    /**
+     * Optionally trim whitespace from the result of an expansion,
+     * and either wrap it as a YAML string node, or process it as a
+     * YAML blob.
+     */
+    YAML::Node process(std::string str) const {
+        if (_trim == Trim::kWhitespace) {
+            size_t start = 0;
+            size_t end = str.size();
+            while ((start < end) && std::isspace(str[start])) {
+                ++start;
+            }
+            while ((start < end) && std::isspace(str[end - 1])) {
+                --end;
+            }
+            if ((start > 0) || (end < str.size())) {
+                str = str.substr(start, end - start);
+            }
+        }
+
+        if (_type == ContentType::kString) {
+            return YAML::Node(str);
+        }
+
+        invariant(_type == ContentType::kYAML);
+        YAML::Node newNode;
+        const auto status = parseYAMLConfigFile(str, &newNode);
+        if (!status.isOK()) {
+            uasserted(status.code(),
+                      str::stream() << "Failed processing output of " << getExpansionName()
+                                    << " block for config file: "
+                                    << status.reason());
+        }
+
+        return newNode;
+    }
+
+private:
+    // The type of expansion represented.
+    enum class ExpansionType {
+        kRest,
+        kExec,
+    };
+    ExpansionType _expansion = ExpansionType::kRest;
+
+    // Whether this expansion represents a single value, or structured YAML.
+    enum class ContentType {
+        kString,
+        kYAML,
+    };
+    ContentType _type = ContentType::kString;
+
+    // Whether the result of the expansion action should be trimmed for whitespace.
+    enum class Trim {
+        kNone,
+        kWhitespace,
+    };
+    Trim _trim = Trim::kNone;
+
+    std::string _action;
+};
+
+std::string runYAMLRestExpansion(StringData url, Seconds timeout) {
+
+    auto client = HttpClient::create();
+    uassert(
+        ErrorCodes::OperationFailed, "No HTTP Client available in this build of MongoDB", client);
+
+    // Expect https:// URLs unless we can be sure we're talking to localhost.
+    if (!url.startsWith("https://")) {
+        uassert(ErrorCodes::BadValue,
+                "__rest configuration expansion only supports http/https",
+                url.startsWith("http://"));
+        const auto start = strlen("http://");
+        auto end = url.find('/', start);
+        if (end == std::string::npos) {
+            end = url.size();
+        }
+        HostAndPort hp(url.substr(start, end - start));
+        client->allowInsecureHTTP(hp.isLocalHost());
+    }
+
+    client->setConnectTimeout(timeout);
+    client->setTimeout(timeout);
+
+    std::string output;
+    auto dataBuilder = client->get(url);
+    const auto sz = dataBuilder.size();
+    output.resize(sz);
+    std::copy_n(dataBuilder.release().get(), sz, &output[0]);
+
+    return output;
+}
+
+/* Attempts to parse configuration expansion directives from a config block.
+ *
+ * If a __rest configuration expansion directive is found,
+ * mongo::HttpClient will be invoked to fetch the resource via GET request.
+ *
+ * If an __exec configuration expansion directive is found,
+ * mongo::shellExec() will be invoked to execute the process.
+ *
+ * See the comment for class ConfigExpandNode for more details.
+ */
+StatusWith<YAML::Node> runYAMLExpansion(const YAML::Node& node,
+                                        const std::string& nodePath,
+                                        const OptionsParser::ConfigExpand& configExpand) try {
+    invariant(node.IsMap());
+    ConfigExpandNode expansion(node, nodePath, configExpand);
+
+    auto nodeName = nodePath;
+    auto prefix = nodePath;
+    if (nodePath.empty()) {
+        nodeName = "Top-level config node";
+    } else {
+        prefix += '.';
+    }
+
+    log() << "Processing " << expansion.getExpansionName() << " config expansion for: " << nodeName;
+    const auto action = expansion.getAction();
+    LOG(2) << prefix << expansion.getExpansionName() << ": " << action;
+
+    if (expansion.isRestExpansion()) {
+        return expansion.process(runYAMLRestExpansion(action, configExpand.timeout));
+    }
+
+    invariant(expansion.isExecExpansion());
+    // Hard-cap shell expansion at 128MB
+    const size_t kShellExpandMaxLenBytes = 128 << 20;
+    auto swOutput = shellExec(action, configExpand.timeout, kShellExpandMaxLenBytes);
+    if (!swOutput.isOK()) {
+        return {ErrorCodes::OperationFailed,
+                str::stream() << "Failed expanding __exec section: "
+                              << swOutput.getStatus().reason()};
+    }
+    return expansion.process(std::move(swOutput.getValue()));
+
+} catch (...) {
+    return exceptionToStatus();
+}
+
 // Convert a YAML::Node to a Value.  See comments at the beginning of this section.
 // 'canonicalKey' holds the dotted name that should be used in the result Environment.
 // This ensures that both canonical and deprecated dotted names in the configuration
@@ -244,8 +529,9 @@ bool OptionIsStringMap(const std::vector<OptionDescription>& options_vector, con
 Status YAMLNodeToValue(const YAML::Node& YAMLNode,
                        const std::vector<OptionDescription>& options_vector,
                        const Key& key,
-                       Key* canonicalKey,
-                       Value* value) {
+                       OptionDescription const** option,
+                       Value* value,
+                       const OptionsParser::ConfigExpand& configExpand) {
     bool isRegistered = false;
 
     // The logic below should ensure that we don't use this uninitialized, but we need to
@@ -275,7 +561,7 @@ Status YAMLNodeToValue(const YAML::Node& YAMLNode,
         if (key == iterator->_dottedName || isDeprecated) {
             isRegistered = true;
             type = iterator->_type;
-            *canonicalKey = iterator->_dottedName;
+            *option = &*iterator;
             if (isDeprecated) {
                 warning() << "Option: " << key << " is deprecated. Please use "
                           << iterator->_dottedName << " instead.";
@@ -322,20 +608,48 @@ Status YAMLNodeToValue(const YAML::Node& YAMLNode,
             return Status(ErrorCodes::BadValue, sb.str());
         }
         StringMap_t stringMap;
+
+        const auto addPair = [&stringMap, &key](std::string elemKey, const YAML::Node& elemVal) {
+            if (elemVal.IsSequence() || elemVal.IsMap()) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream()
+                                  << key
+                                  << " has a map with non scalar values, which is not allowed");
+            }
+
+            if (stringMap.count(elemKey) > 0) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "String Map Option: " << key
+                                            << " has duplicate keys in YAML Config: "
+                                            << elemKey);
+            }
+
+            stringMap[std::move(elemKey)] = elemVal.Scalar();
+            return Status::OK();
+        };
+
         for (YAML::const_iterator it = YAMLNode.begin(); it != YAMLNode.end(); ++it) {
-            if (it->second.IsSequence() || it->second.IsMap()) {
-                StringBuilder sb;
-                sb << "Option: " << key
-                   << " has a map with non scalar values, which is not allowed";
-                return Status(ErrorCodes::BadValue, sb.str());
+            auto elementKey = it->first.Scalar();
+            const auto& elementVal = it->second;
+
+            if (elementVal.IsMap()) {
+                auto swExpansion = runYAMLExpansion(
+                    elementVal, str::stream() << key << "." << elementKey, configExpand);
+                if (swExpansion.isOK()) {
+                    const auto status = addPair(elementKey, swExpansion.getValue());
+                    if (!status.isOK()) {
+                        return status;
+                    }
+                    continue;
+                } else if (swExpansion.getStatus().code() != ErrorCodes::NoSuchKey) {
+                    return swExpansion.getStatus();
+                }  // else not an expansion block.
             }
-            if (stringMap.count(it->first.Scalar()) > 0) {
-                StringBuilder sb;
-                sb << "String Map Option: " << key
-                   << " has duplicate keys in YAML Config: " << it->first.Scalar();
-                return Status(ErrorCodes::BadValue, sb.str());
+
+            const auto status = addPair(std::move(elementKey), elementVal);
+            if (!status.isOK()) {
+                return status;
             }
-            stringMap[it->first.Scalar()] = it->second.Scalar();
         }
         *value = Value(stringMap);
         return Status::OK();
@@ -351,6 +665,104 @@ Status YAMLNodeToValue(const YAML::Node& YAMLNode,
     return stringToValue(stringVal, type, key, value);
 }
 
+Status canonicalizeOption(const OptionDescription& option, Environment* env) {
+    if (!option._canonicalize) {
+        return Status::OK();
+    }
+
+    return option._canonicalize(env);
+}
+
+Status checkLongName(const po::variables_map& vm,
+                     const std::string& singleName,
+                     const OptionDescription& option,
+                     Environment* environment,
+                     bool* optionAdded) {
+    // Trim off the short option from our name so we can look it up correctly in our map
+    std::string long_name;
+    std::string::size_type commaOffset = singleName.find(',');
+    if (commaOffset != string::npos) {
+        if (commaOffset != singleName.size() - 2) {
+            StringBuilder sb;
+            sb << "Unexpected comma in option name: \"" << singleName << "\""
+               << ": option name must be in the format \"option,o\" or \"option\", "
+               << "where \"option\" is the long name and \"o\" is the optional one "
+               << "character short alias";
+            return Status(ErrorCodes::BadValue, sb.str());
+        }
+        long_name = singleName.substr(0, commaOffset);
+    } else {
+        long_name = singleName;
+    }
+
+    if (vm.count(long_name)) {
+        if (!vm[long_name].defaulted() && singleName != option._singleName) {
+            warning() << "Option: " << singleName << " is deprecated. Please use "
+                      << option._singleName << " instead.";
+        } else if (long_name == "sslMode") {
+            warning() << "Option: sslMode is deprecated. Please use tlsMode instead.";
+        }
+
+        Value optionValue;
+        Status ret = boostAnyToValue(vm[long_name].value(), option._type, long_name, &optionValue);
+        if (!ret.isOK()) {
+            return ret;
+        }
+
+        // If this is really a StringMap, try to split on "key=value" for each element
+        // in our StringVector
+        if (option._type == StringMap) {
+            StringVector_t keyValueVector;
+            ret = optionValue.get(&keyValueVector);
+            if (!ret.isOK()) {
+                return ret;
+            }
+            StringMap_t mapValue;
+            for (StringVector_t::iterator keyValueVectorIt = keyValueVector.begin();
+                 keyValueVectorIt != keyValueVector.end();
+                 ++keyValueVectorIt) {
+                std::string key;
+                std::string value;
+                if (!mongoutils::str::splitOn(*keyValueVectorIt, '=', key, value)) {
+                    StringBuilder sb;
+                    sb << "Illegal option assignment: \"" << *keyValueVectorIt << "\"";
+                    return Status(ErrorCodes::BadValue, sb.str());
+                }
+                // Make sure we aren't setting an option to two different values
+                if (mapValue.count(key) > 0 && mapValue[key] != value) {
+                    StringBuilder sb;
+                    sb << "Key Value Option: " << option._dottedName
+                       << " has a duplicate key from the same source: " << key;
+                    return Status(ErrorCodes::BadValue, sb.str());
+                }
+                mapValue[key] = value;
+            }
+            optionValue = Value(mapValue);
+        }
+        if (!(*optionAdded)) {
+            auto ret = environment->set(option._dottedName, optionValue);
+            if (!ret.isOK()) {
+                return ret;
+            }
+
+            ret = canonicalizeOption(option, environment);
+            if (!ret.isOK()) {
+                return ret;
+            }
+        } else if (!vm[long_name].defaulted()) {
+            StringBuilder sb;
+            sb << "Error parsing command line:  Multiple occurrences of option \"" << long_name
+               << "\"";
+            return Status(ErrorCodes::BadValue, sb.str());
+        }
+        if (!vm[long_name].defaulted()) {
+            *optionAdded = true;
+        }
+    }
+
+    return Status::OK();
+}
+
 // Add all the values in the given variables_map to our environment.  See comments at the
 // beginning of this section.
 Status addBoostVariablesToEnvironment(const po::variables_map& vm,
@@ -362,66 +774,22 @@ Status addBoostVariablesToEnvironment(const po::variables_map& vm,
         return ret;
     }
 
-    for (std::vector<OptionDescription>::const_iterator iterator = options_vector.begin();
-         iterator != options_vector.end();
-         iterator++) {
-        // Trim off the short option from our name so we can look it up correctly in our map
-        std::string long_name;
-        std::string::size_type commaOffset = iterator->_singleName.find(',');
-        if (commaOffset != string::npos) {
-            if (commaOffset != iterator->_singleName.size() - 2) {
-                StringBuilder sb;
-                sb << "Unexpected comma in option name: \"" << iterator->_singleName << "\""
-                   << ": option name must be in the format \"option,o\" or \"option\", "
-                   << "where \"option\" is the long name and \"o\" is the optional one "
-                   << "character short alias";
-                return Status(ErrorCodes::BadValue, sb.str());
-            }
-            long_name = iterator->_singleName.substr(0, commaOffset);
-        } else {
-            long_name = iterator->_singleName;
+    for (const OptionDescription& od : options_vector) {
+
+        bool optionAdded = false;
+        ret = checkLongName(vm, od._singleName, od, environment, &optionAdded);
+
+        if (!ret.isOK()) {
+            return ret;
         }
 
-        if (vm.count(long_name)) {
-            Value optionValue;
-            Status ret =
-                boostAnyToValue(vm[long_name].value(), iterator->_type, long_name, &optionValue);
+        for (const std::string& deprecatedSingleName : od._deprecatedSingleNames) {
+
+            ret = checkLongName(vm, deprecatedSingleName, od, environment, &optionAdded);
+
             if (!ret.isOK()) {
                 return ret;
             }
-
-            // If this is really a StringMap, try to split on "key=value" for each element
-            // in our StringVector
-            if (iterator->_type == StringMap) {
-                StringVector_t keyValueVector;
-                ret = optionValue.get(&keyValueVector);
-                if (!ret.isOK()) {
-                    return ret;
-                }
-                StringMap_t mapValue;
-                for (StringVector_t::iterator keyValueVectorIt = keyValueVector.begin();
-                     keyValueVectorIt != keyValueVector.end();
-                     ++keyValueVectorIt) {
-                    std::string key;
-                    std::string value;
-                    if (!mongoutils::str::splitOn(*keyValueVectorIt, '=', key, value)) {
-                        StringBuilder sb;
-                        sb << "Illegal option assignment: \"" << *keyValueVectorIt << "\"";
-                        return Status(ErrorCodes::BadValue, sb.str());
-                    }
-                    // Make sure we aren't setting an option to two different values
-                    if (mapValue.count(key) > 0 && mapValue[key] != value) {
-                        StringBuilder sb;
-                        sb << "Key Value Option: " << iterator->_dottedName
-                           << " has a duplicate key from the same source: " << key;
-                        return Status(ErrorCodes::BadValue, sb.str());
-                    }
-                    mapValue[key] = value;
-                }
-                optionValue = Value(mapValue);
-            }
-
-            environment->set(iterator->_dottedName, optionValue).transitional_ignore();
         }
     }
     return Status::OK();
@@ -432,7 +800,8 @@ Status addBoostVariablesToEnvironment(const po::variables_map& vm,
 Status addYAMLNodesToEnvironment(const YAML::Node& root,
                                  const OptionSection& options,
                                  const std::string parentPath,
-                                 Environment* environment) {
+                                 Environment* environment,
+                                 const OptionsParser::ConfigExpand& configExpand) {
     std::vector<OptionDescription> options_vector;
     Status ret = options.getAllOptions(&options_vector);
     if (!ret.isOK()) {
@@ -442,6 +811,20 @@ Status addYAMLNodesToEnvironment(const YAML::Node& root,
     // Don't return an error on empty config files
     if (root.IsNull()) {
         return Status::OK();
+    }
+
+    if (root.IsMap()) {
+        auto swExpansion = runYAMLExpansion(root, parentPath, configExpand);
+        if (swExpansion.isOK()) {
+            // Expanded fine, but disallow recursion.
+            return addYAMLNodesToEnvironment(swExpansion.getValue(),
+                                             options,
+                                             parentPath,
+                                             environment,
+                                             OptionsParser::ConfigExpand());
+        } else if (swExpansion.getStatus().code() != ErrorCodes::NoSuchKey) {
+            return swExpansion.getStatus();
+        }  // else not an expansion block.
     }
 
     if (!root.IsMap() && parentPath.empty()) {
@@ -471,32 +854,52 @@ Status addYAMLNodesToEnvironment(const YAML::Node& root,
             }
         }
 
+        // Avoid potential double-expand in YAMLNodeToValue by clearing configExpand per-element.
+        auto expand = configExpand;
+
+        if (YAMLNode.IsMap()) {
+            auto swExpansion = runYAMLExpansion(YAMLNode, dottedName, expand);
+            if (swExpansion.isOK()) {
+                YAMLNode = std::move(swExpansion.getValue());
+                expand = OptionsParser::ConfigExpand();
+            } else if (swExpansion.getStatus().code() != ErrorCodes::NoSuchKey) {
+                return swExpansion.getStatus();
+            }  // else not an expansion block.
+        }
+
         if (YAMLNode.IsMap() && !OptionIsStringMap(options_vector, dottedName)) {
-            Status ret = addYAMLNodesToEnvironment(YAMLNode, options, dottedName, environment);
+            Status ret =
+                addYAMLNodesToEnvironment(YAMLNode, options, dottedName, environment, expand);
             if (!ret.isOK()) {
                 return ret;
             }
         } else {
-            Key canonicalKey;
+            OptionDescription const* option = nullptr;
             Value optionValue;
-            Status ret =
-                YAMLNodeToValue(YAMLNode, options_vector, dottedName, &canonicalKey, &optionValue);
+            Status ret = YAMLNodeToValue(
+                YAMLNode, options_vector, dottedName, &option, &optionValue, expand);
             if (!ret.isOK()) {
                 return ret;
             }
+            invariant(option);
 
             Value dummyVal;
-            if (environment->get(canonicalKey, &dummyVal).isOK()) {
+            if (environment->get(option->_dottedName, &dummyVal).isOK()) {
                 StringBuilder sb;
                 sb << "Error parsing YAML config: duplicate key: " << dottedName
-                   << "(canonical key: " << canonicalKey << ")";
+                   << "(canonical key: " << option->_dottedName << ")";
                 return Status(ErrorCodes::BadValue, sb.str());
             }
 
             // Only add the value if it is not empty.  YAMLNodeToValue will set the
             // optionValue to an empty Value if we should not set it in the Environment.
             if (!optionValue.isEmpty()) {
-                ret = environment->set(canonicalKey, optionValue);
+                ret = environment->set(option->_dottedName, optionValue);
+                if (!ret.isOK()) {
+                    return ret;
+                }
+
+                ret = canonicalizeOption(*option, environment);
                 if (!ret.isOK()) {
                     return ret;
                 }
@@ -552,6 +955,11 @@ Status addCompositions(const OptionSection& options, const Environment& source, 
                 if (!ret.isOK()) {
                     return ret;
                 }
+
+                ret = canonicalizeOption(*iterator, dest);
+                if (!ret.isOK()) {
+                    return ret;
+                }
             }
         } else if (iterator->_type == StringMap) {
             StringMap_t sourceValue;
@@ -580,6 +988,11 @@ Status addCompositions(const OptionSection& options, const Environment& source, 
 
                 // Set the resulting value in our output environment
                 ret = dest->set(Key(iterator->_dottedName), Value(destValue));
+                if (!ret.isOK()) {
+                    return ret;
+                }
+
+                ret = canonicalizeOption(*iterator, dest);
                 if (!ret.isOK()) {
                     return ret;
                 }
@@ -681,6 +1094,18 @@ Status OptionsParser::parseCommandLine(const OptionSection& options,
         argc++;
     }
 
+    // The function boost::program_options makes the assumption there is at
+    // least one argument passed (usually the executable). When no options are
+    // passed to the executable we're left with an argc value of 0 and an
+    // empty argv_buffer vector from our post-processing above.
+    //
+    // This simply ensures that we always have at least one argument for
+    // boost::program_options
+    if (!argc) {
+        argc = 1;
+        argv_buffer.push_back(nullptr);
+    }
+
     /**
      * Style options for boost command line parser
      *
@@ -709,7 +1134,7 @@ Status OptionsParser::parseCommandLine(const OptionSection& options,
     }
 
     try {
-        po::store(po::command_line_parser(argc, (argc > 0 ? &argv_buffer[0] : NULL))
+        po::store(po::command_line_parser(argc, &argv_buffer[0])
                       .options(boostOptions)
                       .positional(boostPositionalOptions)
                       .style(style)
@@ -722,7 +1147,7 @@ Status OptionsParser::parseCommandLine(const OptionSection& options,
         }
     } catch (po::multiple_occurrences& e) {
         StringBuilder sb;
-        sb << "Error parsing command line:  Multiple occurrences of option \"--"
+        sb << "Error parsing command line:  Multiple occurrences of option \""
            << e.get_option_name() << "\"";
         return Status(ErrorCodes::BadValue, sb.str());
     } catch (po::error& e) {
@@ -850,64 +1275,56 @@ Status OptionsParser::addDefaultValues(const OptionSection& options, Environment
  * simple and works for the current use case of config files which should be limited in size.
  */
 Status OptionsParser::readConfigFile(const std::string& filename, std::string* contents) {
-    FILE* config;
-    config = fopen(filename.c_str(), "r");
-    if (config == NULL) {
+    std::ifstream file;
+    file.open(filename.c_str());
+    if (file.fail()) {
         const int current_errno = errno;
         StringBuilder sb;
-        sb << "Error reading config file: " << strerror(current_errno);
-        return Status(ErrorCodes::InternalError, sb.str());
-    }
-    ON_BLOCK_EXIT(fclose, config);
-
-    // Get length of config file by seeking to the end and getting the cursor position
-    if (fseek(config, 0L, SEEK_END) != 0) {
-        const int current_errno = errno;
-        // TODO: Make sure errno is the correct way to do this
-        // Confirmed that errno gets set in Mac OSX, but not documented
-        StringBuilder sb;
-        sb << "Error seeking in config file: " << strerror(current_errno);
-        return Status(ErrorCodes::InternalError, sb.str());
-    }
-    long configSize = ftell(config);
-
-    // Seek back to the beginning of the file for reading
-    if (fseek(config, 0L, SEEK_SET) != 0) {
-        const int current_errno = errno;
-        // TODO: Make sure errno is the correct way to do this
-        // Confirmed that errno gets set in Mac OSX, but not documented
-        StringBuilder sb;
-        sb << "Error seeking in config file: " << strerror(current_errno);
+        sb << "Error opening config file: " << strerror(current_errno);
         return Status(ErrorCodes::InternalError, sb.str());
     }
 
-    // Read into a vector first since it's guaranteed to have contiguous storage
-    std::vector<char> configVector;
-    configVector.resize(configSize);
+    // check if it's a regular file
+    fs::path configPath(filename);
+    if (!fs::is_regular_file(filename)) {
+        StringBuilder sb;
+        sb << "Error opening config file: " << strerror(EISDIR);
+        return Status(ErrorCodes::InternalError, sb.str());
+    }
 
-    if (configSize > 0) {
-        long nread = 0;
-        while (!feof(config) && nread < configSize) {
-            nread = nread + fread(&configVector[nread], sizeof(char), configSize - nread, config);
-            if (ferror(config)) {
-                const int current_errno = errno;
-                // TODO: Make sure errno is the correct way to do this
-                StringBuilder sb;
-                sb << "Error reading in config file: " << strerror(current_errno);
-                return Status(ErrorCodes::InternalError, sb.str());
-            }
+    // Transfer data to a stringstream
+    std::stringstream config;
+    std::string configString;
+    try {
+        config << file.rdbuf();
+        configString = config.str();
+    } catch (const std::exception& e) {
+        StringBuilder sb;
+        sb << "Error reading in config file: " << e.what();
+        return Status(ErrorCodes::InternalError, sb.str());
+    }
+
+    // Config files cannot have null bytes
+    if (std::count(configString.begin(), configString.end(), '\0') > 0) {
+
+#if defined(_WIN32)
+        // On Windows, it is common for files to be saved by Notepad as UTF-16 with a BOM so convert
+        // it for the user. If the file lacks a BOM, but is UTF-16 encoded we will fail rather then
+        // try to guess the file encoding.
+        const std::array<unsigned char, 2> UTF16LEBOM = {0xff, 0xfe};
+        if (configString.size() >= UTF16LEBOM.size() &&
+            memcmp(configString.data(), UTF16LEBOM.data(), UTF16LEBOM.size()) == 0) {
+            auto wstr = std::wstring(configString.begin() + 2, configString.end());
+            *contents = toUtf8String(wstr);
+            return Status::OK();
         }
-        // Resize our config vector to the number of bytes we actually read
-        configVector.resize(nread);
+#endif
+        return Status(
+            ErrorCodes::FailedToParse,
+            "Config file has null bytes, ensure the file is saved as UTF-8 and not UTF-16.");
     }
-
-    // config file cannot have null bytes
-    if (end(configVector) != std::find(begin(configVector), end(configVector), '\0')) {
-        return Status(ErrorCodes::FailedToParse, "Config file has null bytes");
-    }
-
     // Copy the vector contents into our result string
-    *contents = std::string(configVector.begin(), configVector.end());
+    *contents = std::move(configString);
     return Status::OK();
 }
 
@@ -919,7 +1336,7 @@ namespace {
  * instead they only support "--option=value", this function
  * attempts to workound this by translating the former into the later.
  */
-StatusWith<std::vector<std::string>> transformImplictOptions(
+StatusWith<std::vector<std::string>> transformImplicitOptions(
     const OptionSection& options, const std::vector<std::string>& argvOriginal) {
     if (argvOriginal.empty()) {
         return {std::vector<std::string>()};
@@ -947,6 +1364,16 @@ StatusWith<std::vector<std::string>> transformImplictOptions(
             implicitOptions[opt._singleName.substr(pos + 1)] = &opt;
         } else {
             implicitOptions[opt._singleName] = &opt;
+        }
+
+        for (const std::string& deprecatedSingleName : opt._deprecatedSingleNames) {
+            pos = deprecatedSingleName.find(',');
+            if (pos != string::npos) {
+                implicitOptions[deprecatedSingleName.substr(0, pos)] = &opt;
+                implicitOptions[deprecatedSingleName.substr(pos + 1)] = &opt;
+            } else {
+                implicitOptions[deprecatedSingleName] = &opt;
+            }
         }
     }
 
@@ -1071,6 +1498,57 @@ StatusWith<std::vector<std::string>> transformImplictOptions(
 
 }  // namespace
 
+StatusWith<OptionsParser::ConfigExpand> parseConfigExpand(const Environment& cli) {
+    OptionsParser::ConfigExpand ret;
+
+    if (!cli.count("configExpand")) {
+        return ret;
+    }
+
+    Value expand_value;
+    auto status = cli.get(Key("configExpand"), &expand_value);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    auto expand = expand_value.as<std::string>();
+    if (expand == "none") {
+        return ret;
+    }
+
+    Value timeout_value;
+    status = cli.get(Key("configExpandTimeoutSecs"), &timeout_value);
+    if (status.isOK()) {
+        auto timeout = timeout_value.as<int>();
+        if (timeout <= 0) {
+            return {ErrorCodes::BadValue, "Invalid value for configExpandTimeoutSecs"};
+        }
+        ret.timeout = Seconds{timeout};
+    }
+
+    StringData expandSD(expand);
+    while (!expandSD.empty()) {
+        StringData elem;
+        auto comma = expandSD.find(',');
+        if (comma == std::string::npos) {
+            elem = expandSD;
+            expandSD = StringData();
+        } else {
+            elem = expandSD.substr(0, comma);
+            expandSD = expandSD.substr(comma + 1);
+        }
+        if (elem == "rest") {
+            ret.rest = true;
+        } else if (elem == "exec") {
+            ret.exec = true;
+        } else {
+            return {ErrorCodes::BadValue,
+                    str::stream() << "Invalid value for --configExpand: '" << elem << "'"};
+        }
+    }
+    return ret;
+}
+
 /**
  * Run the OptionsParser
  *
@@ -1091,7 +1569,7 @@ Status OptionsParser::run(const OptionSection& options,
     Environment configEnvironment;
     Environment composedEnvironment;
 
-    auto swTransform = transformImplictOptions(options, argvOriginal);
+    auto swTransform = transformImplicitOptions(options, argvOriginal);
     if (!swTransform.isOK()) {
         return swTransform.getStatus();
     }
@@ -1109,6 +1587,7 @@ Status OptionsParser::run(const OptionSection& options,
     if (!ret.isOK() && ret != ErrorCodes::NoSuchKey) {
         return ret;
     }
+
     // "config" exists in our environment
     else if (ret.isOK()) {
         // Environment::get returns a bad status if config was not set
@@ -1124,22 +1603,15 @@ Status OptionsParser::run(const OptionSection& options,
             return ret;
         }
 
-        YAML::Node YAMLConfig;
-        ret = parseYAMLConfigFile(config_file, &YAMLConfig);
+        auto swExpand = parseConfigExpand(commandLineEnvironment);
+        if (!swExpand.isOK()) {
+            return swExpand.getStatus();
+        }
+        auto configExpand = std::move(swExpand.getValue());
+
+        ret = parseConfigFile(options, config_file, &configEnvironment, configExpand);
         if (!ret.isOK()) {
             return ret;
-        }
-
-        if (isYAMLConfig(YAMLConfig)) {
-            ret = addYAMLNodesToEnvironment(YAMLConfig, options, "", &configEnvironment);
-            if (!ret.isOK()) {
-                return ret;
-            }
-        } else {
-            ret = parseINIConfigFile(options, config_file, &configEnvironment);
-            if (!ret.isOK()) {
-                return ret;
-            }
         }
     }
 
@@ -1192,6 +1664,58 @@ Status OptionsParser::run(const OptionSection& options,
     }
 
     return Status::OK();
+}
+
+Status OptionsParser::runConfigFile(
+    const OptionSection& options,
+    const std::string& config,
+    const std::map<std::string, std::string>& env,  // Unused, interface consistent with run()
+    Environment* configEnvironment) {
+    // Add the default values to our resulting environment
+    Status ret = addDefaultValues(options, configEnvironment);
+    if (!ret.isOK()) {
+        return ret;
+    }
+
+    // Add values from the provided config file
+    ret = parseConfigFile(options, config, configEnvironment, ConfigExpand());
+    if (!ret.isOK()) {
+        return ret;
+    }
+
+    // Add the constraints from our options to the result environment
+    ret = addConstraints(options, configEnvironment);
+    if (!ret.isOK()) {
+        return ret;
+    }
+
+    return ret;
+}
+
+Status OptionsParser::parseConfigFile(const OptionSection& options,
+                                      const std::string& config_file,
+                                      Environment* configEnvironment,
+                                      const ConfigExpand& configExpand) {
+    YAML::Node YAMLConfig;
+    Status ret = parseYAMLConfigFile(config_file, &YAMLConfig);
+    if (!ret.isOK()) {
+        return ret;
+    }
+
+    // Check if YAML parsing was successful, if not try to read as INI
+    if (isYAMLConfig(YAMLConfig)) {
+        ret = addYAMLNodesToEnvironment(YAMLConfig, options, "", configEnvironment, configExpand);
+        if (!ret.isOK()) {
+            return ret;
+        }
+    } else {
+        ret = parseINIConfigFile(options, config_file, configEnvironment);
+        if (!ret.isOK()) {
+            return ret;
+        }
+    }
+
+    return ret;
 }
 
 }  // namespace optionenvironment

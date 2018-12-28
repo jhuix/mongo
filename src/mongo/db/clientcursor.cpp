@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2008, 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -47,8 +49,9 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/cursor_server_params.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/query/explain.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/exit.h"
@@ -78,20 +81,25 @@ long long ClientCursor::totalOpen() {
 ClientCursor::ClientCursor(ClientCursorParams params,
                            CursorManager* cursorManager,
                            CursorId cursorId,
-                           boost::optional<LogicalSessionId> lsid,
+                           OperationContext* operationUsingCursor,
                            Date_t now)
     : _cursorid(cursorId),
       _nss(std::move(params.nss)),
       _authenticatedUsers(std::move(params.authenticatedUsers)),
-      _lsid(std::move(lsid)),
-      _isReadCommitted(params.isReadCommitted),
+      _lsid(operationUsingCursor->getLogicalSessionId()),
+      _txnNumber(operationUsingCursor->getTxnNumber()),
+      _readConcernArgs(params.readConcernArgs),
       _cursorManager(cursorManager),
       _originatingCommand(params.originatingCommandObj),
       _queryOptions(params.queryOptions),
       _exec(std::move(params.exec)),
-      _lastUseDate(now) {
+      _operationUsingCursor(operationUsingCursor),
+      _lastUseDate(now),
+      _createdDate(now),
+      _planSummary(Explain::getPlanSummary(_exec.get())) {
     invariant(_cursorManager);
     invariant(_exec);
+    invariant(_operationUsingCursor);
 
     cursorStatsOpen.increment();
 
@@ -104,7 +112,7 @@ ClientCursor::ClientCursor(ClientCursorParams params,
 
 ClientCursor::~ClientCursor() {
     // Cursors must be unpinned and deregistered from their cursor manager before being deleted.
-    invariant(!_isPinned);
+    invariant(!_operationUsingCursor);
     invariant(_disposed);
 
     cursorStatsOpen.decrement();
@@ -113,8 +121,8 @@ ClientCursor::~ClientCursor() {
     }
 }
 
-void ClientCursor::markAsKilled(const std::string& reason) {
-    _exec->markAsKilled(reason);
+void ClientCursor::markAsKilled(Status killStatus) {
+    _exec->markAsKilled(killStatus);
 }
 
 void ClientCursor::dispose(OperationContext* opCtx) {
@@ -126,21 +134,24 @@ void ClientCursor::dispose(OperationContext* opCtx) {
     _disposed = true;
 }
 
-void ClientCursor::updateSlaveLocation(OperationContext* opCtx) {
-    if (_slaveReadTill.isNull())
-        return;
-
-    verify(_nss.isOplog());
-
-    Client* c = opCtx->getClient();
-    verify(c);
-    OID rid = repl::ReplClientInfo::forClient(c).getRemoteID();
-    if (!rid.isSet())
-        return;
-
-    repl::getGlobalReplicationCoordinator()
-        ->setLastOptimeForSlave(rid, _slaveReadTill)
-        .transitional_ignore();
+GenericCursor ClientCursor::toGenericCursor() const {
+    GenericCursor gc;
+    gc.setCursorId(cursorid());
+    gc.setNs(nss());
+    gc.setNDocsReturned(nReturnedSoFar());
+    gc.setTailable(isTailable());
+    gc.setAwaitData(isAwaitData());
+    gc.setNoCursorTimeout(isNoTimeout());
+    gc.setOriginatingCommand(getOriginatingCommandObj());
+    gc.setLsid(getSessionId());
+    gc.setLastAccessDate(getLastUseDate());
+    gc.setCreatedDate(getCreatedDate());
+    gc.setNBatchesReturned(getNBatches());
+    gc.setPlanSummary(getPlanSummary());
+    if (auto opCtx = _operationUsingCursor) {
+        gc.setOperationUsingCursorId(opCtx->getOpID());
+    }
+    return gc;
 }
 
 //
@@ -150,7 +161,7 @@ void ClientCursor::updateSlaveLocation(OperationContext* opCtx) {
 ClientCursorPin::ClientCursorPin(OperationContext* opCtx, ClientCursor* cursor)
     : _opCtx(opCtx), _cursor(cursor) {
     invariant(_cursor);
-    invariant(_cursor->_isPinned);
+    invariant(_cursor->_operationUsingCursor);
     invariant(_cursor->_cursorManager);
     invariant(!_cursor->_disposed);
 
@@ -166,7 +177,7 @@ ClientCursorPin::ClientCursorPin(ClientCursorPin&& other)
     // The pinned cursor is being transferred to us from another pin. The 'other' pin must have a
     // pinned cursor.
     invariant(other._cursor);
-    invariant(other._cursor->_isPinned);
+    invariant(other._cursor->_operationUsingCursor);
 
     // Be sure to set the 'other' pin's cursor to null in order to transfer ownership to ourself.
     other._cursor = nullptr;
@@ -182,7 +193,7 @@ ClientCursorPin& ClientCursorPin::operator=(ClientCursorPin&& other) {
     // pinned cursor, and we must not have a cursor.
     invariant(!_cursor);
     invariant(other._cursor);
-    invariant(other._cursor->_isPinned);
+    invariant(other._cursor->_operationUsingCursor);
 
     // Copy the cursor pointer to ourselves, but also be sure to set the 'other' pin's cursor to
     // null so that it no longer has the cursor pinned.
@@ -207,11 +218,10 @@ void ClientCursorPin::release() {
     // Note it's not safe to dereference _cursor->_cursorManager unless we know we haven't been
     // killed. If we're not locked we assume we haven't been killed because we're working with the
     // global cursor manager which never kills cursors.
-    const bool isLocked =
-        _opCtx->lockState()->isCollectionLockedForMode(_cursor->_nss.ns(), MODE_IS);
-    dassert(isLocked || _cursor->_cursorManager->isGlobalManager());
+    dassert(_opCtx->lockState()->isCollectionLockedForMode(_cursor->_nss.ns(), MODE_IS) ||
+            _cursor->_cursorManager->isGlobalManager());
 
-    invariant(_cursor->_isPinned);
+    invariant(_cursor->_operationUsingCursor);
 
     if (_cursor->getExecutor()->isMarkedAsKilled()) {
         // The ClientCursor was killed while we had it.  Therefore, it is our responsibility to
@@ -219,7 +229,8 @@ void ClientCursorPin::release() {
         deleteUnderlying();
     } else {
         // Unpin the cursor under the collection cursor manager lock.
-        _cursor->_cursorManager->unpin(_opCtx, _cursor);
+        _cursor->_cursorManager->unpin(
+            _opCtx, std::unique_ptr<ClientCursor, ClientCursor::Deleter>(_cursor));
         cursorStatsOpenPinned.decrement();
     }
 
@@ -228,7 +239,7 @@ void ClientCursorPin::release() {
 
 void ClientCursorPin::deleteUnderlying() {
     invariant(_cursor);
-    invariant(_cursor->_isPinned);
+    invariant(_cursor->_operationUsingCursor);
     // Note the following subtleties of this method's implementation:
     // - We must unpin the cursor before destruction, since it is an error to delete a pinned
     //   cursor.
@@ -240,9 +251,8 @@ void ClientCursorPin::deleteUnderlying() {
     // Note it's not safe to dereference _cursor->_cursorManager unless we know we haven't been
     // killed. If we're not locked we assume we haven't been killed because we're working with the
     // global cursor manager which never kills cursors.
-    const bool isLocked =
-        _opCtx->lockState()->isCollectionLockedForMode(_cursor->_nss.ns(), MODE_IS);
-    dassert(isLocked || _cursor->_cursorManager->isGlobalManager());
+    dassert(_opCtx->lockState()->isCollectionLockedForMode(_cursor->_nss.ns(), MODE_IS) ||
+            _cursor->_cursorManager->isGlobalManager());
 
     if (!_cursor->getExecutor()->isMarkedAsKilled()) {
         _cursor->_cursorManager->deregisterCursor(_cursor);
@@ -250,7 +260,7 @@ void ClientCursorPin::deleteUnderlying() {
 
     // Make sure the cursor is disposed and unpinned before being destroyed.
     _cursor->dispose(_opCtx);
-    _cursor->_isPinned = false;
+    _cursor->_operationUsingCursor = nullptr;
     delete _cursor;
 
     cursorStatsOpenPinned.decrement();
@@ -276,7 +286,7 @@ public:
     }
 
     void run() {
-        Client::initThread("clientcursormon");
+        ThreadClient tc("clientcursormon", getGlobalServiceContext());
         while (!globalInShutdownDeprecated()) {
             {
                 const ServiceContext::UniqueOperationContext opCtx = cc().makeOperationContext();

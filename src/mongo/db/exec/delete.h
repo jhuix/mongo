@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,7 +30,7 @@
 
 #pragma once
 
-#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/requires_collection_stage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_id.h"
 
@@ -83,7 +85,7 @@ struct DeleteStageParams {
  * Callers of work() must be holding a write lock (and, for replicated deletes, callers must have
  * had the replication coordinator approve the write).
  */
-class DeleteStage final : public PlanStage {
+class DeleteStage final : public RequiresMutableCollectionStage {
     MONGO_DISALLOW_COPYING(DeleteStage);
 
 public:
@@ -95,8 +97,6 @@ public:
 
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;
-
-    void doRestoreState() final;
 
     StageType stageType() const final {
         return STAGE_DELETE;
@@ -115,6 +115,11 @@ public:
      */
     static long long getNumDeleted(const PlanExecutor& exec);
 
+protected:
+    void doSaveStateRequiresCollection() final {}
+
+    void doRestoreStateRequiresCollection() final;
+
 private:
     /**
      * Stores 'idToRetry' in '_idRetrying' so the delete can be retried during the next call to
@@ -126,11 +131,6 @@ private:
 
     // Not owned by us.
     WorkingSet* _ws;
-
-    // Collection to operate on.  Not owned by us.  Can be NULL (if NULL, isEOF() will always
-    // return true).  If non-NULL, the lifetime of the collection must supersede that of the
-    // stage.
-    Collection* _collection;
 
     // If not WorkingSet::INVALID_ID, we use this rather than asking our child what to do next.
     WorkingSetID _idRetrying;

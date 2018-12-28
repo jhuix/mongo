@@ -43,7 +43,11 @@ IDLCAction = SCons.Action.Action('$IDLCCOM', '$IDLCCOMSTR')
 def idl_scanner(node, env, path):
     # Use the import scanner mode of the IDL compiler to file imported files
     cmd = [sys.executable, "buildscripts/idl/idlc.py",  '--include','src', str(node), '--write-dependencies']
-    deps_str = subprocess.check_output(cmd)
+    try:
+        deps_str = subprocess.check_output(cmd)
+    except subprocess.CalledProcessError as e:
+        print("IDLC ERROR: %s" % (e.output) )
+        raise
 
     deps_list = deps_str.splitlines()
 
@@ -76,7 +80,7 @@ def generate(env):
     env['IDLC'] = sys.executable + " buildscripts/idl/idlc.py"
     env['IDLCFLAGS'] = ''
     base_dir = env.subst('$BUILD_ROOT/$VARIANT_DIR').replace("#", "")
-    env['IDLCCOM'] = '$IDLC --include src --base_dir %s --header ${TARGETS[1]} --output ${TARGETS[0]} $SOURCES ' % (base_dir)
+    env['IDLCCOM'] = '$IDLC --include src --base_dir %s --target_arch $TARGET_ARCH --header ${TARGETS[1]} --output ${TARGETS[0]} $SOURCES ' % (base_dir)
     env['IDLCSUFFIX'] = '.idl'
 
 

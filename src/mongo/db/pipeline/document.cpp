@@ -1,29 +1,31 @@
+
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -45,8 +47,11 @@ using std::vector;
 
 const DocumentStorage DocumentStorage::kEmptyDoc;
 
-const std::vector<StringData> Document::allMetadataFieldNames = {
-    Document::metaFieldTextScore, Document::metaFieldRandVal, Document::metaFieldSortKey};
+const std::vector<StringData> Document::allMetadataFieldNames = {Document::metaFieldTextScore,
+                                                                 Document::metaFieldRandVal,
+                                                                 Document::metaFieldSortKey,
+                                                                 Document::metaFieldGeoNearDistance,
+                                                                 Document::metaFieldGeoNearPoint};
 
 Position DocumentStorage::findField(StringData requested) const {
     int reqSize = requested.size();  // get size calculation out of the way if needed
@@ -205,6 +210,8 @@ intrusive_ptr<DocumentStorage> DocumentStorage::clone() const {
     out->_textScore = _textScore;
     out->_randVal = _randVal;
     out->_sortKey = _sortKey.getOwned();
+    out->_geoNearDistance = _geoNearDistance;
+    out->_geoNearPoint = _geoNearPoint.getOwned();
 
     // Tell values that they have been memcpyed (updates ref counts)
     for (DocumentStorageIterator it = out->iteratorAll(); !it.atEnd(); it.advance()) {
@@ -272,16 +279,22 @@ BSONObj Document::toBson() const {
 constexpr StringData Document::metaFieldTextScore;
 constexpr StringData Document::metaFieldRandVal;
 constexpr StringData Document::metaFieldSortKey;
+constexpr StringData Document::metaFieldGeoNearDistance;
+constexpr StringData Document::metaFieldGeoNearPoint;
 
-BSONObj Document::toBsonWithMetaData(bool includeSortKey) const {
+BSONObj Document::toBsonWithMetaData() const {
     BSONObjBuilder bb;
     toBson(&bb);
     if (hasTextScore())
         bb.append(metaFieldTextScore, getTextScore());
     if (hasRandMetaField())
         bb.append(metaFieldRandVal, getRandMetaField());
-    if (includeSortKey && hasSortKeyMetaField())
+    if (hasSortKeyMetaField())
         bb.append(metaFieldSortKey, getSortKeyMetaField());
+    if (hasGeoNearDistance())
+        bb.append(metaFieldGeoNearDistance, getGeoNearDistance());
+    if (hasGeoNearPoint())
+        getGeoNearPoint().addToBsonObj(&bb, metaFieldGeoNearPoint);
     return bb.obj();
 }
 
@@ -301,6 +314,20 @@ Document Document::fromBsonWithMetaData(const BSONObj& bson) {
                 continue;
             } else if (fieldName == metaFieldSortKey) {
                 md.setSortKeyMetaField(elem.Obj());
+                continue;
+            } else if (fieldName == metaFieldGeoNearDistance) {
+                md.setGeoNearDistance(elem.Double());
+                continue;
+            } else if (fieldName == metaFieldGeoNearPoint) {
+                Value val;
+                if (elem.type() == BSONType::Array) {
+                    val = Value(BSONArray(elem.embeddedObject()));
+                } else {
+                    invariant(elem.type() == BSONType::Object);
+                    val = Value(elem.embeddedObject());
+                }
+
+                md.setGeoNearPoint(val);
                 continue;
             }
         }

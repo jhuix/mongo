@@ -1,35 +1,38 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/matcher/matcher_type_set.h"
 
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/schema/json_schema_parser.h"
 
 namespace mongo {
@@ -53,6 +56,15 @@ Status addAliasToTypeSet(StringData typeAlias,
 
     auto it = aliasMap.find(typeAlias.toString());
     if (it == aliasMap.end()) {
+        // The string "missing" can be returned from the $type agg expression, but is not valid for
+        // use in the $type match expression predicate. Return a special error message for this
+        // case.
+        if (typeAlias == StringData{typeName(BSONType::EOO)}) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "'missing' is not a legal type name. To query for "
+                                           "non-existence of a field, use {$exists:false}.");
+        }
+
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Unknown type name alias: " << typeAlias);
     }
@@ -78,18 +90,24 @@ Status parseSingleType(BSONElement elt,
         return addAliasToTypeSet(elt.valueStringData(), aliasMap, typeSet);
     }
 
-    invariant(elt.isNumber());
-    int typeInt = elt.numberInt();
-    if (elt.type() != BSONType::NumberInt && typeInt != elt.number()) {
-        typeInt = -1;
-    }
-
-    if (!isValidBSONType(typeInt)) {
+    auto valueAsInt = MatchExpressionParser::parseIntegerElementToInt(elt);
+    if (!valueAsInt.isOK()) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "Invalid numerical type code: " << typeInt);
+                      str::stream() << "Invalid numerical type code: " << elt.number());
     }
 
-    typeSet->bsonTypes.insert(static_cast<BSONType>(typeInt));
+    if (valueAsInt.getValue() == 0) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Invalid numerical type code: " << elt.number()
+                                    << ". Instead use {$exists:false}.");
+    }
+
+    if (!isValidBSONType(valueAsInt.getValue())) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Invalid numerical type code: " << elt.number());
+    }
+
+    typeSet->bsonTypes.insert(static_cast<BSONType>(valueAsInt.getValue()));
     return Status::OK();
 }
 
@@ -97,35 +115,12 @@ Status parseSingleType(BSONElement elt,
 
 constexpr StringData MatcherTypeSet::kMatchesAllNumbersAlias;
 
-const StringMap<BSONType> MatcherTypeSet::kTypeAliasMap = {
-    {typeName(BSONType::NumberDouble), BSONType::NumberDouble},
-    {typeName(BSONType::String), BSONType::String},
-    {typeName(BSONType::Object), BSONType::Object},
-    {typeName(BSONType::Array), BSONType::Array},
-    {typeName(BSONType::BinData), BSONType::BinData},
-    {typeName(BSONType::Undefined), BSONType::Undefined},
-    {typeName(BSONType::jstOID), BSONType::jstOID},
-    {typeName(BSONType::Bool), BSONType::Bool},
-    {typeName(BSONType::Date), BSONType::Date},
-    {typeName(BSONType::jstNULL), BSONType::jstNULL},
-    {typeName(BSONType::RegEx), BSONType::RegEx},
-    {typeName(BSONType::DBRef), BSONType::DBRef},
-    {typeName(BSONType::Code), BSONType::Code},
-    {typeName(BSONType::Symbol), BSONType::Symbol},
-    {typeName(BSONType::CodeWScope), BSONType::CodeWScope},
-    {typeName(BSONType::NumberInt), BSONType::NumberInt},
-    {typeName(BSONType::bsonTimestamp), BSONType::bsonTimestamp},
-    {typeName(BSONType::NumberLong), BSONType::NumberLong},
-    {typeName(BSONType::NumberDecimal), BSONType::NumberDecimal},
-    {typeName(BSONType::MaxKey), BSONType::MaxKey},
-    {typeName(BSONType::MinKey), BSONType::MinKey}};
-
 const StringMap<BSONType> MatcherTypeSet::kJsonSchemaTypeAliasMap = {
-    {JSONSchemaParser::kSchemaTypeArray, BSONType::Array},
-    {JSONSchemaParser::kSchemaTypeBoolean, BSONType::Bool},
-    {JSONSchemaParser::kSchemaTypeNull, BSONType::jstNULL},
-    {JSONSchemaParser::kSchemaTypeObject, BSONType::Object},
-    {JSONSchemaParser::kSchemaTypeString, BSONType::String},
+    {std::string(JSONSchemaParser::kSchemaTypeArray), BSONType::Array},
+    {std::string(JSONSchemaParser::kSchemaTypeBoolean), BSONType::Bool},
+    {std::string(JSONSchemaParser::kSchemaTypeNull), BSONType::jstNULL},
+    {std::string(JSONSchemaParser::kSchemaTypeObject), BSONType::Object},
+    {std::string(JSONSchemaParser::kSchemaTypeString), BSONType::String},
 };
 
 StatusWith<MatcherTypeSet> MatcherTypeSet::fromStringAliases(std::set<StringData> typeAliases,

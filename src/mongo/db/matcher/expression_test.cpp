@@ -1,25 +1,27 @@
 // expression_test.cpp
 
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -42,8 +44,7 @@ namespace mongo {
 
 TEST(LeafMatchExpressionTest, Equal1) {
     BSONObj temp = BSON("x" << 5);
-    EqualityMatchExpression e;
-    e.init("x", temp["x"]).transitional_ignore();
+    EqualityMatchExpression e("x", temp["x"]);
 
     ASSERT_TRUE(e.matchesBSON(fromjson("{ x : 5 }")));
     ASSERT_TRUE(e.matchesBSON(fromjson("{ x : [5] }")));
@@ -61,8 +62,7 @@ TEST(LeafMatchExpressionTest, Comp1) {
     BSONObj temp = BSON("x" << 5);
 
     {
-        LTEMatchExpression e;
-        e.init("x", temp["x"]).transitional_ignore();
+        LTEMatchExpression e("x", temp["x"]);
         ASSERT_TRUE(e.matchesBSON(fromjson("{ x : 5 }")));
         ASSERT_TRUE(e.matchesBSON(fromjson("{ x : 4 }")));
         ASSERT_FALSE(e.matchesBSON(fromjson("{ x : 6 }")));
@@ -70,8 +70,7 @@ TEST(LeafMatchExpressionTest, Comp1) {
     }
 
     {
-        LTMatchExpression e;
-        e.init("x", temp["x"]).transitional_ignore();
+        LTMatchExpression e("x", temp["x"]);
         ASSERT_FALSE(e.matchesBSON(fromjson("{ x : 5 }")));
         ASSERT_TRUE(e.matchesBSON(fromjson("{ x : 4 }")));
         ASSERT_FALSE(e.matchesBSON(fromjson("{ x : 6 }")));
@@ -79,8 +78,7 @@ TEST(LeafMatchExpressionTest, Comp1) {
     }
 
     {
-        GTEMatchExpression e;
-        e.init("x", temp["x"]).transitional_ignore();
+        GTEMatchExpression e("x", temp["x"]);
         ASSERT_TRUE(e.matchesBSON(fromjson("{ x : 5 }")));
         ASSERT_FALSE(e.matchesBSON(fromjson("{ x : 4 }")));
         ASSERT_TRUE(e.matchesBSON(fromjson("{ x : 6 }")));
@@ -88,8 +86,7 @@ TEST(LeafMatchExpressionTest, Comp1) {
     }
 
     {
-        GTMatchExpression e;
-        e.init("x", temp["x"]).transitional_ignore();
+        GTMatchExpression e("x", temp["x"]);
         ASSERT_FALSE(e.matchesBSON(fromjson("{ x : 5 }")));
         ASSERT_FALSE(e.matchesBSON(fromjson("{ x : 4 }")));
         ASSERT_TRUE(e.matchesBSON(fromjson("{ x : 6 }")));
@@ -99,8 +96,7 @@ TEST(LeafMatchExpressionTest, Comp1) {
 
 TEST(MatchesBSONElement, ScalarEquality) {
     auto filterObj = fromjson("{i: 5}");
-    EqualityMatchExpression filter;
-    ASSERT_OK(filter.init("i", filterObj["i"]));
+    EqualityMatchExpression filter("i", filterObj["i"]);
 
     auto aFive = fromjson("{a: 5}");
     auto iFive = fromjson("{i: 5}");
@@ -140,8 +136,7 @@ TEST(MatchesBSONElement, ScalarEquality) {
 
 TEST(MatchesBSONElement, DottedPathEquality) {
     auto filterObj = fromjson("{'i.a': 5}");
-    EqualityMatchExpression filter;
-    ASSERT_OK(filter.init("i.a", filterObj["i.a"]));
+    EqualityMatchExpression filter("i.a", filterObj["i.a"]);
 
     auto aFive = fromjson("{a: 5}");
     auto iFive = fromjson("{i: 5}");
@@ -191,8 +186,7 @@ TEST(MatchesBSONElement, DottedPathEquality) {
 
 TEST(MatchesBSONElement, ArrayIndexEquality) {
     auto filterObj = fromjson("{'i.1': 5}");
-    EqualityMatchExpression filter;
-    ASSERT_OK(filter.init("i.1", filterObj["i.1"]));
+    EqualityMatchExpression filter("i.1", filterObj["i.1"]);
 
     auto aFive = fromjson("{a: 5}");
     auto iFive = fromjson("{i: 5}");
@@ -237,8 +231,7 @@ TEST(MatchesBSONElement, ArrayIndexEquality) {
 
 TEST(MatchesBSONElement, ObjectEquality) {
     auto filterObj = fromjson("{i: {a: 5}}");
-    EqualityMatchExpression filter;
-    ASSERT_OK(filter.init("i", filterObj["i"]));
+    EqualityMatchExpression filter("i", filterObj["i"]);
 
     auto aFive = fromjson("{a: 5}");
     auto iFive = fromjson("{i: 5}");
@@ -288,8 +281,7 @@ TEST(MatchesBSONElement, ObjectEquality) {
 
 TEST(MatchesBSONElement, ArrayEquality) {
     auto filterObj = fromjson("{i: [5]}");
-    EqualityMatchExpression filter;
-    ASSERT_OK(filter.init("i", filterObj["i"]));
+    EqualityMatchExpression filter("i", filterObj["i"]);
 
     auto aFive = fromjson("{a: 5}");
     auto iFive = fromjson("{i: 5}");
@@ -320,10 +312,10 @@ TEST(MatchesBSONElement, ArrayEquality) {
 TEST(MatchesBSONElement, LogicalExpression) {
     auto clauseObj1 = fromjson("{i: 5}");
     auto clauseObj2 = fromjson("{'i.a': 6}");
-    std::unique_ptr<ComparisonMatchExpression> clause1(new EqualityMatchExpression());
-    ASSERT_OK(clause1->init("i", clauseObj1["i"]));
-    std::unique_ptr<ComparisonMatchExpression> clause2(new EqualityMatchExpression());
-    ASSERT_OK(clause2->init("i.a", clauseObj2["i.a"]));
+    std::unique_ptr<ComparisonMatchExpression> clause1(
+        new EqualityMatchExpression("i", clauseObj1["i"]));
+    std::unique_ptr<ComparisonMatchExpression> clause2(
+        new EqualityMatchExpression("i.a", clauseObj2["i.a"]));
 
     OrMatchExpression filter;
     filter.add(clause1.release());

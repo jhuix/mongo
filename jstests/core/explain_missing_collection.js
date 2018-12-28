@@ -1,8 +1,7 @@
-// Cannot implicitly shard accessed collections because of unsupported group operator on sharded
-// collection.
-// @tags: [assumes_unsharded_collection]
-
-// Test explain of various operations against a non-existent collection
+/**
+ * Test explaining various operations against a non-existent collection.
+ * @tags: [assumes_no_implicit_collection_creation_after_drop]
+ */
 (function() {
     var missingColl = db.explain_null_collection;
 
@@ -18,13 +17,6 @@
     // .count()
     missingColl.drop();
     explain = missingColl.explain("executionStats").count();
-    assert.commandWorked(explain);
-    assert("executionStats" in explain);
-
-    // .group()
-    missingColl.drop();
-    explainColl = missingColl.explain("executionStats");
-    explain = explainColl.group({key: "a", initial: {}, reduce: function() {}});
     assert.commandWorked(explain);
     assert("executionStats" in explain);
 

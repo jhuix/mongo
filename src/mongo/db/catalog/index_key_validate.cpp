@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
@@ -39,10 +41,13 @@
 #include "mongo/base/status_with.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/mongoutils/str.h"
@@ -50,6 +55,8 @@
 
 namespace mongo {
 namespace index_key_validate {
+
+std::function<void(std::set<StringData>&)> filterAllowedIndexFieldNames;
 
 using std::string;
 
@@ -59,9 +66,9 @@ namespace {
 // When the skipIndexCreateFieldNameValidation failpoint is enabled, validation for index field
 // names will be disabled. This will allow for creation of indexes with invalid field names in their
 // specification.
-MONGO_FP_DECLARE(skipIndexCreateFieldNameValidation);
+MONGO_FAIL_POINT_DEFINE(skipIndexCreateFieldNameValidation);
 
-static const std::set<StringData> allowedFieldNames = {
+static std::set<StringData> allowedFieldNames = {
     IndexDescriptor::k2dIndexMaxFieldName,
     IndexDescriptor::k2dIndexBitsFieldName,
     IndexDescriptor::k2dIndexMaxFieldName,
@@ -81,6 +88,7 @@ static const std::set<StringData> allowedFieldNames = {
     IndexDescriptor::kLanguageOverrideFieldName,
     IndexDescriptor::kNamespaceFieldName,
     IndexDescriptor::kPartialFilterExprFieldName,
+    IndexDescriptor::kPathProjectionFieldName,
     IndexDescriptor::kSparseFieldName,
     IndexDescriptor::kStorageEngineFieldName,
     IndexDescriptor::kTextVersionFieldName,
@@ -120,7 +128,6 @@ Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion inde
         BSONElement keyElement = it.next();
 
         switch (indexVersion) {
-            case IndexVersion::kV0:
             case IndexVersion::kV1: {
                 if (keyElement.type() == BSONType::Object || keyElement.type() == BSONType::Array) {
                     return {code,
@@ -130,6 +137,12 @@ Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion inde
                                           << static_cast<int>(indexVersion)};
                 }
 
+                if (pluginName == IndexNames::WILDCARD) {
+                    return {code,
+                            str::stream() << "'" << pluginName
+                                          << "' index plugin is not allowed with index version v:"
+                                          << static_cast<int>(indexVersion)};
+                }
                 break;
             }
             case IndexVersion::kV2: {
@@ -139,6 +152,9 @@ Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion inde
                         return {code, "Values in the index key pattern cannot be NaN."};
                     } else if (value == 0.0) {
                         return {code, "Values in the index key pattern cannot be 0."};
+                    } else if (value < 0.0 && pluginName == IndexNames::WILDCARD) {
+                        return {code,
+                                "A numeric value in a $** index key pattern must be positive."};
                     }
                 } else if (keyElement.type() != BSONType::String) {
                     return {code,
@@ -156,11 +172,21 @@ Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion inde
 
         if (keyElement.type() == String && pluginName != keyElement.str()) {
             return Status(code, "Can't use more than one index plugin for a single index.");
+        } else if (keyElement.type() == String && keyElement.str() == IndexNames::WILDCARD) {
+            return Status(code,
+                          str::stream() << "The key pattern value for an '" << IndexNames::WILDCARD
+                                        << "' index must be a non-zero number, not a string.");
+        }
+
+        // Check if the wildcard index is compounded. If it is the key is invalid because
+        // compounded wildcard indexes are disallowed.
+        if (pluginName == IndexNames::WILDCARD && key.nFields() != 1) {
+            return Status(code, "wildcard indexes do not allow compounding");
         }
 
         // Ensure that the fields on which we are building the index are valid: a field must not
-        // begin with a '$' unless it is part of a DBRef or text index, and a field path cannot
-        // contain an empty field. If a field cannot be created or updated, it should not be
+        // begin with a '$' unless it is part of a wildcard, DBRef or text index, and a field path
+        // cannot contain an empty field. If a field cannot be created or updated, it should not be
         // indexable.
 
         FieldRef keyField(keyElement.fieldName());
@@ -170,9 +196,9 @@ Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion inde
             return Status(code, "Index keys cannot be an empty field.");
         }
 
-        // "$**" is acceptable for a text index.
+        // "$**" is acceptable for a text index or wildcard index.
         if (mongoutils::str::equals(keyElement.fieldName(), "$**") &&
-            keyElement.valuestrsafe() == IndexNames::TEXT)
+            ((keyElement.isNumber()) || (keyElement.valuestrsafe() == IndexNames::TEXT)))
             continue;
 
         if (mongoutils::str::equals(keyElement.fieldName(), "_fts") &&
@@ -197,7 +223,10 @@ Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion inde
             const bool mightBePartOfDbRef =
                 (i != 0) && (part == "$db" || part == "$id" || part == "$ref");
 
-            if (!mightBePartOfDbRef) {
+            const bool isPartOfWildcard =
+                (i == numParts - 1) && (part == "$**") && (pluginName == IndexNames::WILDCARD);
+
+            if (!mightBePartOfDbRef && !isPartOfWildcard) {
                 return Status(code,
                               "Index key contains an illegal field name: "
                               "field name starts with '$'.");
@@ -209,6 +238,7 @@ Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion inde
 }
 
 StatusWith<BSONObj> validateIndexSpec(
+    OperationContext* opCtx,
     const BSONObj& indexSpec,
     const NamespaceString& expectedNamespace,
     const ServerGlobalParams::FeatureCompatibility& featureCompatibility) {
@@ -255,6 +285,15 @@ StatusWith<BSONObj> validateIndexSpec(
                 return keyPatternValidateStatus;
             }
 
+            if ((featureCompatibility.getVersion() <
+                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) &&
+                (IndexNames::findPluginName(indexSpec.getObjectField(
+                     IndexDescriptor::kKeyPatternFieldName)) == IndexNames::WILDCARD)) {
+                return {ErrorCodes::CannotCreateIndex,
+                        mongoutils::str::stream() << "Unknown index plugin '"
+                                                  << IndexNames::WILDCARD
+                                                  << "'"};
+            }
             hasKeyPatternField = true;
         } else if (IndexDescriptor::kIndexNameFieldName == indexSpecElemFieldName) {
             if (indexSpecElem.type() != BSONType::String) {
@@ -333,6 +372,70 @@ StatusWith<BSONObj> validateIndexSpec(
             }
 
             hasCollationField = true;
+        } else if (IndexDescriptor::kPartialFilterExprFieldName == indexSpecElemFieldName) {
+            if (indexSpecElem.type() != BSONType::Object) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream() << "The field '"
+                                      << IndexDescriptor::kPartialFilterExprFieldName
+                                      << "' must be an object, but got "
+                                      << typeName(indexSpecElem.type())};
+            }
+
+            // Just use the simple collator, even though the index may have a separate collation
+            // specified or may inherit the default collation from the collection. It's legal to
+            // parse with the wrong collation, since the collation can be set on a MatchExpression
+            // after the fact. Here, we don't bother checking the collation after the fact, since
+            // this invocation of the parser is just for validity checking.
+            auto simpleCollator = nullptr;
+            boost::intrusive_ptr<ExpressionContext> expCtx(
+                new ExpressionContext(opCtx, simpleCollator));
+
+            // Special match expression features (e.g. $jsonSchema, $expr, ...) are not allowed in
+            // a partialFilterExpression on index creation.
+            auto statusWithMatcher =
+                MatchExpressionParser::parse(indexSpecElem.Obj(),
+                                             std::move(expCtx),
+                                             ExtensionsCallbackNoop(),
+                                             MatchExpressionParser::kBanAllSpecialFeatures);
+            if (!statusWithMatcher.isOK()) {
+                return statusWithMatcher.getStatus();
+            }
+        } else if (IndexDescriptor::kPathProjectionFieldName == indexSpecElemFieldName) {
+            const auto key = indexSpec.getObjectField(IndexDescriptor::kKeyPatternFieldName);
+            if (IndexNames::findPluginName(key) != IndexNames::WILDCARD) {
+                return {ErrorCodes::BadValue,
+                        str::stream() << "The field '" << IndexDescriptor::kPathProjectionFieldName
+                                      << "' is only allowed in an '"
+                                      << IndexNames::WILDCARD
+                                      << "' index"};
+            }
+            if (indexSpecElem.type() != BSONType::Object) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream() << "The field '" << IndexDescriptor::kPathProjectionFieldName
+                                      << "' must be a non-empty object, but got "
+                                      << typeName(indexSpecElem.type())};
+            }
+            if (!key.hasField("$**")) {
+                return {ErrorCodes::FailedToParse,
+                        str::stream() << "The field '" << IndexDescriptor::kPathProjectionFieldName
+                                      << "' is only allowed when '"
+                                      << IndexDescriptor::kKeyPatternFieldName
+                                      << "' is {\"$**\": ±1}"};
+            }
+
+            if (indexSpecElem.embeddedObject().isEmpty()) {
+                return {ErrorCodes::FailedToParse,
+                        str::stream() << "The '" << IndexDescriptor::kPathProjectionFieldName
+                                      << "' field can't be an empty object"};
+            }
+            try {
+                // We use WildcardKeyGenerator::createProjectionExec to parse and validate the path
+                // projection spec.
+                WildcardKeyGenerator::createProjectionExec(key, indexSpecElem.embeddedObject());
+            } catch (const DBException& ex) {
+                return ex.toStatus(str::stream() << "Failed to parse: "
+                                                 << IndexDescriptor::kPathProjectionFieldName);
+            }
         } else {
             // We can assume field name is valid at this point. Validation of fieldname is handled
             // prior to this in validateIndexSpecFieldNames().
@@ -341,8 +444,7 @@ StatusWith<BSONObj> validateIndexSpec(
     }
 
     if (!resolvedIndexVersion) {
-        resolvedIndexVersion =
-            IndexDescriptor::getDefaultIndexVersion(featureCompatibility.getVersion());
+        resolvedIndexVersion = IndexDescriptor::getDefaultIndexVersion();
     }
 
     if (!hasKeyPatternField) {
@@ -495,6 +597,13 @@ StatusWith<BSONObj> validateIndexSpecCollation(OperationContext* opCtx,
     }
     return indexSpec;
 }
+
+GlobalInitializerRegisterer filterAllowedIndexFieldNamesInitializer(
+    "FilterAllowedIndexFieldNames", [](InitializerContext* service) {
+        if (filterAllowedIndexFieldNames)
+            filterAllowedIndexFieldNames(allowedFieldNames);
+        return Status::OK();
+    });
 
 }  // namespace index_key_validate
 }  // namespace mongo

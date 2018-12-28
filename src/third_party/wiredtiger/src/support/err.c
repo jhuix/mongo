@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -169,12 +169,12 @@ __wt_event_handler_set(WT_SESSION_IMPL *session, WT_EVENT_HANDLER *handler)
 } while (0)
 
 /*
- * __wt_eventv --
+ * __eventv --
  * 	Report a message to an event handler.
  */
-int
-__wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
-    const char *file_name, int line_number, const char *fmt, va_list ap)
+static int
+__eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
+    const char *func, int line, const char *fmt, va_list ap)
     WT_GCC_FUNC_ATTRIBUTE((cold))
 {
 	struct timespec ts;
@@ -193,7 +193,7 @@ __wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
 	 * SECURITY:
 	 * Buffer placed at the end of the stack in case snprintf overflows.
 	 */
-	char s[2048];
+	char s[4 * 1024];
 	p = s;
 	remain = sizeof(s);
 
@@ -217,7 +217,7 @@ __wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
 	 * followed by a colon.
 	 */
 	__wt_epoch(session, &ts);
-	WT_ERR(__wt_thread_id(tid, sizeof(tid)));
+	WT_ERR(__wt_thread_str(tid, sizeof(tid)));
 	WT_ERROR_APPEND(p, remain,
 	    "[%" PRIuMAX ":%" PRIuMAX "][%s]",
 	    (uintmax_t)ts.tv_sec, (uintmax_t)ts.tv_nsec / WT_THOUSAND, tid);
@@ -231,8 +231,8 @@ __wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
 		WT_ERROR_APPEND(p, remain, ", %s", prefix);
 	WT_ERROR_APPEND(p, remain, ": ");
 
-	if (file_name != NULL)
-		WT_ERROR_APPEND(p, remain, "%s, %d: ", file_name, line_number);
+	if (func != NULL)
+		WT_ERROR_APPEND(p, remain, "%s, %d: ", func, line);
 
 	WT_ERROR_APPEND_AP(p, remain, fmt, ap);
 
@@ -279,6 +279,17 @@ __wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
 			__handler_failure(session, ret, "error", true);
 	}
 
+	/*
+	 * The buffer is fixed sized, complain if we overflow. (The test is for
+	 * no more bytes remaining in the buffer, so technically we might have
+	 * filled it exactly.) Be cautious changing this code, it's a recursive
+	 * call.
+	 */
+	if (ret == 0 && remain == 0)
+		__wt_err(session, ENOMEM,
+		    "error or message truncated: internal WiredTiger buffer "
+		    "too small");
+
 	if (ret != 0) {
 err:		if (fprintf(stderr,
 		    "WiredTiger Error%s%s: ",
@@ -298,13 +309,14 @@ err:		if (fprintf(stderr,
 }
 
 /*
- * __wt_err --
+ * __wt_err_func --
  * 	Report an error.
  */
 void
-__wt_err(WT_SESSION_IMPL *session, int error, const char *fmt, ...)
+__wt_err_func(WT_SESSION_IMPL *session,
+    int error, const char *func, int line, const char *fmt, ...)
     WT_GCC_FUNC_ATTRIBUTE((cold))
-    WT_GCC_FUNC_ATTRIBUTE((format (printf, 3, 4)))
+    WT_GCC_FUNC_ATTRIBUTE((format (printf, 5, 6)))
     WT_GCC_FUNC_ATTRIBUTE((visibility("default")))
 {
 	va_list ap;
@@ -314,18 +326,20 @@ __wt_err(WT_SESSION_IMPL *session, int error, const char *fmt, ...)
 	 * an error value to return.
 	 */
 	va_start(ap, fmt);
-	WT_IGNORE_RET(__wt_eventv(session, false, error, NULL, 0, fmt, ap));
+	WT_IGNORE_RET(__eventv(session, false, error, func, line, fmt, ap));
 	va_end(ap);
 }
 
 /*
- * __wt_errx --
+ * __wt_errx_func --
  * 	Report an error with no error code.
  */
 void
-__wt_errx(WT_SESSION_IMPL *session, const char *fmt, ...)
+__wt_errx_func(WT_SESSION_IMPL *session,
+    const char *func, int line, const char *fmt, ...)
     WT_GCC_FUNC_ATTRIBUTE((cold))
-    WT_GCC_FUNC_ATTRIBUTE((format (printf, 2, 3)))
+    WT_GCC_FUNC_ATTRIBUTE((format (printf, 4, 5)))
+    WT_GCC_FUNC_ATTRIBUTE((visibility("default")))
 {
 	va_list ap;
 
@@ -334,8 +348,21 @@ __wt_errx(WT_SESSION_IMPL *session, const char *fmt, ...)
 	 * an error value to return.
 	 */
 	va_start(ap, fmt);
-	WT_IGNORE_RET(__wt_eventv(session, false, 0, NULL, 0, fmt, ap));
+	WT_IGNORE_RET(__eventv(session, false, 0, func, line, fmt, ap));
 	va_end(ap);
+}
+
+/*
+ * __wt_set_return_func --
+ * 	Conditionally log the source of an error code and return the error.
+ */
+int
+__wt_set_return_func(
+    WT_SESSION_IMPL *session, const char* func, int line, int err)
+{
+	__wt_verbose(session,
+	    WT_VERB_ERROR_RETURNS, "%s: %d Error: %d", func, line, err);
+	return (err);
 }
 
 /*
@@ -355,7 +382,7 @@ __wt_ext_err_printf(
 		session = ((WT_CONNECTION_IMPL *)wt_api->conn)->default_session;
 
 	va_start(ap, fmt);
-	ret = __wt_eventv(session, false, 0, NULL, 0, fmt, ap);
+	ret = __eventv(session, false, 0, NULL, 0, fmt, ap);
 	va_end(ap);
 	return (ret);
 }
@@ -372,32 +399,8 @@ __wt_verbose_worker(WT_SESSION_IMPL *session, const char *fmt, ...)
 	va_list ap;
 
 	va_start(ap, fmt);
-	WT_IGNORE_RET(__wt_eventv(session, true, 0, NULL, 0, fmt, ap));
+	WT_IGNORE_RET(__eventv(session, true, 0, NULL, 0, fmt, ap));
 	va_end(ap);
-}
-
-/*
- * info_msg --
- * 	Informational message.
- */
-static int
-info_msg(WT_SESSION_IMPL *session, const char *fmt, va_list ap)
-{
-	WT_EVENT_HANDLER *handler;
-	WT_SESSION *wt_session;
-
-	/*
-	 * !!!
-	 * SECURITY:
-	 * Buffer placed at the end of the stack in case snprintf overflows.
-	 */
-	char s[2048];
-
-	WT_RET(__wt_vsnprintf(s, sizeof(s), fmt, ap));
-
-	wt_session = (WT_SESSION *)session;
-	handler = session->event_handler;
-	return (handler->handle_message(handler, wt_session, s));
 }
 
 /*
@@ -409,12 +412,20 @@ __wt_msg(WT_SESSION_IMPL *session, const char *fmt, ...)
     WT_GCC_FUNC_ATTRIBUTE((cold))
     WT_GCC_FUNC_ATTRIBUTE((format (printf, 2, 3)))
 {
+	WT_DECL_ITEM(buf);
 	WT_DECL_RET;
-	va_list ap;
+	WT_EVENT_HANDLER *handler;
+	WT_SESSION *wt_session;
 
-	va_start(ap, fmt);
-	ret = info_msg(session, fmt, ap);
-	va_end(ap);
+	WT_RET(__wt_scr_alloc(session, 0, &buf));
+
+	WT_VA_ARGS_BUF_FORMAT(session, buf, fmt, false);
+
+	wt_session = (WT_SESSION *)session;
+	handler = session->event_handler;
+	ret = handler->handle_message(handler, wt_session, buf->data);
+
+	__wt_scr_free(session, &buf);
 
 	return (ret);
 }
@@ -428,16 +439,24 @@ __wt_ext_msg_printf(
     WT_EXTENSION_API *wt_api, WT_SESSION *wt_session, const char *fmt, ...)
     WT_GCC_FUNC_ATTRIBUTE((format (printf, 3, 4)))
 {
+	WT_DECL_ITEM(buf);
 	WT_DECL_RET;
+	WT_EVENT_HANDLER *handler;
 	WT_SESSION_IMPL *session;
-	va_list ap;
 
 	if ((session = (WT_SESSION_IMPL *)wt_session) == NULL)
 		session = ((WT_CONNECTION_IMPL *)wt_api->conn)->default_session;
 
-	va_start(ap, fmt);
-	ret = info_msg(session, fmt, ap);
-	va_end(ap);
+	WT_RET(__wt_scr_alloc(session, 0, &buf));
+
+	WT_VA_ARGS_BUF_FORMAT(session, buf, fmt, false);
+
+	wt_session = (WT_SESSION *)session;
+	handler = session->event_handler;
+	ret = handler->handle_message(handler, wt_session, buf->data);
+
+	__wt_scr_free(session, &buf);
+
 	return (ret);
 }
 
@@ -473,34 +492,6 @@ __wt_progress(WT_SESSION_IMPL *session, const char *s, uint64_t v)
 		    wt_session, s == NULL ? session->name : s, v)) != 0)
 			__handler_failure(session, ret, "progress", false);
 	return (0);
-}
-
-/*
- * __wt_assert --
- *	Assert and other unexpected failures, includes file/line information
- * for debugging.
- */
-void
-__wt_assert(WT_SESSION_IMPL *session,
-    int error, const char *file_name, int line_number, const char *fmt, ...)
-    WT_GCC_FUNC_ATTRIBUTE((cold))
-    WT_GCC_FUNC_ATTRIBUTE((format (printf, 5, 6)))
-#ifdef HAVE_DIAGNOSTIC
-    WT_GCC_FUNC_ATTRIBUTE((noreturn))
-#endif
-    WT_GCC_FUNC_ATTRIBUTE((visibility("default")))
-{
-	va_list ap;
-
-	va_start(ap, fmt);
-	WT_IGNORE_RET(__wt_eventv(
-	    session, false, error, file_name, line_number, fmt, ap));
-	va_end(ap);
-
-#ifdef HAVE_DIAGNOSTIC
-	__wt_abort(session);			/* Drop core if testing. */
-	/* NOTREACHED */
-#endif
 }
 
 /*
@@ -554,16 +545,13 @@ __wt_panic(WT_SESSION_IMPL *session)
  */
 int
 __wt_illegal_value_func(
-    WT_SESSION_IMPL *session, const char *tag, const char *file, int line)
+    WT_SESSION_IMPL *session, uintmax_t v, const char *func, int line)
     WT_GCC_FUNC_ATTRIBUTE((cold))
     WT_GCC_FUNC_ATTRIBUTE((visibility("default")))
 {
-	__wt_errx(session, "%s%s%s: (%s, %d)",
-	    tag == NULL ? "" : tag,
-	    tag == NULL ? "" : ": ",
-	    "encountered an illegal file format or internal value",
-	    file, line);
-
+	__wt_err_func(session, EINVAL,
+	    func, line, "%s: 0x%" PRIxMAX,
+	    "encountered an illegal file format or internal value", v);
 	return (__wt_panic(session));
 }
 

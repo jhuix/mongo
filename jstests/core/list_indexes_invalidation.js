@@ -1,8 +1,7 @@
 // Cannot implicitly shard accessed collections because renameCollection command not supported
 // on sharded collections.
-// @tags: [assumes_unsharded_collection]
+// @tags: [assumes_unsharded_collection, requires_non_retryable_commands, requires_fastcount]
 
-// SERVER-24963/SERVER-27930 Missing invalidation for system.indexes writes
 (function() {
     'use strict';
     let collName = 'system_indexes_invalidations';
@@ -15,8 +14,8 @@
         collRenamed.drop();
         assert.commandWorked(coll.createIndexes([{a: 1}, {b: 1}, {c: 1}]));
 
-        // Get the first two indexes. Use find on 'system.indexes' on MMAPv1, listIndexes otherwise.
-        let cmd = db.system.indexes.count() ? {find: 'system.indexes'} : {listIndexes: collName};
+        // Get the first two indexes.
+        let cmd = {listIndexes: collName};
         Object.extend(cmd, {batchSize: 2});
         let res = db.runCommand(cmd);
         assert.commandWorked(res, 'could not run ' + tojson(cmd));

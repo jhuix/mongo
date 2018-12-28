@@ -1,25 +1,27 @@
 // expression_parser_test.cpp
 
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -65,21 +67,6 @@ TEST(MatchExpressionParserTest, Multiple1) {
     ASSERT(!result.getValue()->matchesBSON(BSON("x" << 5 << "y" << 4)));
 }
 
-TEST(AtomicMatchExpressionTest, AtomicOperator1) {
-    BSONObj query = BSON("x" << 5 << "$atomic" << BSON("$gt" << 5 << "$lt" << 8));
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    StatusWithMatchExpression result = MatchExpressionParser::parse(query, expCtx);
-    ASSERT_TRUE(result.isOK());
-
-    query = BSON("x" << 5 << "$isolated" << 1);
-    result = MatchExpressionParser::parse(query, expCtx);
-    ASSERT_TRUE(result.isOK());
-
-    query = BSON("x" << 5 << "y" << BSON("$isolated" << 1));
-    result = MatchExpressionParser::parse(query, expCtx);
-    ASSERT_FALSE(result.isOK());
-}
-
 TEST(MatchExpressionParserTest, MinDistanceWithoutNearFailsToParse) {
     BSONObj query = fromjson("{loc: {$minDistance: 10}}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -101,13 +88,13 @@ TEST(MatchExpressionParserTest, ParseIntegerElementToLongAcceptsNegative) {
 }
 
 TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsTooLargeDouble) {
-    BSONObj query = BSON("" << MatchExpressionParser::kLongLongMaxPlusOneAsDouble);
+    BSONObj query = BSON("" << BSONElement::kLongLongMaxPlusOneAsDouble);
     ASSERT_NOT_OK(
         MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
 }
 
 TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsTooLargeDouble) {
-    BSONObj query = BSON("" << MatchExpressionParser::kLongLongMaxPlusOneAsDouble);
+    BSONObj query = BSON("" << BSONElement::kLongLongMaxPlusOneAsDouble);
     ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
 }
 
@@ -300,6 +287,30 @@ TEST(MatchExpressionParserTest, TextParsesSuccessfullyWhenAllowed) {
             .getStatus());
 }
 
+TEST(MatchExpressionParserTest, TextFailsToParseIfNotTopLevel) {
+    auto query = fromjson("{a: {$text: {$search: 'str'}}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    ASSERT_NOT_OK(
+        MatchExpressionParser::parse(
+            query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kText)
+            .getStatus());
+}
+
+TEST(MatchExpressionParserTest, TextWithinElemMatchFailsToParse) {
+    auto query = fromjson("{a: {$elemMatch: {$text: {$search: 'str'}}}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    ASSERT_NOT_OK(
+        MatchExpressionParser::parse(
+            query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kText)
+            .getStatus());
+
+    query = fromjson("{a: {$elemMatch: {$elemMatch: {$text: {$search: 'str'}}}}}");
+    ASSERT_NOT_OK(
+        MatchExpressionParser::parse(
+            query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kText)
+            .getStatus());
+}
+
 TEST(MatchExpressionParserTest, WhereFailsToParseWhenDisallowed) {
     auto query = fromjson("{$where: 'this.a == this.b'}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -430,4 +441,36 @@ TEST(MatchExpressionParserTest, ExprFailsToParseWithinInternalSchemaObjectMatch)
             query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr)
             .getStatus());
 }
+
+TEST(MatchExpressionParserTest, InternalExprEqParsesCorrectly) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    auto query = fromjson("{a: {$_internalExprEq: 'foo'}}");
+    auto statusWith = MatchExpressionParser::parse(query, expCtx);
+    ASSERT_OK(statusWith.getStatus());
+    ASSERT_TRUE(statusWith.getValue()->matchesBSON(fromjson("{a: 'foo'}")));
+    ASSERT_TRUE(statusWith.getValue()->matchesBSON(fromjson("{a: ['foo']}")));
+    ASSERT_TRUE(statusWith.getValue()->matchesBSON(fromjson("{a: ['bar']}")));
+    ASSERT_FALSE(statusWith.getValue()->matchesBSON(fromjson("{a: 'bar'}")));
+
+    query = fromjson("{'a.b': {$_internalExprEq: 5}}");
+    statusWith = MatchExpressionParser::parse(query, expCtx);
+    ASSERT_OK(statusWith.getStatus());
+    ASSERT_TRUE(statusWith.getValue()->matchesBSON(fromjson("{a: {b: 5}}")));
+    ASSERT_TRUE(statusWith.getValue()->matchesBSON(fromjson("{a: {b: [5]}}")));
+    ASSERT_TRUE(statusWith.getValue()->matchesBSON(fromjson("{a: {b: [6]}}")));
+    ASSERT_FALSE(statusWith.getValue()->matchesBSON(fromjson("{a: {b: 6}}")));
 }
+
+TEST(MatchesExpressionParserTest, InternalExprEqComparisonToArrayDoesNotParse) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto query = fromjson("{'a.b': {$_internalExprEq: [5]}}");
+    ASSERT_EQ(MatchExpressionParser::parse(query, expCtx).getStatus(), ErrorCodes::BadValue);
+}
+
+TEST(MatchesExpressionParserTest, InternalExprEqComparisonToUndefinedDoesNotParse) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto query = fromjson("{'a.b': {$_internalExprEq: undefined}}");
+    ASSERT_EQ(MatchExpressionParser::parse(query, expCtx).getStatus(), ErrorCodes::BadValue);
+}
+}  // namespace mongo

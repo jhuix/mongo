@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -38,7 +40,7 @@ namespace mongo {
 /**
  * The state used as input and working space for Expressions.
  */
-class Variables {
+class Variables final {
 public:
     // Each unique variable is assigned a unique id of this type. Negative ids are reserved for
     // system variables and non-negative ids are allocated for user variables.
@@ -83,6 +85,12 @@ public:
     void setValue(Variables::Id id, const Value& value);
 
     /**
+     * Same as 'setValue' but marks 'value' as being constant. It is illegal to change a value that
+     * has been marked constant.
+     */
+    void setConstantValue(Variables::Id id, const Value& value);
+
+    /**
      * Gets the value of a user-defined or system variable. If the 'id' provided represents the
      * special ROOT variable, then we return 'root' in Value form.
      */
@@ -95,11 +103,11 @@ public:
     Value getUserDefinedValue(Variables::Id id) const;
 
     /**
-     * Returns whether a value for 'id' has been stored in this Variables instance.
+     * Returns whether a constant value for 'id' has been defined using setConstantValue().
      */
-    bool hasUserDefinedValue(Variables::Id id) const {
-        invariant(isUserDefinedVariable(id));
-        return _valueList.size() > static_cast<size_t>(id);
+    bool hasConstantValue(Variables::Id id) const {
+
+        return _valueList.size() > static_cast<size_t>(id) && _valueList[id].isConstant;
     }
 
     /**
@@ -113,8 +121,19 @@ public:
     }
 
 private:
+    struct ValueAndState {
+        ValueAndState() = default;
+
+        ValueAndState(Value val, bool isConst) : value(std::move(val)), isConstant(isConst) {}
+
+        Value value;
+        bool isConstant = false;
+    };
+
+    void setValue(Id id, const Value& value, bool isConstant);
+
     IdGenerator _idGenerator;
-    std::vector<Value> _valueList;
+    std::vector<ValueAndState> _valueList;
 };
 
 /**
@@ -124,7 +143,7 @@ private:
  * and to propagate back to the original instance enough information to correctly construct a
  * Variables instance.
  */
-class VariablesParseState {
+class VariablesParseState final {
 public:
     explicit VariablesParseState(Variables::IdGenerator* variableIdGenerator)
         : _idGenerator(variableIdGenerator) {}

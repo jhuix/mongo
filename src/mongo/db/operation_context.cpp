@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,6 +39,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/platform/random.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/transport/baton.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/fail_point_service.h"
@@ -52,13 +55,13 @@ namespace {
 // created with a valid non-zero max time will also fail immediately.
 //
 // This fail point cannot be used with the maxTimeNeverTimeOut fail point.
-MONGO_FP_DECLARE(maxTimeAlwaysTimeOut);
+MONGO_FAIL_POINT_DEFINE(maxTimeAlwaysTimeOut);
 
 // Enabling the maxTimeNeverTimeOut fail point will cause the server to never time out any
 // query, command, or getmore operation, regardless of whether a max time is set.
 //
 // This fail point cannot be used with the maxTimeAlwaysTimeOut fail point.
-MONGO_FP_DECLARE(maxTimeNeverTimeOut);
+MONGO_FAIL_POINT_DEFINE(maxTimeNeverTimeOut);
 
 // Enabling the checkForInterruptFail fail point will start a game of random chance on the
 // connection specified in the fail point data, generating an interrupt with a given fixed
@@ -66,12 +69,13 @@ MONGO_FP_DECLARE(maxTimeNeverTimeOut);
 //
 // {configureFailPoint: "checkForInterruptFail",
 //  mode: "alwaysOn",
-//  data: {conn: 17, chance: .01}}
+//  data: {threadName: "threadName", chance: .01}}
 //
-// Both data fields must be specified.  In the above example, all interrupt points on connection 17
-// will generate a kill on the current operation with probability p(.01), including interrupt points
-// of nested operations.  "chance" must be a double between 0 and 1, inclusive.
-MONGO_FP_DECLARE(checkForInterruptFail);
+// Both data fields must be specified. In the above example, all interrupt points on the thread with
+// name 'threadName' will generate a kill on the current operation with probability p(.01),
+// including interrupt points of nested operations. "chance" must be a double between 0 and 1,
+// inclusive.
+MONGO_FAIL_POINT_DEFINE(checkForInterruptFail);
 
 }  // namespace
 
@@ -81,11 +85,19 @@ OperationContext::OperationContext(Client* client, unsigned int opId)
       _elapsedTime(client ? client->getServiceContext()->getTickSource()
                           : SystemTickSource::get()) {}
 
-void OperationContext::setDeadlineAndMaxTime(Date_t when, Microseconds maxTime) {
-    invariant(!getClient()->isInDirectClient());
-    uassert(40120, "Illegal attempt to change operation deadline", !hasDeadline());
+OperationContext::~OperationContext() = default;
+
+void OperationContext::setDeadlineAndMaxTime(Date_t when,
+                                             Microseconds maxTime,
+                                             ErrorCodes::Error timeoutError) {
+    invariant(!getClient()->isInDirectClient() || _hasArtificialDeadline);
+    invariant(ErrorCodes::isExceededTimeLimitError(timeoutError));
+    uassert(40120,
+            "Illegal attempt to change operation deadline",
+            _hasArtificialDeadline || !hasDeadline());
     _deadline = when;
     _maxTime = maxTime;
+    _timeoutError = timeoutError;
 }
 
 Microseconds OperationContext::computeMaxTimeFromDeadline(Date_t when) {
@@ -101,22 +113,11 @@ Microseconds OperationContext::computeMaxTimeFromDeadline(Date_t when) {
     return maxTime;
 }
 
-OperationContext::DeadlineStash::DeadlineStash(OperationContext* opCtx)
-    : _opCtx(opCtx), _originalDeadline(_opCtx->getDeadline()) {
-    _opCtx->_deadline = Date_t::max();
-    _opCtx->_maxTime = _opCtx->computeMaxTimeFromDeadline(Date_t::max());
+void OperationContext::setDeadlineByDate(Date_t when, ErrorCodes::Error timeoutError) {
+    setDeadlineAndMaxTime(when, computeMaxTimeFromDeadline(when), timeoutError);
 }
 
-OperationContext::DeadlineStash::~DeadlineStash() {
-    _opCtx->_deadline = _originalDeadline;
-    _opCtx->_maxTime = _opCtx->computeMaxTimeFromDeadline(_originalDeadline);
-}
-
-void OperationContext::setDeadlineByDate(Date_t when) {
-    setDeadlineAndMaxTime(when, computeMaxTimeFromDeadline(when));
-}
-
-void OperationContext::setDeadlineAfterNowBy(Microseconds maxTime) {
+void OperationContext::setDeadlineAfterNowBy(Microseconds maxTime, ErrorCodes::Error timeoutError) {
     Date_t when;
     if (maxTime < Microseconds::zero()) {
         maxTime = Microseconds::zero();
@@ -130,7 +131,7 @@ void OperationContext::setDeadlineAfterNowBy(Microseconds maxTime) {
             when += clock->getPrecision() + maxTime;
         }
     }
-    setDeadlineAndMaxTime(when, maxTime);
+    setDeadlineAndMaxTime(when, maxTime, timeoutError);
 }
 
 bool OperationContext::hasDeadlineExpired() const {
@@ -170,26 +171,20 @@ Microseconds OperationContext::getRemainingMaxTimeMicros() const {
     return _maxTime - getElapsedTime();
 }
 
-void OperationContext::checkForInterrupt() {
-    uassertStatusOK(checkForInterruptNoAssert());
-}
-
 namespace {
 
 // Helper function for checkForInterrupt fail point.  Decides whether the operation currently
 // being run by the given Client meet the (probabilistic) conditions for interruption as
 // specified in the fail point info.
-bool opShouldFail(const OperationContext* opCtx, const BSONObj& failPointInfo) {
+bool opShouldFail(Client* client, const BSONObj& failPointInfo) {
     // Only target the client with the specified connection number.
-    if (opCtx->getClient()->getConnectionId() != failPointInfo["conn"].safeNumberLong()) {
+    if (client->desc() != failPointInfo["threadName"].valuestrsafe()) {
         return false;
     }
 
     // Return true with (approx) probability p = "chance".  Recall: 0 <= chance <= 1.
-    double next = static_cast<double>(std::abs(opCtx->getClient()->getPrng().nextInt64()));
-    double upperBound =
-        std::numeric_limits<int64_t>::max() * failPointInfo["chance"].numberDouble();
-    if (next > upperBound) {
+    double next = client->getPrng().nextCanonicalDouble();
+    if (next > failPointInfo["chance"].numberDouble()) {
         return false;
     }
     return true;
@@ -197,7 +192,7 @@ bool opShouldFail(const OperationContext* opCtx, const BSONObj& failPointInfo) {
 
 }  // namespace
 
-Status OperationContext::checkForInterruptNoAssert() {
+Status OperationContext::checkForInterruptNoAssert() noexcept {
     // TODO: Remove the MONGO_likely(getClient()) once all operation contexts are constructed with
     // clients.
     if (MONGO_likely(getClient() && getServiceContext()) &&
@@ -206,12 +201,18 @@ Status OperationContext::checkForInterruptNoAssert() {
     }
 
     if (hasDeadlineExpired()) {
-        markKilled(ErrorCodes::ExceededTimeLimit);
-        return Status(ErrorCodes::ExceededTimeLimit, "operation exceeded time limit");
+        if (!_hasArtificialDeadline) {
+            markKilled(_timeoutError);
+        }
+        return Status(_timeoutError, "operation exceeded time limit");
+    }
+
+    if (_ignoreInterrupts) {
+        return Status::OK();
     }
 
     MONGO_FAIL_POINT_BLOCK(checkForInterruptFail, scopedFailPoint) {
-        if (opShouldFail(this, scopedFailPoint.getData())) {
+        if (opShouldFail(getClient(), scopedFailPoint.getData())) {
             log() << "set pending kill on op " << getOpID() << ", for checkForInterruptFail";
             markKilled();
         }
@@ -223,41 +224,6 @@ Status OperationContext::checkForInterruptNoAssert() {
     }
 
     return Status::OK();
-}
-
-void OperationContext::sleepUntil(Date_t deadline) {
-    stdx::mutex m;
-    stdx::condition_variable cv;
-    stdx::unique_lock<stdx::mutex> lk(m);
-    invariant(!waitForConditionOrInterruptUntil(cv, lk, deadline, [] { return false; }));
-}
-
-void OperationContext::sleepFor(Milliseconds duration) {
-    stdx::mutex m;
-    stdx::condition_variable cv;
-    stdx::unique_lock<stdx::mutex> lk(m);
-    invariant(!waitForConditionOrInterruptFor(cv, lk, duration, [] { return false; }));
-}
-
-void OperationContext::waitForConditionOrInterrupt(stdx::condition_variable& cv,
-                                                   stdx::unique_lock<stdx::mutex>& m) {
-    uassertStatusOK(waitForConditionOrInterruptNoAssert(cv, m));
-}
-
-Status OperationContext::waitForConditionOrInterruptNoAssert(
-    stdx::condition_variable& cv, stdx::unique_lock<stdx::mutex>& m) noexcept {
-    auto status = waitForConditionOrInterruptNoAssertUntil(cv, m, Date_t::max());
-    if (!status.isOK()) {
-        return status.getStatus();
-    }
-    invariant(status.getValue() == stdx::cv_status::no_timeout);
-    return status.getStatus();
-}
-
-stdx::cv_status OperationContext::waitForConditionOrInterruptUntil(
-    stdx::condition_variable& cv, stdx::unique_lock<stdx::mutex>& m, Date_t deadline) {
-
-    return uassertStatusOK(waitForConditionOrInterruptNoAssertUntil(cv, m, deadline));
 }
 
 // Theory of operation for waitForConditionOrInterruptNoAssertUntil and markKilled:
@@ -309,7 +275,7 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
     // that we expect to time out at the same time as the existing deadline expires. If, when we
     // time out, we find that the op's deadline has not expired (as will always be the case if
     // maxTimeNeverTimeOut is set) then we assume that the incongruity is due to a clock mismatch
-    // and return ExceededTimeLimit regardless. To prevent this behaviour, only consider the op's
+    // and return _timeoutError regardless. To prevent this behaviour, only consider the op's
     // deadline in the event that the maxTimeNeverTimeOut failpoint is not set.
     bool opHasDeadline = (hasDeadline() && !MONGO_FAIL_POINT(maxTimeNeverTimeOut));
 
@@ -319,14 +285,15 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
 
     const auto waitStatus = [&] {
         if (Date_t::max() == deadline) {
-            cv.wait(m);
+            Waitable::wait(_baton.get(), getServiceContext()->getPreciseClockSource(), cv, m);
             return stdx::cv_status::no_timeout;
         }
-        return getServiceContext()->getPreciseClockSource()->waitForConditionUntil(cv, m, deadline);
+        return getServiceContext()->getPreciseClockSource()->waitForConditionUntil(
+            cv, m, deadline, _baton.get());
     }();
 
     // Continue waiting on cv until no other thread is attempting to kill this one.
-    cv.wait(m, [this] {
+    Waitable::wait(_baton.get(), getServiceContext()->getPreciseClockSource(), cv, m, [this] {
         stdx::lock_guard<Client> clientLock(*getClient());
         if (0 == _numKillers) {
             _waitMutex = nullptr;
@@ -345,9 +312,12 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
         // is slightly ahead of the FastClock used in checkForInterrupt. In this case,
         // we treat the operation as though it has exceeded its time limit, just as if the
         // FastClock and system clock had agreed.
-        markKilled(ErrorCodes::ExceededTimeLimit);
-        return Status(ErrorCodes::ExceededTimeLimit, "operation exceeded time limit");
+        if (!_hasArtificialDeadline) {
+            markKilled(_timeoutError);
+        }
+        return Status(_timeoutError, "operation exceeded time limit");
     }
+
     return waitStatus;
 }
 
@@ -381,27 +351,29 @@ void OperationContext::setTxnNumber(TxnNumber txnNumber) {
     _txnNumber = txnNumber;
 }
 
-RecoveryUnit* OperationContext::releaseRecoveryUnit() {
-    return _recoveryUnit.release();
+std::unique_ptr<RecoveryUnit> OperationContext::releaseRecoveryUnit() {
+    return std::move(_recoveryUnit);
 }
 
-OperationContext::RecoveryUnitState OperationContext::setRecoveryUnit(RecoveryUnit* unit,
-                                                                      RecoveryUnitState state) {
-    _recoveryUnit.reset(unit);
-    RecoveryUnitState oldState = _ruState;
+WriteUnitOfWork::RecoveryUnitState OperationContext::setRecoveryUnit(
+    std::unique_ptr<RecoveryUnit> unit, WriteUnitOfWork::RecoveryUnitState state) {
+    _recoveryUnit = std::move(unit);
+    WriteUnitOfWork::RecoveryUnitState oldState = _ruState;
     _ruState = state;
     return oldState;
 }
 
-std::unique_ptr<Locker> OperationContext::releaseLockState() {
-    dassert(_locker);
-    return std::move(_locker);
+void OperationContext::setLockState(std::unique_ptr<Locker> locker) {
+    invariant(!_locker);
+    invariant(locker);
+    _locker = std::move(locker);
 }
 
-void OperationContext::setLockState(std::unique_ptr<Locker> locker) {
-    dassert(!_locker);
-    dassert(locker);
-    _locker = std::move(locker);
+std::unique_ptr<Locker> OperationContext::swapLockState(std::unique_ptr<Locker> locker) {
+    invariant(_locker);
+    invariant(locker);
+    _locker.swap(locker);
+    return locker;
 }
 
 Date_t OperationContext::getExpirationDateForWaitForValue(Milliseconds waitFor) {

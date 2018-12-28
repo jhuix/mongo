@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -123,6 +125,7 @@ TEST_F(RenameNodeTest, SimpleNumberAtRoot) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: 2}"), doc);
     ASSERT_EQUALS(fromjson("{$set: {b: 2}, $unset: {a: true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, ToExistsAtSameLevel) {
@@ -139,6 +142,7 @@ TEST_F(RenameNodeTest, ToExistsAtSameLevel) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: 2}"), doc);
     ASSERT_EQUALS(fromjson("{$set: {b: 2}, $unset: {a: true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, ToAndFromHaveSameValue) {
@@ -154,7 +158,25 @@ TEST_F(RenameNodeTest, ToAndFromHaveSameValue) {
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: 2}"), doc);
-    ASSERT_EQUALS(fromjson("{$unset: {a: true}}"), getLogDoc());
+    ASSERT_EQUALS(fromjson("{$set: {b: 2}, $unset: {a: true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
+}
+
+TEST_F(RenameNodeTest, RenameToFieldWithSameValueButDifferentType) {
+    auto update = fromjson("{$rename: {a: 'b'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    RenameNode node;
+    ASSERT_OK(node.init(update["$rename"]["a"], expCtx));
+
+    mutablebson::Document doc(fromjson("{a: 1, b: NumberLong(1)}"));
+    setPathTaken("b");
+    addIndexedPath("a");
+    auto result = node.apply(getApplyParams(doc.root()["b"]));
+    ASSERT_FALSE(result.noop);
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_EQUALS(fromjson("{b: 1}"), doc);
+    ASSERT_EQUALS(fromjson("{$set: {b: 1}, $unset: {a: true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, FromDottedElement) {
@@ -171,6 +193,7 @@ TEST_F(RenameNodeTest, FromDottedElement) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {}, b: {d: 6}}"), doc);
     ASSERT_EQUALS(fromjson("{$set: {b: {d: 6}}, $unset: {'a.c': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.c, b}");
 }
 
 TEST_F(RenameNodeTest, RenameToExistingNestedFieldDoesNotReorderFields) {
@@ -187,6 +210,7 @@ TEST_F(RenameNodeTest, RenameToExistingNestedFieldDoesNotReorderFields) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: {c: 4, d: 2}}, b: 3, c: {}}"), doc);
     ASSERT_EQUALS(fromjson("{$set: {'a.b.c': 4}, $unset: {'c.d': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b.c, c.d}");
 }
 
 TEST_F(RenameNodeTest, MissingCompleteTo) {
@@ -204,6 +228,7 @@ TEST_F(RenameNodeTest, MissingCompleteTo) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: 1, c: {r: {d: 2}}}"), doc);
     ASSERT_EQUALS(fromjson("{$set: {'c.r.d': 2}, $unset: {'a': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, c.r.d}");
 }
 
 TEST_F(RenameNodeTest, ToIsCompletelyMissing) {
@@ -220,6 +245,7 @@ TEST_F(RenameNodeTest, ToIsCompletelyMissing) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: {c: {d: 2}}}"), doc);
     ASSERT_EQUALS(fromjson("{$set: {'b.c.d': 2}, $unset: {'a': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b.c.d}");
 }
 
 TEST_F(RenameNodeTest, ToMissingDottedField) {
@@ -236,6 +262,7 @@ TEST_F(RenameNodeTest, ToMissingDottedField) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: {c: {d: [{a:2, b:1}]}}}"), doc);
     ASSERT_EQUALS(fromjson("{$set: {'b.c.d': [{a:2, b:1}]}, $unset: {'a': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b.c.d}");
 }
 
 TEST_F(RenameNodeTest, MoveIntoArray) {
@@ -281,7 +308,7 @@ TEST_F(RenameNodeTest, MoveToArrayElement) {
     mutablebson::Document doc(fromjson("{_id: 'test_object', a: [1, 2], b: 2}"));
     setPathTaken("a.1");
     addIndexedPath("a");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"]["1"])),
+    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"][1])),
                                 AssertionException,
                                 ErrorCodes::BadValue,
                                 "The destination field cannot be an array element, 'a.1' in doc "
@@ -350,6 +377,7 @@ TEST_F(RenameNodeTest, ReplaceArrayField) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: 2}"), doc);
     ASSERT_EQUALS(fromjson("{$set: {b: 2}, $unset: {a: true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, ReplaceWithArrayField) {
@@ -366,6 +394,7 @@ TEST_F(RenameNodeTest, ReplaceWithArrayField) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: []}"), doc);
     ASSERT_EQUALS(fromjson("{$set: {b: []}, $unset: {a: true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, CanRenameFromInvalidFieldName) {
@@ -382,6 +411,7 @@ TEST_F(RenameNodeTest, CanRenameFromInvalidFieldName) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     ASSERT_EQUALS(fromjson("{$set: {a: 2}, $unset: {'$a': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{$a, a}");
 }
 
 TEST_F(RenameNodeTest, RenameWithoutLogBuilderOrIndexData) {
@@ -412,6 +442,7 @@ TEST_F(RenameNodeTest, RenameFromNonExistentPathIsNoOp) {
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: 2}"), doc);
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a, b}");
 }
 
 TEST_F(RenameNodeTest, ApplyCannotRemoveRequiredPartOfDBRef) {
@@ -448,6 +479,7 @@ TEST_F(RenameNodeTest, ApplyCanRemoveRequiredPartOfDBRefIfValidateForStorageIsFa
     ASSERT_EQUALS(updated, doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$set: {'b': 0}, $unset: {'a.$id': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.$id, b}");
 }
 
 TEST_F(RenameNodeTest, ApplyCannotRemoveImmutablePath) {
@@ -514,6 +546,7 @@ TEST_F(RenameNodeTest, ApplyCanRemoveImmutablePathIfNoop) {
     ASSERT_EQUALS(fromjson("{a: {b: {}}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b.c, d}");
 }
 
 TEST_F(RenameNodeTest, ApplyCannotCreateDollarPrefixedField) {

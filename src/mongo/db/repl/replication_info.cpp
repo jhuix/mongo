@@ -1,30 +1,31 @@
 /**
-*    Copyright (C) 2008-2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
@@ -33,6 +34,8 @@
 #include <vector>
 
 #include "mongo/client/connpool.h"
+#include "mongo/client/dbclient_connection.h"
+#include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/db_raii.h"
@@ -45,13 +48,11 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/is_master_response.h"
-#include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/wire_version.h"
@@ -70,7 +71,7 @@ using std::stringstream;
 namespace repl {
 
 void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int level) {
-    ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
+    ReplicationCoordinator* replCoord = ReplicationCoordinator::get(opCtx);
     if (replCoord->getSettings().usingReplSets()) {
         IsMasterResponse isMasterResponse;
         replCoord->fillIsMasterForReplSet(&isMasterResponse);
@@ -81,15 +82,8 @@ void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int 
         return;
     }
 
-    // TODO(dannenberg) replAllDead is bad and should be removed when master slave is removed
-    if (replAllDead) {
-        result.append("ismaster", 0);
-        string s = string("dead: ") + replAllDead;
-        result.append("info", s);
-    } else {
-        result.appendBool("ismaster",
-                          getGlobalReplicationCoordinator()->isMasterForReportingPurposes());
-    }
+    result.appendBool("ismaster",
+                      ReplicationCoordinator::get(opCtx)->isMasterForReportingPurposes());
 
     if (level) {
         BSONObjBuilder sources(result.subarrayStart("sources"));
@@ -127,7 +121,7 @@ void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int 
             }
 
             if (level > 1) {
-                wassert(!opCtx->lockState()->isLocked());
+                invariant(!opCtx->lockState()->isLocked());
                 // note: there is no so-style timeout on this connection; perhaps we should have
                 // one.
                 ScopedDbConnection conn(s["host"].valuestr());
@@ -155,15 +149,19 @@ void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int 
     }
 }
 
+namespace {
+
 class ReplicationInfoServerStatus : public ServerStatusSection {
 public:
     ReplicationInfoServerStatus() : ServerStatusSection("repl") {}
-    bool includeByDefault() const {
+
+    bool includeByDefault() const override {
         return true;
     }
 
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
-        if (!getGlobalReplicationCoordinator()->isReplEnabled()) {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
+        if (!ReplicationCoordinator::get(opCtx)->isReplEnabled()) {
             return BSONObj();
         }
 
@@ -172,9 +170,9 @@ public:
         BSONObjBuilder result;
         appendReplicationInfo(opCtx, result, level);
 
-        auto rbid = ReplicationProcess::get(opCtx)->getRollbackID(opCtx);
-        if (rbid.isOK()) {
-            result.append("rbid", rbid.getValue());
+        auto rbid = ReplicationProcess::get(opCtx)->getRollbackID();
+        if (ReplicationProcess::kUninitializedRollbackId != rbid) {
+            result.append("rbid", rbid);
         }
 
         return result.obj();
@@ -185,12 +183,14 @@ public:
 class OplogInfoServerStatus : public ServerStatusSection {
 public:
     OplogInfoServerStatus() : ServerStatusSection("oplog") {}
-    bool includeByDefault() const {
+
+    bool includeByDefault() const override {
         return false;
     }
 
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
-        ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
+        ReplicationCoordinator* replCoord = ReplicationCoordinator::get(opCtx);
         if (!replCoord->isReplEnabled()) {
             return BSONObj();
         }
@@ -199,43 +199,44 @@ public:
         // TODO(siyuan) Output term of OpTime
         result.append("latestOptime", replCoord->getMyLastAppliedOpTime().getTimestamp());
 
-        const std::string& oplogNS =
-            replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet
-            ? NamespaceString::kRsOplogNamespace.ns()
-            : masterSlaveOplogName;
         BSONObj o;
         uassert(17347,
                 "Problem reading earliest entry from oplog",
-                Helpers::getSingleton(opCtx, oplogNS.c_str(), o));
+                Helpers::getSingleton(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), o));
         result.append("earliestOptime", o["ts"].timestamp());
         return result.obj();
     }
 } oplogInfoServerStatus;
 
-class CmdIsMaster : public BasicCommand {
+class CmdIsMaster final : public BasicCommand {
 public:
-    bool requiresAuth() const override {
-        return false;
-    }
-    virtual bool slaveOk() const {
-        return true;
-    }
-    virtual void help(stringstream& help) const {
-        help << "Check if this server is primary for a replica pair/set; also if it is --master or "
-                "--slave in simple master/slave setups.\n";
-        help << "{ isMaster : 1 }";
-    }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
     CmdIsMaster() : BasicCommand("isMaster", "ismaster") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+
+    bool requiresAuth() const final {
+        return false;
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    std::string help() const override {
+        return "Check if this server is primary for a replica set\n"
+               "{ isMaster : 1 }";
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const final {
+        return false;
+    }
+
+    void addRequiredPrivileges(const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::vector<Privilege>* out) const final {}  // No auth required
+
+    bool run(OperationContext* opCtx,
+             const string&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) final {
         /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
            authenticated.
         */
@@ -243,14 +244,13 @@ public:
             LastError::get(opCtx->getClient()).disable();
         }
 
+        transport::Session::TagMask sessionTagsToSet = 0;
+        transport::Session::TagMask sessionTagsToUnset = 0;
+
         // Tag connections to avoid closing them on stepdown.
         auto hangUpElement = cmdObj["hangUpOnStepDown"];
         if (!hangUpElement.eoo() && !hangUpElement.trueValue()) {
-            auto session = opCtx->getClient()->session();
-            if (session) {
-                session->replaceTags(session->getTags() |
-                                     executor::NetworkInterface::kMessagingPortKeepOpen);
-            }
+            sessionTagsToSet |= transport::Session::kKeepOpen;
         }
 
         auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx->getClient());
@@ -262,17 +262,13 @@ public:
         BSONElement element = cmdObj[kMetadataDocumentName];
         if (!element.eoo()) {
             if (seenIsMaster) {
-                return Command::appendCommandStatus(
-                    result,
-                    Status(ErrorCodes::ClientMetadataCannotBeMutated,
-                           "The client metadata document may only be sent in the first isMaster"));
+                uasserted(ErrorCodes::ClientMetadataCannotBeMutated,
+                          "The client metadata document may only be sent in the first isMaster");
             }
 
             auto swParseClientMetadata = ClientMetadata::parse(element);
 
-            if (!swParseClientMetadata.getStatus().isOK()) {
-                return Command::appendCommandStatus(result, swParseClientMetadata.getStatus());
-            }
+            uassertStatusOK(swParseClientMetadata.getStatus());
 
             invariant(swParseClientMetadata.getValue());
 
@@ -286,10 +282,7 @@ public:
         // mongod and mongos.
         auto internalClientElement = cmdObj["internalClient"];
         if (internalClientElement) {
-            auto session = opCtx->getClient()->session();
-            if (session) {
-                session->replaceTags(session->getTags() | transport::Session::kInternalClient);
-            }
+            sessionTagsToSet |= transport::Session::kInternalClient;
 
             uassert(ErrorCodes::TypeMismatch,
                     str::stream() << "'internalClient' must be of type Object, but was of type "
@@ -313,18 +306,13 @@ public:
 
                     // All incoming connections from mongod/mongos of earlier versions should be
                     // closed if the featureCompatibilityVersion is bumped to 3.6.
-                    if (elem.numberInt() >= WireSpec::instance().incoming.maxWireVersion) {
-                        if (session) {
-                            session->replaceTags(
-                                session->getTags() |
-                                transport::Session::kLatestVersionInternalClientKeepOpen);
-                        }
+                    if (elem.numberInt() >=
+                        WireSpec::instance().incomingInternalClient.maxWireVersion) {
+                        sessionTagsToSet |=
+                            transport::Session::kLatestVersionInternalClientKeepOpen;
                     } else {
-                        if (session) {
-                            session->replaceTags(
-                                session->getTags() &
-                                ~transport::Session::kLatestVersionInternalClientKeepOpen);
-                        }
+                        sessionTagsToUnset |=
+                            transport::Session::kLatestVersionInternalClientKeepOpen;
                     }
                 } else {
                     uasserted(ErrorCodes::BadValue,
@@ -338,11 +326,26 @@ public:
                     "Missing required field 'maxWireVersion' of 'internalClient'",
                     foundMaxWireVersion);
         } else {
-            auto session = opCtx->getClient()->session();
-            if (session && !(session->getTags() & transport::Session::kInternalClient)) {
-                session->replaceTags(session->getTags() |
-                                     transport::Session::kExternalClientKeepOpen);
-            }
+            sessionTagsToUnset |= (transport::Session::kInternalClient |
+                                   transport::Session::kLatestVersionInternalClientKeepOpen);
+            sessionTagsToSet |= transport::Session::kExternalClientKeepOpen;
+        }
+
+        auto session = opCtx->getClient()->session();
+        if (session) {
+            session->mutateTags(
+                [sessionTagsToSet, sessionTagsToUnset](transport::Session::TagMask originalTags) {
+                    // After a mongos sends the initial "isMaster" command with its mongos client
+                    // information, it sometimes sends another "isMaster" command that is forwarded
+                    // from its client. Once kInternalClient has been set, we assume that any future
+                    // "isMaster" commands are forwarded in this manner, and we do not update the
+                    // session tags.
+                    if ((originalTags & transport::Session::kInternalClient) == 0) {
+                        return (originalTags | sessionTagsToSet) & ~sessionTagsToUnset;
+                    } else {
+                        return originalTags;
+                    }
+                });
         }
 
         appendReplicationInfo(opCtx, result, 0);
@@ -356,18 +359,19 @@ public:
         result.appendNumber("maxMessageSizeBytes", MaxMessageSizeBytes);
         result.appendNumber("maxWriteBatchSize", write_ops::kMaxWriteBatchSize);
         result.appendDate("localTime", jsTime());
-        result.append("maxWireVersion", WireSpec::instance().incoming.maxWireVersion);
         result.append("logicalSessionTimeoutMinutes", localLogicalSessionTimeoutMinutes);
+        result.appendNumber("connectionId", opCtx->getClient()->getConnectionId());
 
-        // If the featureCompatibilityVersion is 3.6, respond with minWireVersion=maxWireVersion.
-        // Then if the connection is from a mongod/mongos of an earlier version, it will fail to
-        // connect.
-        if (internalClientElement &&
-            serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k36) {
-            result.append("minWireVersion", WireSpec::instance().incoming.maxWireVersion);
+        if (internalClientElement) {
+            result.append("minWireVersion",
+                          WireSpec::instance().incomingInternalClient.minWireVersion);
+            result.append("maxWireVersion",
+                          WireSpec::instance().incomingInternalClient.maxWireVersion);
         } else {
-            result.append("minWireVersion", WireSpec::instance().incoming.minWireVersion);
+            result.append("minWireVersion",
+                          WireSpec::instance().incomingExternalClient.minWireVersion);
+            result.append("maxWireVersion",
+                          WireSpec::instance().incomingExternalClient.maxWireVersion);
         }
 
         result.append("readOnly", storageGlobalParams.readOnly);
@@ -383,11 +387,16 @@ public:
                 .serverNegotiate(cmdObj, &result);
         }
 
+        auto& saslMechanismRegistry = SASLServerMechanismRegistry::get(opCtx->getServiceContext());
+        saslMechanismRegistry.advertiseMechanismNamesForUser(opCtx, cmdObj, &result);
+
         return true;
     }
 } cmdismaster;
 
 OpCounterServerStatusSection replOpCounterServerStatusSection("opcountersRepl", &replOpCounters);
+
+}  // namespace
 
 }  // namespace repl
 }  // namespace mongo

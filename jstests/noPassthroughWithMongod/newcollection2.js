@@ -1,7 +1,7 @@
 // Alocate collection forcing just a small size remainder in 2nd extent
 
 var baseName = "jstests_disk_newcollection2";
-var m = MongoRunner.runMongod({noprealloc: "", smallfiles: ""});
+var m = MongoRunner.runMongod();
 db = m.getDB("test");
 
 db.createCollection(baseName, {size: 0x1FFC0000 - 0x10 - 8192});
@@ -14,4 +14,5 @@ assert(v.valid);
 
 db.runCommand({applyOps: [{op: 'u', ns: 'a\0b'}]});
 var res = db["a\0a"].insert({});
-assert(res.hasWriteError(), "A write to collection a\0a succceeded");
+assert(res instanceof WriteCommandError, "A write to collection a\0a succceeded");
+MongoRunner.stopMongod(m);

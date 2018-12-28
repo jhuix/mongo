@@ -1,31 +1,33 @@
 // documentsourcetests.cpp : Unit tests for DocumentSource classes.
 
+
 /**
- *    Copyright (C) 2012-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -86,7 +88,7 @@ protected:
         // clean up first if this was called before
         _source.reset();
 
-        OldClientWriteContext ctx(opCtx(), nss.ns());
+        dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
 
         auto qr = stdx::make_unique<QueryRequest>(nss);
         if (hint) {
@@ -95,7 +97,7 @@ protected:
         auto cq = uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(qr)));
 
         auto exec = uassertStatusOK(
-            getExecutor(opCtx(), ctx.getCollection(), std::move(cq), PlanExecutor::NO_YIELD));
+            getExecutor(opCtx(), ctx.getCollection(), std::move(cq), PlanExecutor::NO_YIELD, 0));
 
         exec->saveState();
         _source = DocumentSourceCursor::create(ctx.getCollection(), std::move(exec), _ctx);
@@ -111,6 +113,12 @@ protected:
 
     OperationContext* opCtx() {
         return _opCtx.get();
+    }
+
+    void exhaustCursor() {
+        while (!_source->getNext().isEOF()) {
+            // Just pull everything out of the cursor.
+        }
     }
 
 protected:
@@ -279,42 +287,80 @@ TEST_F(DocumentSourceCursorTest, CompoundIndexScanProvidesMultipleSorts) {
     source()->dispose();
 }
 
-TEST_F(DocumentSourceCursorTest, SerializationRespectsExplainModes) {
+TEST_F(DocumentSourceCursorTest, SerializationNoExplainLevel) {
+    // Nothing serialized when no explain mode specified.
     createSource();
+    auto explainResult = source()->serialize();
+    ASSERT_TRUE(explainResult.missing());
 
-    {
-        // Nothing serialized when no explain mode specified.
-        auto explainResult = source()->serialize();
-        ASSERT_TRUE(explainResult.missing());
-    }
-
-    {
-        auto explainResult = source()->serialize(ExplainOptions::Verbosity::kQueryPlanner);
-        ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
-        ASSERT_TRUE(explainResult["$cursor"]["executionStats"].missing());
-    }
-
-    {
-        auto explainResult = source()->serialize(ExplainOptions::Verbosity::kExecStats);
-        ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
-        ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
-        ASSERT_TRUE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
-    }
-
-    {
-        auto explainResult =
-            source()->serialize(ExplainOptions::Verbosity::kExecAllPlans).getDocument();
-        ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
-        ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
-        ASSERT_FALSE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
-    }
     source()->dispose();
 }
 
-TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorStillUsableAfterTimeout) {
+TEST_F(DocumentSourceCursorTest, SerializationQueryPlannerExplainLevel) {
+    auto verb = ExplainOptions::Verbosity::kQueryPlanner;
+    createSource();
+    ctx()->explain = verb;
+
+    auto explainResult = source()->serialize(verb);
+    ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+    ASSERT_TRUE(explainResult["$cursor"]["executionStats"].missing());
+
+    source()->dispose();
+}
+
+TEST_F(DocumentSourceCursorTest, SerializationExecStatsExplainLevel) {
+    auto verb = ExplainOptions::Verbosity::kExecStats;
+    createSource();
+    ctx()->explain = verb;
+
+    // Execute the plan so that the source populates its internal execution stats.
+    exhaustCursor();
+
+    auto explainResult = source()->serialize(verb);
+    ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+    ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
+    ASSERT_TRUE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
+
+    source()->dispose();
+}
+
+TEST_F(DocumentSourceCursorTest, SerializationExecAllPlansExplainLevel) {
+    auto verb = ExplainOptions::Verbosity::kExecAllPlans;
+    createSource();
+    ctx()->explain = verb;
+
+    // Execute the plan so that the source populates its internal executionStats.
+    exhaustCursor();
+
+    auto explainResult = source()->serialize(verb).getDocument();
+    ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+    ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
+    ASSERT_FALSE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
+
+    source()->dispose();
+}
+
+TEST_F(DocumentSourceCursorTest, ExpressionContextAndSerializeVerbosityMismatch) {
+    const auto verb1 = ExplainOptions::Verbosity::kExecAllPlans;
+    const auto verb2 = ExplainOptions::Verbosity::kQueryPlanner;
+    createSource();
+    ctx()->explain = verb1;
+
+    // Execute the plan so that the source populates its internal executionStats.
+    exhaustCursor();
+
+    ASSERT_THROWS_CODE(source()->serialize(verb2), DBException, 50660);
+}
+
+TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterTimeout) {
+    // Skip the test if the storage engine doesn't support capped collections.
+    if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+        return;
+    }
+
     // Make sure the collection exists, otherwise we'll default to a NO_YIELD yield policy.
     const bool capped = true;
-    const bool cappedSize = 1024;
+    const long long cappedSize = 1024;
     ASSERT_TRUE(client.createCollection(nss.ns(), cappedSize, capped));
     client.insert(nss.ns(), BSON("a" << 1));
 
@@ -322,15 +368,14 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorStillUsableAfterTimeout)
     AutoGetCollectionForRead readLock(opCtx(), nss);
     auto workingSet = stdx::make_unique<WorkingSet>();
     CollectionScanParams collScanParams;
-    collScanParams.collection = readLock.getCollection();
     collScanParams.tailable = true;
     auto filter = BSON("a" << 1);
     auto matchExpression = uassertStatusOK(MatchExpressionParser::parse(filter, ctx()));
     auto collectionScan = stdx::make_unique<CollectionScan>(
-        opCtx(), collScanParams, workingSet.get(), matchExpression.get());
+        opCtx(), readLock.getCollection(), collScanParams, workingSet.get(), matchExpression.get());
     auto queryRequest = stdx::make_unique<QueryRequest>(nss);
     queryRequest->setFilter(filter);
-    queryRequest->setTailableMode(TailableMode::kTailableAndAwaitData);
+    queryRequest->setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
     auto planExecutor =
@@ -342,14 +387,15 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorStillUsableAfterTimeout)
                                            PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT));
 
     // Make a DocumentSourceCursor.
-    ctx()->tailableMode = TailableMode::kTailableAndAwaitData;
+    ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
     auto cursor =
         DocumentSourceCursor::create(readLock.getCollection(), std::move(planExecutor), ctx());
 
-    ASSERT(cursor->getNext().isEOF());
-    cursor->dispose();
+    ON_BLOCK_EXIT([cursor]() { cursor->dispose(); });
+    ASSERT_THROWS_CODE(
+        cursor->getNext().isEOF(), AssertionException, ErrorCodes::ExceededTimeLimit);
 }
 
 TEST_F(DocumentSourceCursorTest, NonAwaitDataCursorShouldErrorAfterTimeout) {
@@ -361,11 +407,10 @@ TEST_F(DocumentSourceCursorTest, NonAwaitDataCursorShouldErrorAfterTimeout) {
     AutoGetCollectionForRead readLock(opCtx(), nss);
     auto workingSet = stdx::make_unique<WorkingSet>();
     CollectionScanParams collScanParams;
-    collScanParams.collection = readLock.getCollection();
     auto filter = BSON("a" << 1);
     auto matchExpression = uassertStatusOK(MatchExpressionParser::parse(filter, ctx()));
     auto collectionScan = stdx::make_unique<CollectionScan>(
-        opCtx(), collScanParams, workingSet.get(), matchExpression.get());
+        opCtx(), readLock.getCollection(), collScanParams, workingSet.get(), matchExpression.get());
     auto queryRequest = stdx::make_unique<QueryRequest>(nss);
     queryRequest->setFilter(filter);
     auto canonicalQuery = unittest::assertGet(
@@ -379,20 +424,26 @@ TEST_F(DocumentSourceCursorTest, NonAwaitDataCursorShouldErrorAfterTimeout) {
                                            PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT));
 
     // Make a DocumentSourceCursor.
-    ctx()->tailableMode = TailableMode::kNormal;
+    ctx()->tailableMode = TailableModeEnum::kNormal;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
     auto cursor =
         DocumentSourceCursor::create(readLock.getCollection(), std::move(planExecutor), ctx());
 
     ON_BLOCK_EXIT([cursor]() { cursor->dispose(); });
-    ASSERT_THROWS_CODE(cursor->getNext().isEOF(), AssertionException, ErrorCodes::QueryPlanKilled);
+    ASSERT_THROWS_CODE(
+        cursor->getNext().isEOF(), AssertionException, ErrorCodes::ExceededTimeLimit);
 }
 
 TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKilled) {
+    // Skip the test if the storage engine doesn't support capped collections.
+    if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+        return;
+    }
+
     // Make sure the collection exists, otherwise we'll default to a NO_YIELD yield policy.
     const bool capped = true;
-    const bool cappedSize = 1024;
+    const long long cappedSize = 1024;
     ASSERT_TRUE(client.createCollection(nss.ns(), cappedSize, capped));
     client.insert(nss.ns(), BSON("a" << 1));
 
@@ -400,15 +451,14 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKil
     AutoGetCollectionForRead readLock(opCtx(), nss);
     auto workingSet = stdx::make_unique<WorkingSet>();
     CollectionScanParams collScanParams;
-    collScanParams.collection = readLock.getCollection();
     collScanParams.tailable = true;
     auto filter = BSON("a" << 1);
     auto matchExpression = uassertStatusOK(MatchExpressionParser::parse(filter, ctx()));
     auto collectionScan = stdx::make_unique<CollectionScan>(
-        opCtx(), collScanParams, workingSet.get(), matchExpression.get());
+        opCtx(), readLock.getCollection(), collScanParams, workingSet.get(), matchExpression.get());
     auto queryRequest = stdx::make_unique<QueryRequest>(nss);
     queryRequest->setFilter(filter);
-    queryRequest->setTailableMode(TailableMode::kTailableAndAwaitData);
+    queryRequest->setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
     auto planExecutor =
@@ -420,7 +470,7 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKil
                                            PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED));
 
     // Make a DocumentSourceCursor.
-    ctx()->tailableMode = TailableMode::kTailableAndAwaitData;
+    ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
     auto cursor =
@@ -439,11 +489,10 @@ TEST_F(DocumentSourceCursorTest, NormalCursorShouldErrorAfterBeingKilled) {
     AutoGetCollectionForRead readLock(opCtx(), nss);
     auto workingSet = stdx::make_unique<WorkingSet>();
     CollectionScanParams collScanParams;
-    collScanParams.collection = readLock.getCollection();
     auto filter = BSON("a" << 1);
     auto matchExpression = uassertStatusOK(MatchExpressionParser::parse(filter, ctx()));
     auto collectionScan = stdx::make_unique<CollectionScan>(
-        opCtx(), collScanParams, workingSet.get(), matchExpression.get());
+        opCtx(), readLock.getCollection(), collScanParams, workingSet.get(), matchExpression.get());
     auto queryRequest = stdx::make_unique<QueryRequest>(nss);
     queryRequest->setFilter(filter);
     auto canonicalQuery = unittest::assertGet(
@@ -457,7 +506,7 @@ TEST_F(DocumentSourceCursorTest, NormalCursorShouldErrorAfterBeingKilled) {
                                            PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED));
 
     // Make a DocumentSourceCursor.
-    ctx()->tailableMode = TailableMode::kNormal;
+    ctx()->tailableMode = TailableModeEnum::kNormal;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
     auto cursor =

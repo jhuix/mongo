@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,8 +32,9 @@
 
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/requires_collection_stage.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/ops/update_result.h"
 #include "mongo/db/update/update_driver.h"
@@ -71,9 +74,9 @@ private:
  * returned after updating or inserting a document. Otherwise, NEED_TIME is returned after
  * updating or inserting a document.
  *
- * Callers of work() must be holding a write lock.
+ * Callers of doWork() must be holding a write lock.
  */
-class UpdateStage final : public PlanStage {
+class UpdateStage final : public RequiresMutableCollectionStage {
     MONGO_DISALLOW_COPYING(UpdateStage);
 
 public:
@@ -85,8 +88,6 @@ public:
 
     bool isEOF() final;
     StageState doWork(WorkingSetID* out) final;
-
-    void doRestoreState() final;
 
     StageType stageType() const final {
         return STAGE_UPDATE;
@@ -141,9 +142,30 @@ public:
                                            mutablebson::Document* doc,
                                            bool isInternalRequest,
                                            const NamespaceString& ns,
+                                           bool enforceOkForStorage,
                                            UpdateStats* stats);
 
+    /**
+     * Returns true if an update failure due to a given DuplicateKey error is eligible for retry.
+     * Requires that parsedUpdate.hasParsedQuery() is true.
+     */
+    static bool shouldRetryDuplicateKeyException(const ParsedUpdate& parsedUpdate,
+                                                 const DuplicateKeyErrorInfo& errorInfo);
+
+protected:
+    void doSaveStateRequiresCollection() final {}
+
+    void doRestoreStateRequiresCollection() final;
+
 private:
+    static const UpdateStats kEmptyUpdateStats;
+
+    /**
+     * Returns whether a given MatchExpression contains is a MatchType::EQ or a MatchType::AND node
+     * with only MatchType::EQ children.
+     */
+    static bool matchContainsOnlyAndedEqualityNodes(const MatchExpression& root);
+
     /**
      * Computes the result of applying mods to the document 'oldObj' at RecordId 'recordId' in
      * memory, then commits these changes to the database. Returns a possibly unowned copy
@@ -171,7 +193,7 @@ private:
 
     /**
      * Stores 'idToRetry' in '_idRetrying' so the update can be retried during the next call to
-     * work(). Always returns NEED_YIELD and sets 'out' to WorkingSet::INVALID_ID.
+     * doWork(). Always returns NEED_YIELD and sets 'out' to WorkingSet::INVALID_ID.
      */
     StageState prepareToRetryWSM(WorkingSetID idToRetry, WorkingSetID* out);
 
@@ -179,9 +201,6 @@ private:
 
     // Not owned by us.
     WorkingSet* _ws;
-
-    // Not owned by us. May be NULL.
-    Collection* _collection;
 
     // If not WorkingSet::INVALID_ID, we use this rather than asking our child what to do next.
     WorkingSetID _idRetrying;
@@ -191,6 +210,9 @@ private:
 
     // Stats
     UpdateStats _specificStats;
+
+    // True if updated documents should be validated with storage_validation::storageValid().
+    bool _enforceOkForStorage;
 
     // If the update was in-place, we may see it again.  This only matters if we're doing
     // a multi-update; if we're not doing a multi-update we stop after one update and we
@@ -204,7 +226,7 @@ private:
     // document and we wouldn't want to update that.
     //
     // So, no matter what, we keep track of where the doc wound up.
-    typedef unordered_set<RecordId, RecordId::Hasher> RecordIdSet;
+    typedef stdx::unordered_set<RecordId, RecordId::Hasher> RecordIdSet;
     const std::unique_ptr<RecordIdSet> _updatedRecordIds;
 
     // These get reused for each update.

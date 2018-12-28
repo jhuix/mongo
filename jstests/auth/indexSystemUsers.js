@@ -15,8 +15,6 @@ adminDB.auth('mallory', 'x');
 var res = adminDB.system.users.createIndex({haxx: 1}, {unique: true, dropDups: true});
 assert(!res.ok);
 assert.eq(13, res.code);  // unauthorized
-assert.writeError(adminDB.exploit.system.indexes.insert(
-    {ns: "admin.system.users", key: {haxx: 1.0}, name: "haxx_1", unique: true, dropDups: true}));
 // Make sure that no indexes were built.
 var collectionInfosCursor = adminDB.runCommand("listCollections", {
     filter: {
@@ -34,3 +32,4 @@ adminDB.logout();
 adminDB.auth('admin', 'x');
 // Make sure that no users were actually dropped
 assert.eq(3, adminDB.system.users.count());
+MongoRunner.stopMongod(conn, null, {user: 'admin', pwd: 'x'});

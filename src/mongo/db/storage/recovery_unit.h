@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,8 +36,10 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/snapshot.h"
-#include "mongo/db/storage/snapshot_name.h"
 
 namespace mongo {
 
@@ -53,41 +57,89 @@ public:
     virtual ~RecoveryUnit() {}
 
     /**
-     * A storage engine may elect to append state information to the passed BSONObjBuilder.  This
-     * function is not currently called by any MongoDB command, but may in the future.
-     */
-    virtual void reportState(BSONObjBuilder* b) const {}
-
-    /**
-     * These should be called through WriteUnitOfWork rather than directly.
+     * Marks the beginning of a unit of work. Each call must be matched with exactly one call to
+     * either commitUnitOfWork or abortUnitOfWork.
      *
-     * A call to 'beginUnitOfWork' marks the beginning of a unit of work. Each call to
-     * 'beginUnitOfWork' must be matched with exactly one call to either 'commitUnitOfWork' or
-     * 'abortUnitOfWork'. When 'abortUnitOfWork' is called, all changes made since the begin
-     * of the unit of work will be rolled back.
+     * Should be called through WriteUnitOfWork rather than directly.
      */
     virtual void beginUnitOfWork(OperationContext* opCtx) = 0;
+
+    /**
+     * Marks the end of a unit of work and commits all changes registered by calls to onCommit or
+     * registerChange, in order. Must be matched by exactly one preceding call to beginUnitOfWork.
+     *
+     * Should be called through WriteUnitOfWork rather than directly.
+     */
     virtual void commitUnitOfWork() = 0;
+
+    /**
+     * Marks the end of a unit of work and rolls back all changes registered by calls to onRollback
+     * or registerChange, in reverse order. Must be matched by exactly one preceding call to
+     * beginUnitOfWork.
+     *
+     * Should be called through WriteUnitOfWork rather than directly.
+     */
     virtual void abortUnitOfWork() = 0;
 
     /**
-     * Waits until all commits that happened before this call are durable. Returns true, unless the
-     * storage engine cannot guarantee durability, which should never happen when isDurable()
-     * returned true. This cannot be called from inside a unit of work, and should fail if it is.
+     * Transitions the active unit of work to the "prepared" state. Must be called after
+     * beginUnitOfWork and before calling either abortUnitOfWork or commitUnitOfWork. Must be
+     * overridden by storage engines that support prepared transactions.
+     *
+     * Must be preceded by a call to beginUnitOfWork and  setPrepareTimestamp, in that order.
+     *
+     * This cannot be called after setTimestamp or setCommitTimestamp.
+     */
+    virtual void prepareUnitOfWork() {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "This storage engine does not support prepared transactions");
+    }
+
+
+    /**
+     * Sets whether or not to ignore prepared transactions if supported by this storage engine. When
+     * 'ignore' is true, allows reading data in prepared, but uncommitted transactions.
+     */
+    virtual void setIgnorePrepared(bool ignore) {}
+
+    /**
+     * Waits until all commits that happened before this call are durable in the journal. Returns
+     * true, unless the storage engine cannot guarantee durability, which should never happen when
+     * isDurable() returned true. This cannot be called from inside a unit of work, and should
+     * fail if it is.
      */
     virtual bool waitUntilDurable() = 0;
 
     /**
-     * When this is called, if there is an open transaction, it is closed. On return no
-     * transaction is active. This cannot be called inside of a WriteUnitOfWork, and should
-     * fail if it is.
+     * Unlike `waitUntilDurable`, this method takes a stable checkpoint, making durable any writes
+     * on unjournaled tables that are behind the current stable timestamp. If the storage engine
+     * is starting from an "unstable" checkpoint, this method call will turn into an unstable
+     * checkpoint.
+     *
+     * This must not be called by a system taking user writes until after a stable timestamp is
+     * passed to the storage engine.
+     */
+    virtual bool waitUntilUnjournaledWritesDurable() {
+        return waitUntilDurable();
+    }
+
+    /**
+     * If there is an open transaction, it is closed. On return no transaction is active. This
+     * cannot be called inside of a WriteUnitOfWork, and should fail if it is.
      */
     virtual void abandonSnapshot() = 0;
 
     /**
-     * Informs this RecoveryUnit that all future reads through it should be from a snapshot
-     * marked as Majority Committed. Snapshots should still be separately acquired and newer
-     * committed snapshots should be used if available whenever implementations would normally
+     * Informs the RecoveryUnit that a snapshot will be needed soon, if one was not already
+     * established. This specifically allows the storage engine to preallocate any required
+     * transaction resources while minimizing the critical section between generating a new
+     * timestamp and setting it using setTimestamp.
+     */
+    virtual void preallocateSnapshot() {}
+
+    /**
+     * Obtains a majority committed snapshot. Snapshots should still be separately acquired and
+     * newer committed snapshots should be used if available whenever implementations would normally
      * change snapshots.
      *
      * If no snapshot has yet been marked as Majority Committed, returns a status with error code
@@ -99,28 +151,27 @@ public:
      * StorageEngines that don't support a SnapshotManager should use the default
      * implementation.
      */
-    virtual Status setReadFromMajorityCommittedSnapshot() {
+    virtual Status obtainMajorityCommittedSnapshot() {
         return {ErrorCodes::CommandNotSupported,
                 "Current storage engine does not support majority readConcerns"};
     }
 
     /**
-     * Returns true if setReadFromMajorityCommittedSnapshot() has been called.
+     * Returns the Timestamp being used by this recovery unit or boost::none if not reading from
+     * a point in time. Any point in time returned will reflect one of the following:
+     *  - when using ReadSource::kProvided, the timestamp provided.
+     *  - when using ReadSource::kLastAppliedSnapshot, the timestamp chosen using the storage
+     * engine's last applied timestamp.
+     *  - when using ReadSource::kAllCommittedSnapshot, the timestamp chosen using the storage
+     * engine's all-committed timestamp.
+     *  - when using ReadSource::kLastApplied, the last applied timestamp at which the current
+     * storage transaction was opened, if one is open.
+     *  - when using ReadSource::kMajorityCommitted, the majority committed timestamp chosen by the
+     * storage engine after a transaction has been opened or after a call to
+     * obtainMajorityCommittedSnapshot().
      */
-    virtual bool isReadingFromMajorityCommittedSnapshot() const {
-        return false;
-    }
-
-    /**
-     * Returns the SnapshotName being used by this recovery unit or boost::none if not reading from
-     * a majority committed snapshot.
-     *
-     * It is possible for reads to occur from later snapshots, but they may not occur from earlier
-     * snapshots.
-     */
-    virtual boost::optional<SnapshotName> getMajorityCommittedSnapshot() const {
-        dassert(!isReadingFromMajorityCommittedSnapshot());
-        return {};
+    virtual boost::optional<Timestamp> getPointInTimeReadTimestamp() const {
+        return boost::none;
     }
 
     /**
@@ -128,7 +179,7 @@ public:
      *
      * It is only valid to compare SnapshotIds generated by a single RecoveryUnit.
      *
-     * This is unrelated to SnapshotName which must be globally comparable.
+     * This is unrelated to Timestamp which must be globally comparable.
      */
     virtual SnapshotId getSnapshotId() const = 0;
 
@@ -139,18 +190,129 @@ public:
      * new timestamp but past writes remain with their originally assigned timestamps.
      * Writes that occur before any setTimestamp() is called will be assigned the timestamp
      * specified in the last setTimestamp() call in the transaction, at commit time.
+     *
+     * setTimestamp() will fail if a commit timestamp is set using setCommitTimestamp() and not
+     * yet cleared with clearCommitTimestamp(). setTimestamp() will also fail if a prepareTimestamp
+     * has been set.
      */
-    virtual Status setTimestamp(SnapshotName timestamp) {
+    virtual Status setTimestamp(Timestamp timestamp) {
         return Status::OK();
     }
 
     /**
-     * Chooses which snapshot to use for read transactions.
+     * Sets a timestamp that will be assigned to all future writes on this RecoveryUnit until
+     * clearCommitTimestamp() is called. This must be called either outside of a WUOW or on a
+     * prepared transaction after setPrepareTimestamp() is called. setTimestamp() must not be called
+     * while a commit timestamp is set.
      */
-    virtual Status selectSnapshot(SnapshotName timestamp) {
-        return Status(ErrorCodes::CommandNotSupported,
-                      "point-in-time reads are not implemented for this storage engine");
+    virtual void setCommitTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Clears the commit timestamp that was set by setCommitTimestamp(). This must be called outside
+     * of a WUOW. This must be called when a commit timestamp is set.
+     */
+    virtual void clearCommitTimestamp() {}
+
+    /**
+     * Returns the commit timestamp. Can be called at any time.
+     */
+    virtual Timestamp getCommitTimestamp() const {
+        return {};
     }
+
+    /**
+     * Sets a prepare timestamp for the current transaction. A subsequent call to
+     * prepareUnitOfWork() is expected and required.
+     * This cannot be called after setTimestamp or setCommitTimestamp.
+     * This must be called inside a WUOW and may only be called once.
+     */
+    virtual void setPrepareTimestamp(Timestamp timestamp) {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "This storage engine does not support prepared transactions");
+    }
+
+    /**
+     * Returns the prepare timestamp for the current transaction.
+     * Must be called after setPrepareTimestamp(), and cannot be called after setTimestamp() or
+     * setCommitTimestamp(). This must be called inside a WUOW.
+     */
+    virtual Timestamp getPrepareTimestamp() const {
+        uasserted(ErrorCodes::CommandNotSupported,
+                  "This storage engine does not support prepared transactions");
+    }
+
+    /**
+     * Fetches the storage level statistics.
+     */
+    virtual BSONObj getOperationStatistics() const {
+        return {};
+    }
+
+    /**
+     * The ReadSource indicates which exteral or provided timestamp to read from for future
+     * transactions.
+     */
+    enum ReadSource {
+        /**
+         * Do not read from a timestamp. This is the default.
+         */
+        kUnset,
+        /**
+         * Read without a timestamp explicitly.
+         */
+        kNoTimestamp,
+        /**
+         * Read from the majority all-commmitted timestamp.
+         */
+        kMajorityCommitted,
+        /**
+         * Read from the last applied timestamp. New transactions start at the most up-to-date
+         * timestamp.
+         */
+        kLastApplied,
+        /**
+         * Read from the last applied timestamp. New transactions will always read from the same
+         * timestamp and never advance.
+         */
+        kLastAppliedSnapshot,
+        /**
+         * Read from the all-committed timestamp. New transactions will always read from the same
+         * timestamp and never advance.
+         */
+        kAllCommittedSnapshot,
+        /**
+         * Read from the timestamp provided to setTimestampReadSource.
+         */
+        kProvided
+    };
+
+    /**
+     * Sets which timestamp to use for read transactions. If 'provided' is supplied, only kProvided
+     * is an acceptable input.
+     *
+     * Must be called in one of the following cases:
+     * - a transaction is not active
+     * - no read source has been set yet
+     * - the read source provided is the same as the existing read source
+     */
+    virtual void setTimestampReadSource(ReadSource source,
+                                        boost::optional<Timestamp> provided = boost::none) {}
+
+    virtual ReadSource getTimestampReadSource() const {
+        return ReadSource::kUnset;
+    };
+
+    /**
+     * Sets whether this operation intends to perform reads that do not need to keep data in the
+     * storage engine cache. This can be useful for operations that do large, one-time scans of
+     * data, and will attempt to keep higher-priority data from being evicted from the cache. This
+     * may not be called in an active transaction.
+     */
+    virtual void setReadOnce(bool readOnce){};
+
+    virtual bool getReadOnce() const {
+        return false;
+    };
 
     /**
      * A Change is an action that is registerChange()'d while a WriteUnitOfWork exists. The
@@ -162,13 +324,17 @@ public:
      * that rollback() and commit() may be called after resources with a shorter lifetime than
      * the WriteUnitOfWork have been freed. Each registered change will be committed or rolled
      * back once.
+     *
+     * commit() handlers are passed the timestamp at which the transaction is committed. If the
+     * transaction is not committed at a particular timestamp, or if the storage engine does not
+     * support timestamps, then boost::none will be supplied for this parameter.
      */
     class Change {
     public:
         virtual ~Change() {}
 
         virtual void rollback() = 0;
-        virtual void commit() = 0;
+        virtual void commit(boost::optional<Timestamp> commitTime) = 0;
     };
 
     /**
@@ -195,7 +361,7 @@ public:
             void rollback() final {
                 _callback();
             }
-            void commit() final {}
+            void commit(boost::optional<Timestamp>) final {}
 
         private:
             Callback _callback;
@@ -215,8 +381,8 @@ public:
         public:
             OnCommitChange(Callback&& callback) : _callback(std::move(callback)) {}
             void rollback() final {}
-            void commit() final {
-                _callback();
+            void commit(boost::optional<Timestamp> commitTime) final {
+                _callback(commitTime);
             }
 
         private:
@@ -226,49 +392,7 @@ public:
         registerChange(new OnCommitChange(std::move(callback)));
     }
 
-    //
-    // The remaining methods probably belong on DurRecoveryUnit rather than on the interface.
-    //
-
-    /**
-     * Declare that the data at [x, x + len) is being written.
-     */
-    virtual void* writingPtr(void* data, size_t len) = 0;
-
-    //
-    // Syntactic sugar
-    //
-
-    /**
-     * Declare write intent for an int
-     */
-    inline int& writingInt(int& d) {
-        return *writing(&d);
-    }
-
-    /**
-     * A templated helper for writingPtr.
-     */
-    template <typename T>
-    inline T* writing(T* x) {
-        writingPtr(x, sizeof(T));
-        return x;
-    }
-
-    /**
-     * Sets a flag that declares this RecoveryUnit will skip rolling back writes, for the
-     * duration of the current outermost WriteUnitOfWork.  This function can only be called
-     * between a pair of unnested beginUnitOfWork() / endUnitOfWork() calls.
-     * The flag is cleared when endUnitOfWork() is called.
-     * While the flag is set, rollback will skip rolling back writes, but custom rollback
-     * change functions are still called.  Clearly, this functionality should only be used when
-     * writing to temporary collections that can be cleaned up externally.  For example,
-     * foreground index builds write to a temporary collection; if something goes wrong that
-     * normally requires a rollback, we can instead clean up the index by dropping the entire
-     * index.
-     * Setting the flag may permit increased performance.
-     */
-    virtual void setRollbackWritesDisabled() = 0;
+    virtual void setOrderedCommit(bool orderedCommit) = 0;
 
 protected:
     RecoveryUnit() {}

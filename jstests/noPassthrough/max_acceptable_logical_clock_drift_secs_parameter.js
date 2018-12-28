@@ -2,6 +2,7 @@
  * Tests what values are accepted for the maxAcceptableLogicalClockDriftSecs startup parameter, and
  * that servers in a sharded clusters reject cluster times more than
  * maxAcceptableLogicalClockDriftSecs ahead of their wall clocks.
+ * @tags: [requires_sharding]
  */
 (function() {
     "use strict";
@@ -50,7 +51,7 @@
     // Try to advance cluster time by more than the max acceptable drift, which should fail the rate
     // limiter.
     let tooFarTime = Object.assign(
-        lt, {clusterTime: new Timestamp(lt.clusterTime.getTime() + (maxDriftValue * 2), 0)});
+        {}, lt, {clusterTime: new Timestamp(lt.clusterTime.getTime() + (maxDriftValue * 2), 0)});
     assert.commandFailedWithCode(testDB.runCommand({isMaster: 1, $clusterTime: tooFarTime}),
                                  ErrorCodes.ClusterTimeFailsRateLimiter,
                                  "expected command to not pass the rate limiter");

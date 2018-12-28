@@ -1,28 +1,31 @@
-/*    Copyright 2012 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -32,18 +35,21 @@
  */
 #include "mongo/base/status.h"
 #include "mongo/bson/bson_depth.h"
+#include "mongo/crypto/mechanism_scram.h"
+#include "mongo/crypto/sha1_block.h"
+#include "mongo/crypto/sha256_block.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_impl.h"
 #include "mongo/db/auth/authorization_session_for_test.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
 #include "mongo/db/auth/restriction_environment.h"
+#include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
@@ -85,32 +91,41 @@ public:
     FailureCapableAuthzManagerExternalStateMock* managerState;
     transport::TransportLayerMock transportLayer;
     transport::SessionHandle session;
-    ServiceContextNoop serviceContext;
+    ServiceContext::UniqueServiceContext serviceContext = ServiceContext::make();
     ServiceContext::UniqueClient client;
     ServiceContext::UniqueOperationContext _opCtx;
     AuthzSessionExternalStateMock* sessionState;
     AuthorizationManager* authzManager;
     std::unique_ptr<AuthorizationSessionForTest> authzSession;
+    BSONObj credentials;
 
     void setUp() {
-        serverGlobalParams.featureCompatibility.setVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::k36);
         session = transportLayer.createSession();
-        client = serviceContext.makeClient("testClient", session);
+        client = serviceContext->makeClient("testClient", session);
         RestrictionEnvironment::set(
             session, stdx::make_unique<RestrictionEnvironment>(SockAddr(), SockAddr()));
         _opCtx = client->makeOperationContext();
         auto localManagerState = stdx::make_unique<FailureCapableAuthzManagerExternalStateMock>();
         managerState = localManagerState.get();
         managerState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
-        auto uniqueAuthzManager =
-            stdx::make_unique<AuthorizationManager>(std::move(localManagerState));
+        auto uniqueAuthzManager = std::make_unique<AuthorizationManagerImpl>(
+            std::move(localManagerState),
+            AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{});
         authzManager = uniqueAuthzManager.get();
-        AuthorizationManager::set(&serviceContext, std::move(uniqueAuthzManager));
-        auto localSessionState = stdx::make_unique<AuthzSessionExternalStateMock>(authzManager);
+        AuthorizationManager::set(serviceContext.get(), std::move(uniqueAuthzManager));
+        auto localSessionState = std::make_unique<AuthzSessionExternalStateMock>(authzManager);
         sessionState = localSessionState.get();
-        authzSession = stdx::make_unique<AuthorizationSessionForTest>(std::move(localSessionState));
+        authzSession = std::make_unique<AuthorizationSessionForTest>(
+            std::move(localSessionState),
+            AuthorizationSessionImpl::InstallMockForTestingOrAuthImpl{});
         authzManager->setAuthEnabled(true);
+
+        credentials =
+            BSON("SCRAM-SHA-1" << scram::Secrets<SHA1Block>::generateCredentials(
+                                      "a", saslGlobalParams.scramSHA1IterationCount.load())
+                               << "SCRAM-SHA-256"
+                               << scram::Secrets<SHA256Block>::generateCredentials(
+                                      "a", saslGlobalParams.scramSHA256IterationCount.load()));
     }
 };
 
@@ -136,20 +151,12 @@ const ResourcePattern otherUsersCollResource(
     ResourcePattern::forExactNamespace(NamespaceString("other.system.users")));
 const ResourcePattern thirdUsersCollResource(
     ResourcePattern::forExactNamespace(NamespaceString("third.system.users")));
-const ResourcePattern testIndexesCollResource(
-    ResourcePattern::forExactNamespace(NamespaceString("test.system.indexes")));
-const ResourcePattern otherIndexesCollResource(
-    ResourcePattern::forExactNamespace(NamespaceString("other.system.indexes")));
-const ResourcePattern thirdIndexesCollResource(
-    ResourcePattern::forExactNamespace(NamespaceString("third.system.indexes")));
 const ResourcePattern testProfileCollResource(
     ResourcePattern::forExactNamespace(NamespaceString("test.system.profile")));
 const ResourcePattern otherProfileCollResource(
     ResourcePattern::forExactNamespace(NamespaceString("other.system.profile")));
 const ResourcePattern thirdProfileCollResource(
     ResourcePattern::forExactNamespace(NamespaceString("third.system.profile")));
-const ResourcePattern testSystemNamespacesResource(
-    ResourcePattern::forExactNamespace(NamespaceString("test.system.namespaces")));
 
 TEST_F(AuthorizationSessionTest, AddUserAndCheckAuthorization) {
     // Check that disabling auth checks works
@@ -173,8 +180,7 @@ TEST_F(AuthorizationSessionTest, AddUserAndCheckAuthorization) {
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "readWrite"
@@ -202,8 +208,7 @@ TEST_F(AuthorizationSessionTest, AddUserAndCheckAuthorization) {
                                                    << "db"
                                                    << "admin"
                                                    << "credentials"
-                                                   << BSON("MONGODB-CR"
-                                                           << "a")
+                                                   << credentials
                                                    << "roles"
                                                    << BSON_ARRAY(BSON("role"
                                                                       << "readWriteAnyDatabase"
@@ -249,8 +254,7 @@ TEST_F(AuthorizationSessionTest, DuplicateRolesOK) {
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "readWrite"
@@ -282,8 +286,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "readWrite"
@@ -300,8 +303,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "userAdmin"
@@ -315,8 +317,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
                                                    << "db"
                                                    << "test"
                                                    << "credentials"
-                                                   << BSON("MONGODB-CR"
-                                                           << "a")
+                                                   << credentials
                                                    << "roles"
                                                    << BSON_ARRAY(BSON("role"
                                                                       << "readWriteAnyDatabase"
@@ -334,8 +335,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
                                                    << "db"
                                                    << "test"
                                                    << "credentials"
-                                                   << BSON("MONGODB-CR"
-                                                           << "a")
+                                                   << credentials
                                                    << "roles"
                                                    << BSON_ARRAY(BSON("role"
                                                                       << "userAdminAnyDatabase"
@@ -354,11 +354,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(otherUsersCollResource, ActionType::find));
     ASSERT_TRUE(
-        authzSession->isAuthorizedForActionsOnResource(testIndexesCollResource, ActionType::find));
-    ASSERT_TRUE(
         authzSession->isAuthorizedForActionsOnResource(testProfileCollResource, ActionType::find));
-    ASSERT_TRUE(
-        authzSession->isAuthorizedForActionsOnResource(otherIndexesCollResource, ActionType::find));
     ASSERT_TRUE(
         authzSession->isAuthorizedForActionsOnResource(otherProfileCollResource, ActionType::find));
 
@@ -373,11 +369,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
     ASSERT_TRUE(
         authzSession->isAuthorizedForActionsOnResource(otherUsersCollResource, ActionType::find));
     ASSERT_FALSE(
-        authzSession->isAuthorizedForActionsOnResource(testIndexesCollResource, ActionType::find));
-    ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(testProfileCollResource, ActionType::find));
-    ASSERT_FALSE(
-        authzSession->isAuthorizedForActionsOnResource(otherIndexesCollResource, ActionType::find));
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(otherProfileCollResource, ActionType::find));
 
@@ -393,11 +385,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(otherUsersCollResource, ActionType::find));
     ASSERT_TRUE(
-        authzSession->isAuthorizedForActionsOnResource(testIndexesCollResource, ActionType::find));
-    ASSERT_TRUE(
         authzSession->isAuthorizedForActionsOnResource(testProfileCollResource, ActionType::find));
-    ASSERT_FALSE(
-        authzSession->isAuthorizedForActionsOnResource(otherIndexesCollResource, ActionType::find));
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(otherProfileCollResource, ActionType::find));
 
@@ -413,11 +401,7 @@ TEST_F(AuthorizationSessionTest, SystemCollectionsAccessControl) {
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(otherUsersCollResource, ActionType::find));
     ASSERT_FALSE(
-        authzSession->isAuthorizedForActionsOnResource(testIndexesCollResource, ActionType::find));
-    ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(testProfileCollResource, ActionType::find));
-    ASSERT_FALSE(
-        authzSession->isAuthorizedForActionsOnResource(otherIndexesCollResource, ActionType::find));
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(otherProfileCollResource, ActionType::find));
 }
@@ -430,8 +414,7 @@ TEST_F(AuthorizationSessionTest, InvalidateUser) {
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "readWrite"
@@ -463,8 +446,7 @@ TEST_F(AuthorizationSessionTest, InvalidateUser) {
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "read"
@@ -473,7 +455,7 @@ TEST_F(AuthorizationSessionTest, InvalidateUser) {
                                                     BSONObj()));
 
     // Make sure that invalidating the user causes the session to reload its privileges.
-    authzManager->invalidateUserByName(user->getName());
+    authzManager->invalidateUserByName(_opCtx.get(), user->getName());
     authzSession->startRequest(_opCtx.get());  // Refreshes cached data for invalid users
     ASSERT_TRUE(
         authzSession->isAuthorizedForActionsOnResource(testFooCollResource, ActionType::find));
@@ -492,7 +474,7 @@ TEST_F(AuthorizationSessionTest, InvalidateUser) {
                  &ignored)
         .transitional_ignore();
     // Make sure that invalidating the user causes the session to reload its privileges.
-    authzManager->invalidateUserByName(user->getName());
+    authzManager->invalidateUserByName(_opCtx.get(), user->getName());
     authzSession->startRequest(_opCtx.get());  // Refreshes cached data for invalid users
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(testFooCollResource, ActionType::find));
@@ -509,8 +491,7 @@ TEST_F(AuthorizationSessionTest, UseOldUserInfoInFaceOfConnectivityProblems) {
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "readWrite"
@@ -543,8 +524,7 @@ TEST_F(AuthorizationSessionTest, UseOldUserInfoInFaceOfConnectivityProblems) {
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSON_ARRAY(BSON("role"
                                                                             << "read"
@@ -555,7 +535,7 @@ TEST_F(AuthorizationSessionTest, UseOldUserInfoInFaceOfConnectivityProblems) {
     // Even though the user's privileges have been reduced, since we've configured user
     // document lookup to fail, the authz session should continue to use its known out-of-date
     // privilege data.
-    authzManager->invalidateUserByName(user->getName());
+    authzManager->invalidateUserByName(_opCtx.get(), user->getName());
     authzSession->startRequest(_opCtx.get());  // Refreshes cached data for invalid users
     ASSERT_TRUE(
         authzSession->isAuthorizedForActionsOnResource(testFooCollResource, ActionType::find));
@@ -580,8 +560,7 @@ TEST_F(AuthorizationSessionTest, AcquireUserObtainsAndValidatesAuthenticationRes
              << "db"
              << "test"
              << "credentials"
-             << BSON("MONGODB-CR"
-                     << "a")
+             << credentials
              << "roles"
              << BSON_ARRAY(BSON("role"
                                 << "readWrite"
@@ -868,7 +847,7 @@ TEST_F(AuthorizationSessionTest, AddPrivilegesForStageFailsIfOutNamespaceIsNotVa
                                          << ""));
     BSONObj cmdObj =
         BSON("aggregate" << testFooNss.coll() << "pipeline" << pipeline << "cursor" << BSONObj());
-    ASSERT_THROWS_CODE(authzSession->checkAuthForAggregate(testFooNss, cmdObj, false).ignore(),
+    ASSERT_THROWS_CODE(authzSession->checkAuthForAggregate(testFooNss, cmdObj, false),
                        AssertionException,
                        ErrorCodes::InvalidNamespace);
 }
@@ -1124,8 +1103,7 @@ TEST_F(AuthorizationSessionTest, AuthorizedSessionIsNotCoauthorizedWithEmptyUser
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
@@ -1144,8 +1122,7 @@ TEST_F(AuthorizationSessionTest,
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
@@ -1162,8 +1139,7 @@ TEST_F(AuthorizationSessionTest, AuthorizedSessionIsCoauthorizedWithIntersecting
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
@@ -1173,8 +1149,7 @@ TEST_F(AuthorizationSessionTest, AuthorizedSessionIsCoauthorizedWithIntersecting
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
@@ -1194,8 +1169,7 @@ TEST_F(AuthorizationSessionTest, AuthorizedSessionIsNotCoauthorizedWithNoninters
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
@@ -1205,8 +1179,7 @@ TEST_F(AuthorizationSessionTest, AuthorizedSessionIsNotCoauthorizedWithNoninters
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
@@ -1227,8 +1200,7 @@ TEST_F(AuthorizationSessionTest,
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
@@ -1238,8 +1210,7 @@ TEST_F(AuthorizationSessionTest,
                                                          << "db"
                                                          << "test"
                                                          << "credentials"
-                                                         << BSON("MONGODB-CR"
-                                                                 << "a")
+                                                         << credentials
                                                          << "roles"
                                                          << BSONArray()),
                                                     BSONObj()));
@@ -1252,30 +1223,72 @@ TEST_F(AuthorizationSessionTest,
 }
 
 TEST_F(AuthorizationSessionTest, CannotListCollectionsWithoutListCollectionsPrivilege) {
+    BSONObj cmd = BSON("listCollections" << 1);
     // With no privileges, there is not authorization to list collections
-    ASSERT_FALSE(authzSession->isAuthorizedToListCollections(testFooNss.db()));
-    ASSERT_FALSE(authzSession->isAuthorizedToListCollections(testBarNss.db()));
-    ASSERT_FALSE(authzSession->isAuthorizedToListCollections(testQuxNss.db()));
-}
-
-TEST_F(AuthorizationSessionTest, CanListCollectionsWithLegacySystemNamespacesAccess) {
-    // Deprecated: permissions for the find action on test.system.namespaces allows us to list
-    // collections in the test database.
-    authzSession->assumePrivilegesForDB(
-        Privilege(testSystemNamespacesResource, {ActionType::find}));
-
-    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testFooNss.db()));
-    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testBarNss.db()));
-    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testQuxNss.db()));
+    ASSERT_FALSE(authzSession->isAuthorizedToListCollections(testFooNss.db(), cmd));
+    ASSERT_FALSE(authzSession->isAuthorizedToListCollections(testBarNss.db(), cmd));
+    ASSERT_FALSE(authzSession->isAuthorizedToListCollections(testQuxNss.db(), cmd));
 }
 
 TEST_F(AuthorizationSessionTest, CanListCollectionsWithListCollectionsPrivilege) {
+    BSONObj cmd = BSON("listCollections" << 1);
     // The listCollections privilege authorizes the list collections command.
     authzSession->assumePrivilegesForDB(Privilege(testDBResource, {ActionType::listCollections}));
 
-    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testFooNss.db()));
-    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testBarNss.db()));
-    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testQuxNss.db()));
+    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testFooNss.db(), cmd));
+    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testBarNss.db(), cmd));
+    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testQuxNss.db(), cmd));
+}
+
+TEST_F(AuthorizationSessionTest, CanListOwnCollectionsWithPrivilege) {
+    BSONObj cmd =
+        BSON("listCollections" << 1 << "nameOnly" << true << "authorizedCollections" << true);
+    // The listCollections privilege authorizes the list collections command.
+    authzSession->assumePrivilegesForDB(Privilege(testFooCollResource, {ActionType::find}));
+
+    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testFooNss.db(), cmd));
+    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testBarNss.db(), cmd));
+    ASSERT_TRUE(authzSession->isAuthorizedToListCollections(testQuxNss.db(), cmd));
+
+    ASSERT_FALSE(authzSession->isAuthorizedToListCollections("other", cmd));
+}
+
+TEST_F(AuthorizationSessionTest, CanCheckIfHasAnyPrivilegeOnResource) {
+    ASSERT_FALSE(authzSession->isAuthorizedForAnyActionOnResource(testFooCollResource));
+
+    // If we have a collection privilege, we have actions on that collection
+    authzSession->assumePrivilegesForDB(Privilege(testFooCollResource, {ActionType::find}));
+    ASSERT_TRUE(authzSession->isAuthorizedForAnyActionOnResource(testFooCollResource));
+    ASSERT_FALSE(authzSession->isAuthorizedForAnyActionOnResource(
+        ResourcePattern::forDatabaseName(testFooNss.db())));
+    ASSERT_FALSE(
+        authzSession->isAuthorizedForAnyActionOnResource(ResourcePattern::forAnyNormalResource()));
+    ASSERT_FALSE(
+        authzSession->isAuthorizedForAnyActionOnResource(ResourcePattern::forAnyResource()));
+
+    // If we have a database privilege, we have actions on that database and all collections it
+    // contains
+    authzSession->assumePrivilegesForDB(
+        Privilege(ResourcePattern::forDatabaseName(testFooNss.db()), {ActionType::find}));
+    ASSERT_TRUE(authzSession->isAuthorizedForAnyActionOnResource(testFooCollResource));
+    ASSERT_TRUE(authzSession->isAuthorizedForAnyActionOnResource(
+        ResourcePattern::forDatabaseName(testFooNss.db())));
+    ASSERT_FALSE(
+        authzSession->isAuthorizedForAnyActionOnResource(ResourcePattern::forAnyNormalResource()));
+    ASSERT_FALSE(
+        authzSession->isAuthorizedForAnyActionOnResource(ResourcePattern::forAnyResource()));
+
+    // If we have a privilege on anyNormalResource, we have actions on all databases and all
+    // collections they contain
+    authzSession->assumePrivilegesForDB(
+        Privilege(ResourcePattern::forAnyNormalResource(), {ActionType::find}));
+    ASSERT_TRUE(authzSession->isAuthorizedForAnyActionOnResource(testFooCollResource));
+    ASSERT_TRUE(authzSession->isAuthorizedForAnyActionOnResource(
+        ResourcePattern::forDatabaseName(testFooNss.db())));
+    ASSERT_TRUE(
+        authzSession->isAuthorizedForAnyActionOnResource(ResourcePattern::forAnyNormalResource()));
+    ASSERT_FALSE(
+        authzSession->isAuthorizedForAnyActionOnResource(ResourcePattern::forAnyResource()));
 }
 
 TEST_F(AuthorizationSessionTest, CanUseUUIDNamespacesWithPrivilege) {

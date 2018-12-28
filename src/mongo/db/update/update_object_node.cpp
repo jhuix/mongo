@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -81,6 +83,21 @@ StatusWith<std::string> parseArrayFilterIdentifier(
 }
 
 /**
+ * Gets the child of 'element' named 'field', if it exists. Otherwise returns a non-ok element.
+ */
+mutablebson::Element getChild(mutablebson::Element element, StringData field) {
+    if (element.getType() == BSONType::Object) {
+        return element[field];
+    } else if (element.getType() == BSONType::Array) {
+        auto indexFromField = parseUnsignedBase10Integer(field);
+        if (indexFromField) {
+            return element.findNthChild(*indexFromField);
+        }
+    }
+    return element.getDocument().end();
+}
+
+/**
  * Applies 'child' to the child of 'applyParams->element' named 'field' (which will create it, if it
  * does not exist). If 'applyParams->pathToCreate' is created, then 'applyParams->pathToCreate' is
  * moved to the end of 'applyParams->pathTaken', and 'applyParams->element' is advanced to the end
@@ -101,18 +118,8 @@ void applyChild(const UpdateNode& child,
     if (!applyParams->pathToCreate->empty()) {
         // We're already traversing a path with elements that don't exist yet, so we will definitely
         // need to append.
-    } else if (applyParams->element.getType() == BSONType::Object) {
-        childElement = applyParams->element[field];
-    } else if (applyParams->element.getType() == BSONType::Array) {
-        boost::optional<size_t> indexFromField = parseUnsignedBase10Integer(field);
-        if (indexFromField) {
-            childElement = applyParams->element.findNthChild(*indexFromField);
-        } else {
-            // We're trying to traverse an array element, but the path specifies a name instead of
-            // an index. We append the name to 'pathToCreate' for now, even though we know we won't
-            // be able to create it. If the update eventually needs to create the path,
-            // pathsupport::createPathAt() will provide a sensible PathNotViable UserError.
-        }
+    } else {
+        childElement = getChild(applyParams->element, field);
     }
 
     if (childElement.ok()) {
@@ -124,7 +131,8 @@ void applyChild(const UpdateNode& child,
         // We are traversing path components that do not exist in our document. Any update modifier
         // that creates new path components (i.e., any modifiers that return true for
         // allowCreation()) will need to create this component, so we append it to the
-        // 'pathToCreate' FieldRef.
+        // 'pathToCreate' FieldRef. If the component cannot be created, pathsupport::createPathAt()
+        // will provide a sensible PathNotViable UserError.
         childElement = applyParams->element;
         applyParams->pathToCreate->appendPart(field);
     }
@@ -147,7 +155,8 @@ void applyChild(const UpdateNode& child,
     // to the end of 'pathTaken'. We should advance 'element' to the end of 'pathTaken'.
     if (applyParams->pathTaken->numParts() > pathTakenSizeBefore) {
         for (auto i = pathTakenSizeBefore; i < applyParams->pathTaken->numParts(); ++i) {
-            applyParams->element = applyParams->element[applyParams->pathTaken->getPart(i)];
+            applyParams->element =
+                getChild(applyParams->element, applyParams->pathTaken->getPart(i));
             invariant(applyParams->element.ok());
         }
     } else if (!applyParams->pathToCreate->empty()) {
@@ -155,14 +164,15 @@ void applyChild(const UpdateNode& child,
         // If the child is a leaf node, it may have created 'pathToCreate' without moving
         // 'pathToCreate' to the end of 'pathTaken'. We should move 'pathToCreate' to the end of
         // 'pathTaken' and advance 'element' to the end of 'pathTaken'.
-        childElement = applyParams->element[applyParams->pathToCreate->getPart(0)];
+        childElement = getChild(applyParams->element, applyParams->pathToCreate->getPart(0));
         if (childElement.ok()) {
             applyParams->element = childElement;
             applyParams->pathTaken->appendPart(applyParams->pathToCreate->getPart(0));
 
             // Either the path was fully created or not created at all.
             for (size_t i = 1; i < applyParams->pathToCreate->numParts(); ++i) {
-                applyParams->element = applyParams->element[applyParams->pathToCreate->getPart(i)];
+                applyParams->element =
+                    getChild(applyParams->element, applyParams->pathToCreate->getPart(i));
                 invariant(applyParams->element.ok());
                 applyParams->pathTaken->appendPart(applyParams->pathToCreate->getPart(i));
             }

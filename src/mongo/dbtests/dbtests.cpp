@@ -1,32 +1,34 @@
 // #file dbtests.cpp : Runs db unit tests.
 //
 
+
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -35,22 +37,24 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/logical_clock.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/drop_pending_collection_reaper.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
+#include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/dbtests/framework.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers_synchronous.h"
@@ -65,11 +69,17 @@ const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 
 void initWireSpec() {
     WireSpec& spec = WireSpec::instance();
-    // accept from any version
-    spec.incoming.minWireVersion = RELEASE_2_4_AND_BEFORE;
-    spec.incoming.maxWireVersion = LATEST_WIRE_VERSION;
-    // connect to any version
-    spec.outgoing.minWireVersion = RELEASE_2_4_AND_BEFORE;
+
+    // Accept from internal clients of the same version, as in upgrade featureCompatibilityVersion.
+    spec.incomingInternalClient.minWireVersion = LATEST_WIRE_VERSION;
+    spec.incomingInternalClient.maxWireVersion = LATEST_WIRE_VERSION;
+
+    // Accept from any version external client.
+    spec.incomingExternalClient.minWireVersion = RELEASE_2_4_AND_BEFORE;
+    spec.incomingExternalClient.maxWireVersion = LATEST_WIRE_VERSION;
+
+    // Connect to servers of the same version, as in upgrade featureCompatibilityVersion.
+    spec.outgoing.minWireVersion = LATEST_WIRE_VERSION;
     spec.outgoing.maxWireVersion = LATEST_WIRE_VERSION;
 }
 
@@ -107,9 +117,42 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
         return status;
     }
     WriteUnitOfWork wunit(opCtx);
-    indexer.commit();
+    ASSERT_OK(indexer.commit());
     wunit.commit();
     return Status::OK();
+}
+
+WriteContextForTests::WriteContextForTests(OperationContext* opCtx, StringData ns)
+    : _opCtx(opCtx), _nss(ns) {
+    // Lock the database and collection
+    _autoCreateDb.emplace(opCtx, _nss.db(), MODE_IX);
+    _collLock.emplace(opCtx->lockState(), _nss.ns(), MODE_IX);
+
+    const bool doShardVersionCheck = false;
+
+    _clientContext.emplace(opCtx, _nss.ns(), doShardVersionCheck);
+    invariant(_autoCreateDb->getDb() == _clientContext->db());
+
+    // If the collection exists, there is no need to lock into stronger mode
+    if (getCollection())
+        return;
+
+    // If the database was just created, it is already locked in MODE_X so we can skip the relocking
+    // code below
+    if (_autoCreateDb->justCreated()) {
+        dassert(opCtx->lockState()->isDbLockedForMode(_nss.db(), MODE_X));
+        return;
+    }
+
+    // If the collection doesn't exists, put the context in a state where the database is locked in
+    // MODE_X so that the collection can be created
+    _clientContext.reset();
+    _collLock.reset();
+    _autoCreateDb.reset();
+    _autoCreateDb.emplace(opCtx, _nss.db(), MODE_X);
+
+    _clientContext.emplace(opCtx, _nss.ns(), _autoCreateDb->getDb());
+    invariant(_autoCreateDb->getDb() == _clientContext->db());
 }
 
 }  // namespace dbtests
@@ -117,15 +160,19 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
 
 
 int dbtestsMain(int argc, char** argv, char** envp) {
-    Command::testCommandsEnabled = true;
+    ::mongo::setTestCommandsEnabled(true);
     ::mongo::setupSynchronousSignalHandlers();
     mongo::dbtests::initWireSpec();
+
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::k36);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     repl::ReplSettings replSettings;
     replSettings.setOplogSizeBytes(10 * 1024 * 1024);
-    ServiceContext* service = getGlobalServiceContext();
+    setGlobalServiceContext(ServiceContext::make());
+
+    const auto service = getGlobalServiceContext();
+    service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service));
 
     auto logicalClock = stdx::make_unique<LogicalClock>(service);
     LogicalClock::set(service, std::move(logicalClock));
@@ -144,13 +191,22 @@ int dbtestsMain(int argc, char** argv, char** envp) {
     preciseClock->advance(Seconds(1));
     service->setPreciseClockSource(std::move(preciseClock));
 
-    repl::setGlobalReplicationCoordinator(
-        new repl::ReplicationCoordinatorMock(service, replSettings));
-    repl::getGlobalReplicationCoordinator()
+    service->setTransportLayer(
+        transport::TransportLayerManager::makeAndStartDefaultEgressTransportLayer());
+
+    repl::ReplicationCoordinator::set(
+        service,
+        std::unique_ptr<repl::ReplicationCoordinator>(
+            new repl::ReplicationCoordinatorMock(service, replSettings)));
+    repl::ReplicationCoordinator::get(service)
         ->setFollowerMode(repl::MemberState::RS_PRIMARY)
         .ignore();
 
-    getGlobalAuthorizationManager()->setAuthEnabled(false);
+    auto storageMock = stdx::make_unique<repl::StorageInterfaceMock>();
+    repl::DropPendingCollectionReaper::set(
+        service, stdx::make_unique<repl::DropPendingCollectionReaper>(storageMock.get()));
+
+    AuthorizationManager::get(service)->setAuthEnabled(false);
     ScriptEngine::setup();
     StartupTest::runTests();
     return mongo::dbtests::runDbTests(argc, argv);

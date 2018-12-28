@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,12 +31,14 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 
 #include <limits>
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -66,12 +70,10 @@ TEST(IndexKeyValidateTest, KeyElementValueOfZeroFailsForV2Indexes) {
               validateKeyPattern(BSON("x" << -0.0), IndexVersion::kV2));
 }
 
-TEST(IndexKeyValidateTest, KeyElementValueOfZeroSucceedsForV0AndV1Indexes) {
-    for (auto indexVersion : {IndexVersion::kV0, IndexVersion::kV1}) {
-        ASSERT_OK(validateKeyPattern(BSON("x" << 0), indexVersion));
-        ASSERT_OK(validateKeyPattern(BSON("x" << 0.0), indexVersion));
-        ASSERT_OK(validateKeyPattern(BSON("x" << -0.0), indexVersion));
-    }
+TEST(IndexKeyValidateTest, KeyElementValueOfZeroSucceedsForV1Indexes) {
+    ASSERT_OK(validateKeyPattern(BSON("x" << 0), IndexVersion::kV1));
+    ASSERT_OK(validateKeyPattern(BSON("x" << 0.0), IndexVersion::kV1));
+    ASSERT_OK(validateKeyPattern(BSON("x" << -0.0), IndexVersion::kV1));
 }
 
 TEST(IndexKeyValidateTest, KeyElementValueOfNaNFailsForV2Indexes) {
@@ -86,15 +88,13 @@ TEST(IndexKeyValidateTest, KeyElementValueOfNaNFailsForV2Indexes) {
     }
 }
 
-TEST(IndexKeyValidateTest, KeyElementValueOfNaNSucceedsForV0AndV1Indexes) {
+TEST(IndexKeyValidateTest, KeyElementValueOfNaNSucceedsForV1Indexes) {
     if (std::numeric_limits<double>::has_quiet_NaN) {
-        for (auto indexVersion : {IndexVersion::kV0, IndexVersion::kV1}) {
-            double nan = std::numeric_limits<double>::quiet_NaN();
-            ASSERT_OK(validateKeyPattern(BSON("x" << nan), indexVersion));
-            ASSERT_OK(validateKeyPattern(BSON("a" << nan << "b"
-                                                  << "2d"),
-                                         indexVersion));
-        }
+        double nan = std::numeric_limits<double>::quiet_NaN();
+        ASSERT_OK(validateKeyPattern(BSON("x" << nan), IndexVersion::kV1));
+        ASSERT_OK(validateKeyPattern(BSON("a" << nan << "b"
+                                              << "2d"),
+                                     IndexVersion::kV1));
     }
 }
 
@@ -133,16 +133,14 @@ TEST(IndexKeyValidateTest, KeyElementBooleanValueFailsForV2Indexes) {
                                  IndexVersion::kV2));
 }
 
-TEST(IndexKeyValidateTest, KeyElementBooleanValueSucceedsForV0AndV1Indexes) {
-    for (auto indexVersion : {IndexVersion::kV0, IndexVersion::kV1}) {
-        ASSERT_OK(validateKeyPattern(BSON("x" << true), indexVersion));
-        ASSERT_OK(validateKeyPattern(BSON("x" << false), indexVersion));
-        ASSERT_OK(validateKeyPattern(BSON("a"
-                                          << "2dsphere"
-                                          << "b"
-                                          << true),
-                                     indexVersion));
-    }
+TEST(IndexKeyValidateTest, KeyElementBooleanValueSucceedsForV1Indexes) {
+    ASSERT_OK(validateKeyPattern(BSON("x" << true), IndexVersion::kV1));
+    ASSERT_OK(validateKeyPattern(BSON("x" << false), IndexVersion::kV1));
+    ASSERT_OK(validateKeyPattern(BSON("a"
+                                      << "2dsphere"
+                                      << "b"
+                                      << true),
+                                 IndexVersion::kV1));
 }
 
 TEST(IndexKeyValidateTest, KeyElementNullValueFailsForV2Indexes) {
@@ -150,10 +148,8 @@ TEST(IndexKeyValidateTest, KeyElementNullValueFailsForV2Indexes) {
               validateKeyPattern(BSON("x" << BSONNULL), IndexVersion::kV2));
 }
 
-TEST(IndexKeyValidateTest, KeyElementNullValueSucceedsForV0AndV1Indexes) {
-    for (auto indexVersion : {IndexVersion::kV0, IndexVersion::kV1}) {
-        ASSERT_OK(validateKeyPattern(BSON("x" << BSONNULL), indexVersion));
-    }
+TEST(IndexKeyValidateTest, KeyElementNullValueSucceedsForV1Indexes) {
+    ASSERT_OK(validateKeyPattern(BSON("x" << BSONNULL), IndexVersion::kV1));
 }
 
 TEST(IndexKeyValidateTest, KeyElementUndefinedValueFailsForV2Indexes) {
@@ -161,10 +157,8 @@ TEST(IndexKeyValidateTest, KeyElementUndefinedValueFailsForV2Indexes) {
               validateKeyPattern(BSON("x" << BSONUndefined), IndexVersion::kV2));
 }
 
-TEST(IndexKeyValidateTest, KeyElementUndefinedValueSucceedsForV0AndV1Indexes) {
-    for (auto indexVersion : {IndexVersion::kV0, IndexVersion::kV1}) {
-        ASSERT_OK(validateKeyPattern(BSON("x" << BSONUndefined), indexVersion));
-    }
+TEST(IndexKeyValidateTest, KeyElementUndefinedValueSucceedsForV1Indexes) {
+    ASSERT_OK(validateKeyPattern(BSON("x" << BSONUndefined), IndexVersion::kV1));
 }
 
 TEST(IndexKeyValidateTest, KeyElementMinKeyValueFailsForV2Indexes) {
@@ -172,10 +166,8 @@ TEST(IndexKeyValidateTest, KeyElementMinKeyValueFailsForV2Indexes) {
               validateKeyPattern(BSON("x" << MINKEY), IndexVersion::kV2));
 }
 
-TEST(IndexKeyValidateTest, KeyElementMinKeyValueSucceedsForV0AndV1Indexes) {
-    for (auto indexVersion : {IndexVersion::kV0, IndexVersion::kV1}) {
-        ASSERT_OK(validateKeyPattern(BSON("x" << MINKEY), indexVersion));
-    }
+TEST(IndexKeyValidateTest, KeyElementMinKeyValueSucceedsForV1Indexes) {
+    ASSERT_OK(validateKeyPattern(BSON("x" << MINKEY), IndexVersion::kV1));
 }
 
 TEST(IndexKeyValidateTest, KeyElementMaxKeyValueFailsForV2Indexes) {
@@ -183,10 +175,8 @@ TEST(IndexKeyValidateTest, KeyElementMaxKeyValueFailsForV2Indexes) {
               validateKeyPattern(BSON("x" << MAXKEY), IndexVersion::kV2));
 }
 
-TEST(IndexKeyValidateTest, KeyElementMaxKeyValueSucceedsForV0AndV1Indexes) {
-    for (auto indexVersion : {IndexVersion::kV0, IndexVersion::kV1}) {
-        ASSERT_OK(validateKeyPattern(BSON("x" << MAXKEY), indexVersion));
-    }
+TEST(IndexKeyValidateTest, KeyElementMaxKeyValueSucceedsForV1Indexes) {
+    ASSERT_OK(validateKeyPattern(BSON("x" << MAXKEY), IndexVersion::kV1));
 }
 
 TEST(IndexKeyValidateTest, KeyElementObjectValueFails) {
@@ -233,6 +223,67 @@ TEST(IndexKeyValidateTest, KeyElementNameTextSucceedsOnTextIndex) {
                                               << "text"),
                                      indexVersion));
     }
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameWildcardSucceedsOnSubPath) {
+    ASSERT_OK(validateKeyPattern(BSON("a.$**" << 1), IndexVersion::kV2));
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameWildcardSucceeds) {
+    ASSERT_OK(validateKeyPattern(BSON("$**" << 1), IndexVersion::kV2));
+}
+
+TEST(IndexKeyValidateTest, WildcardIndexNumericKeyElementValueFailsIfNotPositive) {
+    ASSERT_EQ(ErrorCodes::CannotCreateIndex,
+              validateKeyPattern(BSON("$**" << 0.0), IndexVersion::kV2));
+    ASSERT_EQ(ErrorCodes::CannotCreateIndex,
+              validateKeyPattern(BSON("$**" << -0.0), IndexVersion::kV2));
+    ASSERT_EQ(ErrorCodes::CannotCreateIndex,
+              validateKeyPattern(BSON("$**" << -0.1), IndexVersion::kV2));
+    ASSERT_EQ(ErrorCodes::CannotCreateIndex,
+              validateKeyPattern(BSON("$**" << -1), IndexVersion::kV2));
+    ASSERT_EQ(ErrorCodes::CannotCreateIndex,
+              validateKeyPattern(BSON("$**" << INT_MIN), IndexVersion::kV2));
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsOnRepeat) {
+    auto status = validateKeyPattern(BSON("$**.$**" << 1), IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsOnSubPathRepeat) {
+    auto status = validateKeyPattern(BSON("a.$**.$**" << 1), IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsOnCompound) {
+    auto status = validateKeyPattern(BSON("$**" << 1 << "a" << 1), IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsOnIncorrectValue) {
+    auto status = validateKeyPattern(BSON("$**" << false), IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsWhenValueIsPluginNameWithInvalidKeyName) {
+    auto status = validateKeyPattern(BSON("a"
+                                          << "wildcard"),
+                                     IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
+}
+
+TEST(IndexKeyValidateTest, KeyElementNameWildcardFailsWhenValueIsPluginNameWithValidKeyName) {
+    auto status = validateKeyPattern(BSON("$**"
+                                          << "wildcard"),
+                                     IndexVersion::kV2);
+    ASSERT_NOT_OK(status);
+    ASSERT_EQ(status, ErrorCodes::CannotCreateIndex);
 }
 
 }  // namespace

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,19 +30,21 @@
 
 #pragma once
 
+#include <map>
 #include <set>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
-#include "mongo/platform/unordered_map.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/ns_targeter.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/write_error_detail.h"
 #include "mongo/s/write_ops/write_op.h"
+#include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
 
@@ -171,6 +175,13 @@ public:
     void abortBatch(const WriteErrorDetail& error);
 
     /**
+     * Disposes of all tracked targeted batches when an error is encountered during a transaction.
+     * This is safe because any partially written data on shards will be rolled back if mongos
+     * decides to abort.
+     */
+    void forgetTargetedBatchesOnTransactionAbortingError();
+
+    /**
      * Returns false if the batch write op needs more processing.
      */
     bool isFinished();
@@ -201,6 +212,9 @@ private:
 
     // The incoming client request
     const BatchedCommandRequest& _clientRequest;
+
+    // Cached transaction number (if one is present on the operation contex)
+    boost::optional<TxnNumber> _batchTxnNum;
 
     // Array of ops being processed from the client request
     std::vector<WriteOp> _writeOps;
@@ -240,15 +254,24 @@ public:
         return _endpoint;
     }
 
-    /**
-     * TargetedWrite is owned here once given to the TargetedWriteBatch
-     */
-    void addWrite(TargetedWrite* targetedWrite) {
-        _writes.mutableVector().push_back(targetedWrite);
-    }
-
     const std::vector<TargetedWrite*>& getWrites() const {
         return _writes.vector();
+    }
+
+    size_t getNumOps() const {
+        return _writes.size();
+    }
+
+    int getEstimatedSizeBytes() const {
+        return _estimatedSizeBytes;
+    }
+
+    /**
+     * TargetedWrite is owned here once given to the TargetedWriteBatch.
+     */
+    void addWrite(TargetedWrite* targetedWrite, int estWriteSize) {
+        _writes.mutableVector().push_back(targetedWrite);
+        _estimatedSizeBytes += estWriteSize;
     }
 
 private:
@@ -258,6 +281,10 @@ private:
     // Where the responses go
     // TargetedWrite*s are owned by the TargetedWriteBatch
     OwnedPointerVector<TargetedWrite> _writes;
+
+    // Conservatvely estimated size of the batch, for ensuring it doesn't grow past the maximum BSON
+    // size
+    int _estimatedSizeBytes{0};
 };
 
 /**
@@ -265,20 +292,18 @@ private:
  */
 class TrackedErrors {
 public:
-    ~TrackedErrors();
+    TrackedErrors() = default;
 
     void startTracking(int errCode);
 
     bool isTracking(int errCode) const;
 
-    void addError(ShardError* error);
+    void addError(ShardError error);
 
-    const std::vector<ShardError*>& getErrors(int errCode) const;
-
-    void clear();
+    const std::vector<ShardError>& getErrors(int errCode) const;
 
 private:
-    typedef stdx::unordered_map<int, std::vector<ShardError*>> TrackedErrorMap;
+    using TrackedErrorMap = stdx::unordered_map<int, std::vector<ShardError>>;
     TrackedErrorMap _errorMap;
 };
 

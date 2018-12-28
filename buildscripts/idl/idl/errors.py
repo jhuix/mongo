@@ -1,16 +1,29 @@
-# Copyright (C) 2017 MongoDB Inc.
+# Copyright (C) 2018-present MongoDB, Inc.
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# Server Side Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 #
 """
 Common error handling code for IDL compiler.
@@ -73,7 +86,6 @@ ERROR_ID_ENUM_BAD_TYPE = "ID0036"
 ERROR_ID_ENUM_BAD_INT_VAUE = "ID0037"
 ERROR_ID_ENUM_NON_UNIQUE_VALUES = "ID0038"
 ERROR_ID_ENUM_NON_CONTINUOUS_RANGE = "ID0039"
-ERROR_ID_FIELD_MUST_BE_EMPTY_FOR_ENUM = "ID0040"
 ERROR_ID_BAD_COMMAND_NAMESPACE = "ID0041"
 ERROR_ID_FIELD_NO_COMMAND = "ID0042"
 ERROR_ID_NO_ARRAY_OF_CHAIN = "ID0043"
@@ -82,6 +94,23 @@ ERROR_ID_STRUCT_NO_DOC_SEQUENCE = "ID0045"
 ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_ARRAY = "ID0046"
 ERROR_ID_NO_DOC_SEQUENCE_FOR_NON_OBJECT = "ID0047"
 ERROR_ID_COMMAND_DUPLICATES_FIELD = "ID0048"
+ERROR_ID_IS_NODE_VALID_INT = "ID0049"
+ERROR_ID_IS_NODE_VALID_NON_NEGATIVE_INT = "ID0050"
+ERROR_ID_IS_DUPLICATE_COMPARISON_ORDER = "ID0051"
+ERROR_ID_IS_COMMAND_TYPE_EXTRANEOUS = "ID0052"
+ERROR_ID_VALUE_NOT_NUMERIC = "ID0053"
+ERROR_ID_SERVER_PARAM_MISSING_METHOD = "ID0054"
+ERROR_ID_SERVER_PARAM_ATTR_NO_STORAGE = "ID0055"
+ERROR_ID_SERVER_PARAM_ATTR_WITH_STORAGE = "ID0056"
+ERROR_ID_BAD_SETAT_SPECIFIER = "ID0057"
+ERROR_ID_BAD_SOURCE_SPECIFIER = "ID0058"
+ERROR_ID_BAD_DUPLICATE_BEHAVIOR_SPECIFIER = "ID0059"
+ERROR_ID_BAD_NUMERIC_RANGE = "ID0060"
+ERROR_ID_MISSING_SHORTNAME_FOR_POSITIONAL = "ID0061"
+ERROR_ID_INVALID_SHORT_NAME = "ID0062"
+ERROR_ID_INVALID_SINGLE_NAME = "ID0063"
+ERROR_ID_MISSING_SHORT_NAME_WITH_SINGLE_NAME = "ID0064"
+ERROR_ID_IS_NODE_TYPE_SCALAR_OR_MAPPING = "ID0065"
 
 
 class IDLError(Exception):
@@ -104,7 +133,7 @@ class ParserError(common.SourceLocation):
 
     def __init__(self, error_id, msg, file_name, line, column):
         # type: (unicode, unicode, unicode, int, int) -> None
-        """"Construct a parser error with source location information."""
+        """Construct a parser error with source location information."""
         # pylint: disable=too-many-arguments
         self.error_id = error_id
         self.msg = msg
@@ -112,8 +141,7 @@ class ParserError(common.SourceLocation):
 
     def __str__(self):
         # type: () -> str
-        """
-        Return a formatted error.
+        """Return a formatted error.
 
         Example error message:
         test.idl: (17, 4): ID0008: Unknown IDL node 'cpp_namespac' for YAML entity 'global'.
@@ -124,11 +152,11 @@ class ParserError(common.SourceLocation):
 
 
 class ParserErrorCollection(object):
-    """A collection of parser errors with source context information."""
+    """Collection of parser errors with source context information."""
 
     def __init__(self):
         # type: () -> None
-        """Default constructor."""
+        """Initialize ParserErrorCollection."""
         self._errors = []  # type: List[ParserError]
 
     def add(self, location, error_id, msg):
@@ -155,9 +183,10 @@ class ParserErrorCollection(object):
     def dump_errors(self):
         # type: () -> None
         """Print the list of errors."""
-        ', '.join(self.to_list())
+        print("Errors found while compiling IDL")
         for error_msg in self.to_list():
             print("%s\n\n" % error_msg)
+        print("Found %s errors" % (len(self.to_list())))
 
     def count(self):
         # type: () -> int
@@ -206,9 +235,10 @@ class ParserContext(object):
     def add_unknown_root_node_error(self, node):
         # type: (yaml.nodes.Node) -> None
         """Add an error about an unknown YAML root node."""
-        self._add_node_error(node, ERROR_ID_UNKNOWN_ROOT, (
-            "Unrecognized IDL specification root level node '%s', only " +
-            " (global, import, types, commands, and structs) are accepted") % (node.value))
+        self._add_node_error(node, ERROR_ID_UNKNOWN_ROOT,
+                             ("Unrecognized IDL specification root level node '%s', only " +
+                              " (global, import, types, commands, and structs) are accepted") %
+                             (node.value))
 
     def add_unknown_node_error(self, node, name):
         # type: (yaml.nodes.Node, unicode) -> None
@@ -276,6 +306,19 @@ class ParserContext(object):
 
         return True
 
+    def is_scalar_or_mapping_node(self, node, node_name):
+        # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode], unicode) -> bool
+        # pylint: disable=invalid-name
+        """Return True if the YAML node is a Scalar or Mapping."""
+        if not node.id == "scalar" and not node.id == "mapping":
+            self._add_node_error(
+                node, ERROR_ID_IS_NODE_TYPE_SCALAR_OR_MAPPING,
+                "Illegal node type '%s' for '%s', expected either node type 'scalar' or 'mapping'" %
+                (node.id, node_name))
+            return False
+
+        return True
+
     def is_scalar_bool_node(self, node, node_name):
         # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode], unicode) -> bool
         """Return True if this YAML node is a Scalar and a valid boolean."""
@@ -283,9 +326,9 @@ class ParserContext(object):
             return False
 
         if not (node.value == "true" or node.value == "false"):
-            self._add_node_error(node, ERROR_ID_IS_NODE_VALID_BOOL,
-                                 "Illegal bool value for '%s', expected either 'true' or 'false'." %
-                                 node_name)
+            self._add_node_error(
+                node, ERROR_ID_IS_NODE_VALID_BOOL,
+                "Illegal bool value for '%s', expected either 'true' or 'false'." % node_name)
             return False
 
         return True
@@ -305,9 +348,8 @@ class ParserContext(object):
         assert self.is_scalar_sequence_or_scalar_node(node, "unknown")
         if node.id == "scalar":
             return [node.value]
-        else:
-            # Unzip the list of ScalarNode
-            return [v.value for v in node.value]
+        # Unzip the list of ScalarNode
+        return [v.value for v in node.value]
 
     def add_duplicate_error(self, node, node_name):
         # type: (yaml.nodes.Node, unicode) -> None
@@ -327,16 +369,16 @@ class ParserContext(object):
         """Add an error about a YAML node missing a required child."""
         # pylint: disable=invalid-name
         self._add_node_error(node, ERROR_ID_MISSING_REQUIRED_FIELD,
-                             "IDL node '%s' is missing required scalar '%s'" %
-                             (node_parent, node_name))
+                             "IDL node '%s' is missing required scalar '%s'" % (node_parent,
+                                                                                node_name))
 
     def add_missing_ast_required_field_error(self, location, ast_type, ast_parent, ast_name):
         # type: (common.SourceLocation, unicode, unicode, unicode) -> None
         """Add an error about a AST node missing a required child."""
         # pylint: disable=invalid-name
         self._add_error(location, ERROR_ID_MISSING_AST_REQUIRED_FIELD,
-                        "%s '%s' is missing required scalar '%s'" %
-                        (ast_type, ast_parent, ast_name))
+                        "%s '%s' is missing required scalar '%s'" % (ast_type, ast_parent,
+                                                                     ast_name))
 
     def add_array_not_valid_error(self, location, ast_type, name):
         # type: (common.SourceLocation, unicode, unicode) -> None
@@ -348,8 +390,8 @@ class ParserContext(object):
         # type: (common.SourceLocation, unicode, unicode, unicode) -> None
         """Add an error about a bad bson type."""
         self._add_error(location, ERROR_ID_BAD_BSON_TYPE,
-                        "BSON Type '%s' is not recognized for %s '%s'." %
-                        (bson_type_name, ast_type, ast_parent))
+                        "BSON Type '%s' is not recognized for %s '%s'." % (bson_type_name, ast_type,
+                                                                           ast_parent))
 
     def add_bad_bson_scalar_type_error(self, location, ast_type, ast_parent, bson_type_name):
         # type: (common.SourceLocation, unicode, unicode, unicode) -> None
@@ -375,6 +417,14 @@ class ParserContext(object):
                         ("The bindata_subtype field's value '%s' for %s '%s' is not valid") %
                         (value, ast_type, ast_parent))
 
+    def add_bad_setat_specifier(self, location, specifier):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about a bad set_at specifier."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_BAD_SETAT_SPECIFIER,
+                        ("Unexpected set_at specifier: '%s', expected 'startup' or 'runtime'") %
+                        (specifier))
+
     def add_no_string_data_error(self, location, ast_type, ast_parent):
         # type: (common.SourceLocation, unicode, unicode) -> None
         """Add an error about using StringData for cpp_type."""
@@ -386,9 +436,10 @@ class ParserContext(object):
         # type: (common.SourceLocation, unicode, unicode) -> None
         """Add an error about field must be empty for ignored fields."""
         # pylint: disable=invalid-name
-        self._add_error(location, ERROR_ID_FIELD_MUST_BE_EMPTY_FOR_IGNORED, (
-            "Field '%s' cannot contain a value for property '%s' when a field is marked as ignored")
-                        % (name, field_name))
+        self._add_error(
+            location, ERROR_ID_FIELD_MUST_BE_EMPTY_FOR_IGNORED,
+            ("Field '%s' cannot contain a value for property '%s' when a field is marked as ignored"
+             ) % (name, field_name))
 
     def add_struct_field_must_be_empty_error(self, location, name, field_name):
         # type: (common.SourceLocation, unicode, unicode) -> None
@@ -403,27 +454,31 @@ class ParserContext(object):
         # type: (common.SourceLocation, unicode, unicode, unicode) -> None
         # pylint: disable=invalid-name
         """Add an error about field must be empty for fields of type struct."""
-        self._add_error(location, ERROR_ID_CUSTOM_SCALAR_SERIALIZATION_NOT_SUPPORTED, (
-            "Custom serialization for a scalar is only supported for 'string'. The %s '%s' cannot" +
-            " use bson type '%s', use a bson_serialization_type of 'any' instead.") %
-                        (ast_type, ast_parent, bson_type_name))
+        self._add_error(
+            location, ERROR_ID_CUSTOM_SCALAR_SERIALIZATION_NOT_SUPPORTED,
+            ("Custom serialization for a scalar is only supported for 'string'. The %s '%s' cannot"
+             + " use bson type '%s', use a bson_serialization_type of 'any' instead.") %
+            (ast_type, ast_parent, bson_type_name))
 
     def add_bad_any_type_use_error(self, location, bson_type, ast_type, ast_parent):
         # type: (common.SourceLocation, unicode, unicode, unicode) -> None
         # pylint: disable=invalid-name
         """Add an error about any being used in a list of bson types."""
-        self._add_error(location, ERROR_ID_BAD_ANY_TYPE_USE, (
-            "The BSON Type '%s' is not allowed in a list of bson serialization types for" +
-            "%s '%s'. It must be only a single bson type.") % (bson_type, ast_type, ast_parent))
+        self._add_error(
+            location, ERROR_ID_BAD_ANY_TYPE_USE,
+            ("The BSON Type '%s' is not allowed in a list of bson serialization types for" +
+             "%s '%s'. It must be only a single bson type.") % (bson_type, ast_type, ast_parent))
 
     def add_bad_cpp_numeric_type_use_error(self, location, ast_type, ast_parent, cpp_type):
         # type: (common.SourceLocation, unicode, unicode, unicode) -> None
         # pylint: disable=invalid-name
         """Add an error about any being used in a list of bson types."""
-        self._add_error(location, ERROR_ID_BAD_NUMERIC_CPP_TYPE, (
-            "The C++ numeric type '%s' is not allowed for %s '%s'. Only 'std::int32_t'," +
-            " 'std::uint32_t', 'std::uint64_t', and 'std::int64_t' are supported.") %
-                        (cpp_type, ast_type, ast_parent))
+        self._add_error(
+            location, ERROR_ID_BAD_NUMERIC_CPP_TYPE,
+            ("The C++ numeric type '%s' is not allowed for %s '%s'. Only 'std::int32_t'," +
+             " 'std::uint32_t', 'std::uint64_t', and 'std::int64_t' are supported.") % (cpp_type,
+                                                                                        ast_type,
+                                                                                        ast_parent))
 
     def add_bad_array_type_name_error(self, location, field_name, type_name):
         # type: (common.SourceLocation, unicode, unicode) -> None
@@ -547,14 +602,6 @@ class ParserContext(object):
                         ("Enum '%s' has non-continuous integer variables, enums must have a " +
                          "continuous range of integer variables.") % (enum_name))
 
-    def add_enum_field_must_be_empty_error(self, location, name, field_name):
-        # type: (common.SourceLocation, unicode, unicode) -> None
-        """Add an error about field must be empty for fields of type enum."""
-        # pylint: disable=invalid-name
-        self._add_error(location, ERROR_ID_FIELD_MUST_BE_EMPTY_FOR_ENUM, (
-            "Field '%s' cannot contain a value for property '%s' when a field's type is a enum") %
-                        (name, field_name))
-
     def add_bad_command_namespace_error(self, location, command_name, command_namespace,
                                         valid_commands):
         # type: (common.SourceLocation, unicode, unicode, List[unicode]) -> None
@@ -567,9 +614,10 @@ class ParserContext(object):
     def add_bad_command_as_field_error(self, location, command_name):
         # type: (common.SourceLocation, unicode) -> None
         """Add an error about using a command for a field."""
-        self._add_error(location, ERROR_ID_FIELD_NO_COMMAND,
-                        ("Command '%s' cannot be used as a field type'. Commands must be top-level"
-                         + " types due to their serialization rules.") % (command_name))
+        self._add_error(
+            location, ERROR_ID_FIELD_NO_COMMAND,
+            ("Command '%s' cannot be used as a field type'. Commands must be top-level" +
+             " types due to their serialization rules.") % (command_name))
 
     def add_bad_array_of_chain(self, location, field_name):
         # type: (common.SourceLocation, unicode) -> None
@@ -581,9 +629,10 @@ class ParserContext(object):
         # type: (common.SourceLocation, unicode) -> None
         """Add an error about a field being optional and having a default value."""
         # pylint: disable=invalid-name
-        self._add_error(location, ERROR_ID_ILLEGAL_FIELD_DEFAULT_AND_OPTIONAL, (
-            "Field '%s' can only be marked as optional or have a default value," + " not both.") %
-                        (field_name))
+        self._add_error(
+            location, ERROR_ID_ILLEGAL_FIELD_DEFAULT_AND_OPTIONAL,
+            ("Field '%s' can only be marked as optional or have a default value," + " not both.") %
+            (field_name))
 
     def add_bad_struct_field_as_doc_sequence_error(self, location, struct_name, field_name):
         # type: (common.SourceLocation, unicode, unicode) -> None
@@ -615,6 +664,135 @@ class ParserContext(object):
         # pylint: disable=invalid-name
         self._add_error(location, ERROR_ID_COMMAND_DUPLICATES_FIELD,
                         ("Command '%s' cannot have the same name as a field.") % (command_name))
+
+    def is_scalar_non_negative_int_node(self, node, node_name):
+        # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode], unicode) -> bool
+        """Return True if this YAML node is a Scalar and a valid non-negative int."""
+        if not self._is_node_type(node, node_name, "scalar"):
+            return False
+
+        try:
+            value = int(node.value)
+            if value < 0:
+                self._add_node_error(
+                    node, ERROR_ID_IS_NODE_VALID_NON_NEGATIVE_INT,
+                    "Illegal negative integer value for '%s', expected 0 or positive integer." %
+                    (node_name))
+                return False
+
+        except ValueError as value_error:
+            self._add_node_error(node, ERROR_ID_IS_NODE_VALID_INT,
+                                 "Illegal integer value for '%s', message '%s'." % (node_name,
+                                                                                    value_error))
+            return False
+
+        return True
+
+    def get_non_negative_int(self, node):
+        # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> int
+        """Convert a scalar to an int."""
+        assert self.is_scalar_non_negative_int_node(node, "unknown")
+
+        return int(node.value)
+
+    def add_duplicate_comparison_order_field_error(self, location, struct_name, comparison_order):
+        # type: (common.SourceLocation, unicode, int) -> None
+        """Add an error about fields having duplicate comparison_orders."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_IS_DUPLICATE_COMPARISON_ORDER,
+            ("Struct '%s' cannot have two fields with the same comparison_order value '%d'.") %
+            (struct_name, comparison_order))
+
+    def add_extranous_command_type(self, location, command_name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about commands having type when not needed."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_IS_COMMAND_TYPE_EXTRANEOUS,
+            ("Command '%s' cannot have a 'type' property unless namespace equals 'type'.") %
+            (command_name))
+
+    def add_value_not_numeric_error(self, location, attrname, value):
+        # type: (common.SourceLocation, unicode, unicode) -> None
+        """Add an error about non-numeric value where number expected."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_VALUE_NOT_NUMERIC,
+                        ("'%s' requires a numeric value, but %s can not be cast") % (attrname,
+                                                                                     value))
+
+    def add_missing_server_parameter_method(self, location, attrname):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about missing server_parameter method."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_SERVER_PARAM_MISSING_METHOD,
+                        ("'%s' required in server parameter definition without storage") %
+                        (attrname))
+
+    def add_server_parameter_attr_without_storage(self, location, attrname):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about unexpected attribute on server_parameter without storage."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_SERVER_PARAM_ATTR_NO_STORAGE,
+                        ("'%s' conflicts with server parameter definition without storage") %
+                        (attrname))
+
+    def add_server_parameter_attr_with_storage(self, location, attrname):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about unexpected attribute on server_paramter with storage."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_SERVER_PARAM_ATTR_WITH_STORAGE,
+                        ("'%s' conflicts with server parameter definition with storage") %
+                        (attrname))
+
+    def add_bad_source_specifier(self, location, value):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about invalid source specifier."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_BAD_SOURCE_SPECIFIER,
+                        ("'%s' is not a valid source specifier") % (value))
+
+    def add_bad_duplicate_behavior(self, location, value):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about invalid duplicate behavior specifier."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_BAD_DUPLICATE_BEHAVIOR_SPECIFIER,
+                        ("'%s' is not a valid duplicate behavior specifier") % (value))
+
+    def add_bad_numeric_range(self, location, attrname, value):
+        # type: (common.SourceLocation, unicode, unicode) -> None
+        """Add an error about invalid range specifier."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_BAD_NUMERIC_RANGE,
+                        ("'%s' is not a valid numeric range for '%s'") % (value, attrname))
+
+    def add_missing_shortname_for_positional_arg(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about required short_name for positional args."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_MISSING_SHORTNAME_FOR_POSITIONAL,
+                        "Missing 'short_name' for positional arg")
+
+    def add_invalid_short_name(self, location, name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about invalid short names."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_INVALID_SHORT_NAME,
+                        ("Invalid 'short_name' value '%s'") % (name))
+
+    def add_invalid_single_name(self, location, name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about invalid single names."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_INVALID_SINGLE_NAME,
+                        ("Invalid 'single_name' value '%s'") % (name))
+
+    def add_missing_short_name_with_single_name(self, location, name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about missing required short name when using single name."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_MISSING_SHORT_NAME_WITH_SINGLE_NAME,
+                        ("Missing 'short_name' required with 'single_name' value '%s'") % (name))
 
 
 def _assert_unique_error_messages():

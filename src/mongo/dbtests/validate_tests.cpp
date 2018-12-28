@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2015 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -32,13 +34,12 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace ValidateTests {
@@ -146,7 +147,7 @@ public:
 
     void run() {
 
-        // Can't do it in background is the RecordStore is not in RecordId order.
+        // Can't do it in background if the RecordStore is not in RecordId order.
         if (_background && !_isInRecordIdOrder) {
             return;
         }
@@ -191,8 +192,7 @@ public:
             WriteUnitOfWork wunit(&_opCtx);
             for (int j = 0; j < 2; j++) {
                 auto doc = BSON("_id" << j);
-                ASSERT_OK(rs->insertRecord(
-                    &_opCtx, doc.objdata(), doc.objsize(), Timestamp(), /*enforceQuota*/ false));
+                ASSERT_OK(rs->insertRecord(&_opCtx, doc.objdata(), doc.objsize(), Timestamp()));
             }
             wunit.commit();
         }
@@ -208,7 +208,7 @@ public:
     ValidateSecondaryIndexCount() : ValidateBase(full, background) {}
     void run() {
 
-        // Can't do it in background is the RecordStore is not in RecordId order.
+        // Can't do it in background if the RecordStore is not in RecordId order.
         if (_background && !_isInRecordIdOrder) {
             return;
         }
@@ -266,8 +266,7 @@ public:
             WriteUnitOfWork wunit(&_opCtx);
             for (int j = 0; j < 2; j++) {
                 auto doc = BSON("_id" << j);
-                ASSERT_OK(rs->insertRecord(
-                    &_opCtx, doc.objdata(), doc.objsize(), Timestamp(), /*enforceQuota*/ false));
+                ASSERT_OK(rs->insertRecord(&_opCtx, doc.objdata(), doc.objsize(), Timestamp()));
             }
             wunit.commit();
         }
@@ -283,7 +282,7 @@ public:
     ValidateSecondaryIndex() : ValidateBase(full, background) {}
     void run() {
 
-        // Can't do it in background is the RecordStore is not in RecordId order.
+        // Can't do it in background if the RecordStore is not in RecordId order.
         if (_background && !_isInRecordIdOrder) {
             return;
         }
@@ -331,8 +330,7 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 1 << "a" << 9);
-            auto updateStatus = rs->updateRecord(
-                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+            auto updateStatus = rs->updateRecord(&_opCtx, id1, doc.objdata(), doc.objsize());
 
             ASSERT_OK(updateStatus);
             wunit.commit();
@@ -350,7 +348,7 @@ public:
 
     void run() {
 
-        // Can't do it in background is the RecordStore is not in RecordId order.
+        // Can't do it in background if the RecordStore is not in RecordId order.
         if (_background && !_isInRecordIdOrder) {
             return;
         }
@@ -383,8 +381,7 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 9);
-            auto updateStatus = rs->updateRecord(
-                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+            auto updateStatus = rs->updateRecord(&_opCtx, id1, doc.objdata(), doc.objsize());
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -397,8 +394,7 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 1);
-            auto updateStatus = rs->updateRecord(
-                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+            auto updateStatus = rs->updateRecord(&_opCtx, id1, doc.objdata(), doc.objsize());
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -415,9 +411,7 @@ public:
             rs->deleteRecord(&_opCtx, id1);
             auto doc = BSON("_id" << 3);
             ASSERT_OK(
-                rs->insertRecord(
-                      &_opCtx, doc.objdata(), doc.objsize(), Timestamp(), /*enforceQuota*/ false)
-                    .getStatus());
+                rs->insertRecord(&_opCtx, doc.objdata(), doc.objsize(), Timestamp()).getStatus());
             wunit.commit();
         }
 
@@ -433,7 +427,7 @@ public:
 
     void run() {
 
-        // Can't do it in background is the RecordStore is not in RecordId order.
+        // Can't do it in background if the RecordStore is not in RecordId order.
         if (_background && !_isInRecordIdOrder) {
             return;
         }
@@ -492,8 +486,7 @@ public:
         // Update a document's indexed field without updating the index.
         {
             WriteUnitOfWork wunit(&_opCtx);
-            auto updateStatus = rs->updateRecord(
-                &_opCtx, id1, doc1_b.objdata(), doc1_b.objsize(), /*enforceQuota*/ false, NULL);
+            auto updateStatus = rs->updateRecord(&_opCtx, id1, doc1_b.objdata(), doc1_b.objsize());
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -506,8 +499,7 @@ public:
         // Index validation should still be valid.
         {
             WriteUnitOfWork wunit(&_opCtx);
-            auto updateStatus = rs->updateRecord(
-                &_opCtx, id1, doc1_c.objdata(), doc1_c.objsize(), /*enforceQuota*/ false, NULL);
+            auto updateStatus = rs->updateRecord(&_opCtx, id1, doc1_c.objdata(), doc1_c.objsize());
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -524,7 +516,7 @@ public:
 
     void run() {
 
-        // Can't do it in background is the RecordStore is not in RecordId order.
+        // Can't do it in background if the RecordStore is not in RecordId order.
         if (_background && !_isInRecordIdOrder) {
             return;
         }
@@ -575,8 +567,7 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 2 << "a" << 3);
-            auto updateStatus = rs->updateRecord(
-                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+            auto updateStatus = rs->updateRecord(&_opCtx, id1, doc.objdata(), doc.objsize());
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -593,7 +584,7 @@ public:
 
     void run() {
 
-        // Can't do it in background is the RecordStore is not in RecordId order.
+        // Can't do it in background if the RecordStore is not in RecordId order.
         if (_background && !_isInRecordIdOrder) {
             return;
         }
@@ -649,8 +640,7 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 1);
-            auto updateStatus = rs->updateRecord(
-                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+            auto updateStatus = rs->updateRecord(&_opCtx, id1, doc.objdata(), doc.objsize());
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -667,7 +657,7 @@ public:
 
     void run() {
 
-        // Can't do it in background is the RecordStore is not in RecordId order.
+        // Can't do it in background if the RecordStore is not in RecordId order.
         if (_background && !_isInRecordIdOrder) {
             return;
         }
@@ -705,8 +695,7 @@ public:
                                                         << "background"
                                                         << false
                                                         << "partialFilterExpression"
-                                                        << BSON("a" << BSON("$eq" << 2))))
-                          .transitional_ignore(),
+                                                        << BSON("a" << BSON("$eq" << 2)))),
                       AssertionException);
 
         // Create a partial geo index that does not index the document.
@@ -738,7 +727,7 @@ public:
 
     void run() {
 
-        // Can't do it in background is the RecordStore is not in RecordId order.
+        // Can't do it in background if the RecordStore is not in RecordId order.
         if (_background && !_isInRecordIdOrder) {
             return;
         }
@@ -812,8 +801,7 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 1 << "a" << 1 << "b" << 3);
-            auto updateStatus = rs->updateRecord(
-                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+            auto updateStatus = rs->updateRecord(&_opCtx, id1, doc.objdata(), doc.objsize());
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -830,7 +818,7 @@ public:
 
     void run() {
 
-        // Can't do it in background is the RecordStore is not in RecordId order.
+        // Can't do it in background if the RecordStore is not in RecordId order.
         if (_background && !_isInRecordIdOrder) {
             return;
         }
@@ -871,23 +859,24 @@ public:
 
         // Replace a correct index entry with a bad one and check it's invalid.
         IndexCatalog* indexCatalog = coll->getIndexCatalog();
-        IndexDescriptor* descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
-        IndexAccessMethod* iam = indexCatalog->getIndex(descriptor);
+        auto descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
+        auto iam =
+            const_cast<IndexAccessMethod*>(indexCatalog->getEntry(descriptor)->accessMethod());
 
         {
             WriteUnitOfWork wunit(&_opCtx);
             int64_t numDeleted;
-            int64_t numInserted;
+            InsertResult insertResult;
             const BSONObj actualKey = BSON("a" << 1);
             const BSONObj badKey = BSON("a" << -1);
             InsertDeleteOptions options;
             options.dupsAllowed = true;
             options.logIfError = true;
             auto removeStatus = iam->remove(&_opCtx, actualKey, id1, options, &numDeleted);
-            auto insertStatus = iam->insert(&_opCtx, badKey, id1, options, &numInserted);
+            auto insertStatus = iam->insert(&_opCtx, badKey, id1, options, &insertResult);
 
             ASSERT_EQUALS(numDeleted, 1);
-            ASSERT_EQUALS(numInserted, 1);
+            ASSERT_EQUALS(insertResult.numInserted, 1);
             ASSERT_OK(removeStatus);
             ASSERT_OK(insertStatus);
             wunit.commit();
@@ -905,7 +894,7 @@ public:
 
     void run() {
 
-        // Can't do it in background is the RecordStore is not in RecordId order.
+        // Can't do it in background if the RecordStore is not in RecordId order.
         if (_background && !_isInRecordIdOrder) {
             return;
         }
@@ -947,13 +936,219 @@ public:
         // Change the IndexDescriptor's keyPattern to descending so the index ordering
         // appears wrong.
         IndexCatalog* indexCatalog = coll->getIndexCatalog();
-        IndexDescriptor* descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
+        IndexDescriptor* descriptor =
+            const_cast<IndexDescriptor*>(indexCatalog->findIndexByName(&_opCtx, indexName));
         descriptor->setKeyPatternForTest(BSON("a" << -1));
 
         ASSERT_FALSE(checkValid());
         releaseDb();
     }
 };
+
+template <bool full, bool background>
+class ValidateWildCardIndex : public ValidateBase {
+public:
+    ValidateWildCardIndex() : ValidateBase(full, background) {}
+
+    void run() {
+        // Can't perform background validation if the RecordStore is not in RecordId order.
+        if (_background && !_isInRecordIdOrder) {
+            return;
+        }
+
+        // Create a new collection.
+        lockDb(MODE_X);
+        Collection* coll;
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
+            coll = _db->createCollection(&_opCtx, _ns);
+            wunit.commit();
+        }
+
+        // Create a $** index.
+        const auto indexName = "wildcardIndex";
+        const auto indexKey = BSON("$**" << 1);
+        auto status = dbtests::createIndexFromSpec(
+            &_opCtx,
+            coll->ns().ns(),
+            BSON("name" << indexName << "ns" << coll->ns().ns() << "key" << indexKey << "v"
+                        << static_cast<int>(kIndexVersion)
+                        << "background"
+                        << false));
+        ASSERT_OK(status);
+
+        // Insert non-multikey documents.
+        OpDebug* const nullOpDebug = nullptr;
+        lockDb(MODE_X);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(
+                coll->insertDocument(&_opCtx,
+                                     InsertStatement(BSON("_id" << 1 << "a" << 1 << "b" << 1)),
+                                     nullOpDebug,
+                                     true));
+            ASSERT_OK(
+                coll->insertDocument(&_opCtx,
+                                     InsertStatement(BSON("_id" << 2 << "b" << BSON("0" << 1))),
+                                     nullOpDebug,
+                                     true));
+            wunit.commit();
+        }
+        ASSERT_TRUE(checkValid());
+
+        // Insert multikey documents.
+        lockDb(MODE_X);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx,
+                InsertStatement(BSON("_id" << 3 << "mk_1" << BSON_ARRAY(1 << 2 << 3))),
+                nullOpDebug,
+                true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx,
+                InsertStatement(BSON("_id" << 4 << "mk_2" << BSON_ARRAY(BSON("e" << 1)))),
+                nullOpDebug,
+                true));
+            wunit.commit();
+        }
+        ASSERT_TRUE(checkValid());
+
+        // Insert additional multikey path metadata index keys.
+        lockDb(MODE_X);
+        const RecordId recordId(RecordId::ReservedId::kWildcardMultikeyMetadataId);
+        IndexCatalog* indexCatalog = coll->getIndexCatalog();
+        auto descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
+        auto accessMethod =
+            const_cast<IndexAccessMethod*>(indexCatalog->getEntry(descriptor)->accessMethod());
+        auto sortedDataInterface = accessMethod->getSortedDataInterface();
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            const BSONObj indexKey = BSON("" << 1 << ""
+                                             << "non_existent_path");
+            auto insertStatus =
+                sortedDataInterface->insert(&_opCtx, indexKey, recordId, true /* dupsAllowed */);
+            ASSERT_OK(insertStatus);
+            wunit.commit();
+        }
+
+        // An index whose set of multikey metadata paths is a superset of collection multikey
+        // metadata paths is valid.
+        ASSERT_TRUE(checkValid());
+
+        // Remove the multikey path metadata index key for a path that exists and is multikey in the
+        // collection.
+        lockDb(MODE_X);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            const BSONObj indexKey = BSON("" << 1 << ""
+                                             << "mk_1");
+            sortedDataInterface->unindex(&_opCtx, indexKey, recordId, true /* dupsAllowed */);
+            wunit.commit();
+        }
+
+        // An index that is missing one or more multikey metadata fields that exist in the
+        // collection is not valid.
+        ASSERT_FALSE(checkValid());
+
+        releaseDb();
+    }
+};
+
+template <bool full, bool background>
+class ValidateWildCardIndexWithProjection : public ValidateBase {
+public:
+    ValidateWildCardIndexWithProjection() : ValidateBase(full, background) {}
+
+    void run() {
+        // Can't perform background validation if the RecordStore is not in RecordId order.
+        if (_background && !_isInRecordIdOrder) {
+            return;
+        }
+
+        // Create a new collection.
+        lockDb(MODE_X);
+        Collection* coll;
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _ns));
+            coll = _db->createCollection(&_opCtx, _ns);
+            wunit.commit();
+        }
+
+        // Create a $** index with a projection on "a".
+        const auto indexName = "wildcardIndex";
+        const auto indexKey = BSON("a.$**" << 1);
+        auto status = dbtests::createIndexFromSpec(
+            &_opCtx,
+            coll->ns().ns(),
+            BSON("name" << indexName << "ns" << coll->ns().ns() << "key" << indexKey << "v"
+                        << static_cast<int>(kIndexVersion)
+                        << "background"
+                        << false));
+        ASSERT_OK(status);
+
+        // Insert documents with indexed and not-indexed paths.
+        OpDebug* const nullOpDebug = nullptr;
+        lockDb(MODE_X);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(
+                coll->insertDocument(&_opCtx,
+                                     InsertStatement(BSON("_id" << 1 << "a" << 1 << "b" << 1)),
+                                     nullOpDebug,
+                                     true));
+            ASSERT_OK(
+                coll->insertDocument(&_opCtx,
+                                     InsertStatement(BSON("_id" << 2 << "a" << BSON("w" << 1))),
+                                     nullOpDebug,
+                                     true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx,
+                InsertStatement(BSON("_id" << 3 << "a" << BSON_ARRAY("x" << 1))),
+                nullOpDebug,
+                true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 4 << "b" << 2)), nullOpDebug, true));
+            ASSERT_OK(
+                coll->insertDocument(&_opCtx,
+                                     InsertStatement(BSON("_id" << 5 << "b" << BSON("y" << 1))),
+                                     nullOpDebug,
+                                     true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx,
+                InsertStatement(BSON("_id" << 6 << "b" << BSON_ARRAY("z" << 1))),
+                nullOpDebug,
+                true));
+            wunit.commit();
+        }
+        ASSERT_TRUE(checkValid());
+
+        lockDb(MODE_X);
+        IndexCatalog* indexCatalog = coll->getIndexCatalog();
+        auto descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
+        auto accessMethod =
+            const_cast<IndexAccessMethod*>(indexCatalog->getEntry(descriptor)->accessMethod());
+        auto sortedDataInterface = accessMethod->getSortedDataInterface();
+
+        // Removing a multikey metadata path for a path included in the projection causes validate
+        // to fail.
+        lockDb(MODE_X);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            const BSONObj indexKey = BSON("" << 1 << ""
+                                             << "a");
+            RecordId recordId(RecordId::ReservedId::kWildcardMultikeyMetadataId);
+            sortedDataInterface->unindex(&_opCtx, indexKey, recordId, true /* dupsAllowed */);
+            wunit.commit();
+        }
+        ASSERT_FALSE(checkValid());
+
+        releaseDb();
+    }
+};
+
 
 class ValidateTests : public Suite {
 public:
@@ -983,6 +1178,8 @@ public:
         add<ValidatePartialIndex<false, true>>();
         add<ValidatePartialIndexOnCollectionWithNonIndexableFields<false, false>>();
         add<ValidatePartialIndexOnCollectionWithNonIndexableFields<false, true>>();
+        add<ValidateWildCardIndex<false, false>>();
+        add<ValidateWildCardIndexWithProjection<false, false>>();
 
         // Tests for index validation.
         add<ValidateIndexEntry<false, false>>();

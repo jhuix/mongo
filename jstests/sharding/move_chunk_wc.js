@@ -1,5 +1,3 @@
-load('jstests/libs/write_concern_util.js');
-
 /**
  * This commands tests that moveChunk gives a proper response when the writeConcern cannot be met.
  * The test creates a sharded cluster with shards and config servers of different sizes to see how
@@ -9,6 +7,7 @@ load('jstests/libs/write_concern_util.js');
  * a writeConcern too high for the from shard and sees that that fails. moveChunk does not yield
  * a writeConcernError. It should simply fail when the writeConcern is not met on the shards.
  */
+load('jstests/libs/write_concern_util.js');
 
 (function() {
     "use strict";
@@ -98,4 +97,5 @@ load('jstests/libs/write_concern_util.js');
     assert.commandFailed(res);
     assert(!res.writeConcernError, 'moveChunk had writeConcernError: ' + tojson(res));
     checkChunkCount(1, 1);
+    st.stop();
 })();

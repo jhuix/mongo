@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -180,13 +182,13 @@ TEST(ParsedAddFieldsSerialize, SerializesToCorrectForm) {
         fromjson("{a: {$add: [\"$a\", {$const: 2}]}, b: {d: {$const: 3}}, x: {y: {$const: 4}}}"));
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeStageOptions(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kQueryPlanner));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kExecStats));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecStats));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kExecAllPlans));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
 }
 
 // Verify that serialize treats the _id field as any other field: including when explicity included.
@@ -199,13 +201,13 @@ TEST(ParsedAddFieldsSerialize, AddsIdToSerializeWhenExplicitlyIncluded) {
     auto expectedSerialization = Document(fromjson("{_id: {$const: false}}"));
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeStageOptions(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kQueryPlanner));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kExecStats));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecStats));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kExecAllPlans));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
 }
 
 // Verify that serialize treats the _id field as any other field: excluded when not explicitly
@@ -221,13 +223,13 @@ TEST(ParsedAddFieldsSerialize, OmitsIdFromSerializeWhenNotIncluded) {
     auto expectedSerialization = Document(fromjson("{a: {$const: true}}"));
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeStageOptions(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kQueryPlanner));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kExecStats));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecStats));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kExecAllPlans));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
 }
 
 // Verify that the $addFields stage optimizes expressions into simpler forms when possible.
@@ -239,13 +241,13 @@ TEST(ParsedAddFieldsOptimize, OptimizesTopLevelExpressions) {
     auto expectedSerialization = Document{{"a", Document{{"$const", 3}}}};
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeStageOptions(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kQueryPlanner));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kExecStats));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecStats));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kExecAllPlans));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
 }
 
 // Verify that the $addFields stage optimizes expressions even when they are nested.
@@ -257,13 +259,13 @@ TEST(ParsedAddFieldsOptimize, ShouldOptimizeNestedExpressions) {
     auto expectedSerialization = Document{{"a", Document{{"b", Document{{"$const", 3}}}}}};
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeStageOptions(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kQueryPlanner));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kExecStats));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecStats));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeStageOptions(ExplainOptions::Verbosity::kExecAllPlans));
+                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
 }
 
 //

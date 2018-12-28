@@ -12,7 +12,9 @@ selector:
   - jstests/sharding/mongos_rs_auth_shard_failure_tolerance.js
   - jstests/sharding/mrShardedOutputAuth.js
   - jstests/sharding/aggregation_currentop.js
-  # Count/write/aggregate/group commands against the config shard do not support retries yet
+  - jstests/sharding/advance_cluster_time_action_type.js
+  - jstests/sharding/mongod_returns_no_cluster_time_without_keys.js
+  # Count/write/aggregate commands against the config shard do not support retries yet
   - jstests/sharding/addshard1.js
   - jstests/sharding/addshard2.js
   - jstests/sharding/autosplit.js
@@ -29,7 +31,7 @@ selector:
   - jstests/sharding/drop_sharded_db.js
   - jstests/sharding/findandmodify1.js
   - jstests/sharding/findandmodify2.js
-  - jstests/sharding/geo_shardedgeonear.js
+  - jstests/sharding/geo_near_sharded.js
   - jstests/sharding/hash_basic.js
   - jstests/sharding/hash_shard1.js
   - jstests/sharding/hash_shard_non_empty.js
@@ -62,14 +64,15 @@ selector:
   - jstests/sharding/tag_range.js
   - jstests/sharding/top_chunk_autosplit.js
   - jstests/sharding/count_config_servers.js
-  - jstests/sharding/conf_server_write_concern_metadata.js
   - jstests/sharding/split_large_key.js
   - jstests/sharding/balancer_window.js
   # No retries on direct writes to the config/admin databases on the config servers
+  - jstests/sharding/database_versioning_safe_secondary_reads.js
   - jstests/sharding/listDatabases.js
   - jstests/sharding/bulk_insert.js
   - jstests/sharding/printShardingStatus.js
   - jstests/sharding/refresh_sessions.js
+  - jstests/sharding/shard_collection_existing_zones.js
   # Balancer writes (direct write to config database with no retries)
   - jstests/sharding/convert_to_and_from_sharded.js
   - jstests/sharding/remove2.js
@@ -79,8 +82,9 @@ selector:
   - jstests/sharding/parallel.js
   - jstests/sharding/migrateBig.js
   - jstests/sharding/sharding_rs1.js
+  - jstests/sharding/move_primary_fails_without_database_version.js
   # Calls the config server primary directly (not through mongos)
-  - jstests/sharding/moveprimary_ignore_sharded.js
+  - jstests/sharding/configsvr_metadata_commands_require_majority_write_concern.js
   - jstests/sharding/min_optime_recovery_on_successful_move_chunk_commit.js
   - jstests/sharding/read_after_optime.js
   - jstests/sharding/server_status.js
@@ -93,6 +97,9 @@ selector:
   - jstests/sharding/move_chunk_insert_with_write_retryability.js
   - jstests/sharding/move_chunk_remove_with_write_retryability.js
   - jstests/sharding/move_chunk_update_with_write_retryability.js
+  - jstests/sharding/txn_coordinator_commands_basic_requirements.js
+  - jstests/sharding/txn_failover_two_phase_commit.js
+  - jstests/sharding/txn_wait_for_majority_commit_after_stepup.js
   # Runs setShardVersion/getShardVersion against the config server and we don't support retries
   # for this command
   - jstests/sharding/major_version_check.js
@@ -111,7 +118,6 @@ selector:
   - jstests/sharding/all_config_servers_blackholed_from_mongos.js
   - jstests/sharding/batch_write_command_sharded.js
   - jstests/sharding/config_rs_no_primary.js
-  - jstests/sharding/config_version_rollback.js
   - jstests/sharding/startup_with_all_configs_down.js
   - jstests/sharding/lagged_config_secondary.js
   - jstests/sharding/autodiscover_config_rs_from_secondary.js
@@ -136,17 +142,55 @@ selector:
   # Expects that connections to all shards/config servers will never close
   - jstests/sharding/shard6.js
   # Stepping down the primary can make the balancer rerun a migration that was designed to fail
-  # earlier, but can potentially pass on the second try.
+  # earlier, but can potentially pass or have different side effects on the second try
   - jstests/sharding/migration_ignore_interrupts_1.js
+  - jstests/sharding/migration_sets_fromMigrate_flag.js
   # Stepping down the config can cause moveChunks stopped on shards via killOp to be restarted.
   - jstests/sharding/migration_ignore_interrupts_3.js
   - jstests/sharding/migration_ignore_interrupts_4.js
   # listCollections is not retryable
   - jstests/sharding/sessions_collection_auto_healing.js
+  # shardCollection is not retryable
+  - jstests/sharding/shard_config_db_collections.js
+  # creates collection, does movePrimary, then shards the collection and moves a chunk to the old
+  # primary (SERVER-31909)
+  - jstests/sharding/mongos_validate_writes.js
+  # Test expects a specific chunk distribution after shardCollection and it can be broken when
+  # a step down occurs.
+  - jstests/sharding/regex_targeting.js
+  # Sets a failpoint on a config server secondary.
+  - jstests/sharding/shards_and_config_return_last_committed_optime.js
+  # Calls movePrimary after data has been inserted into an unsharded collection, so will fail if
+  # a stepdown causes the command to be sent again.
+  - jstests/sharding/move_primary_clone_test.js
+  - jstests/sharding/mongos_validate_writes.js
+  - jstests/sharding/movePrimary1.js
+  # Checks for an exact number of matching entries in the profiler, which will fail if a command
+  # gets retried due to a stepdown.
+  - jstests/sharding/database_and_shard_versioning_all_commands.js
+  # Calls removeShard/removeshard which is not idempotent and these tests expect it to be run an exact number of times
+  - jstests/sharding/addshard5.js
+  - jstests/sharding/auth_add_shard.js
+  - jstests/sharding/remove3.js
+  - jstests/sharding/authCommands.js
+  #  - jstests/sharding/addshard2.js
+  #  - jstests/sharding/configsvr_metadata_commands_require_majority_write_concern.js
+  #  - jstests/sharding/convert_to_and_from_sharded.js
+  #  - jstests/sharding/names.js
+  #  - jstests/sharding/remove1.js
+  #  - jstests/sharding/remove2.js
+
+  # Moves a chunk before continuing a transaction, which can lead to snapshot errors if the
+  # CSRS failovers are sufficiently slow.
+  - jstests/sharding/transactions_reject_writes_for_moved_chunks.js
+  - jstests/sharding/transactions_target_at_point_in_time.js
 
 executor:
   config:
     shell_options:
+      global_vars:
+        TestData:
+          skipCheckingCatalogCacheConsistencyWithShardingCatalog: true
       eval: "load('jstests/libs/override_methods/sharding_continuous_config_stepdown.js');"
       nodb: ''
       readMode: commands

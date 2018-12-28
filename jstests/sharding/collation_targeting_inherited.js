@@ -11,7 +11,7 @@
     var st = new ShardingTest({shards: 3});
     var testDB = st.s.getDB("test");
     assert.commandWorked(testDB.adminCommand({enableSharding: testDB.getName()}));
-    st.ensurePrimaryShard(testDB.getName(), "shard0001");
+    st.ensurePrimaryShard(testDB.getName(), st.shard1.shardName);
 
     // Create a collection with a case-insensitive default collation sharded on {a: 1}.
     var collCaseInsensitive = testDB.getCollection("case_insensitive");
@@ -26,24 +26,24 @@
     }));
 
     // Split the collection.
-    // shard0000: { "a" : { "$minKey" : 1 } } -->> { "a" : 10 }
-    // shard0001: { "a" : 10 } -->> { "a" : "a"}
+    // st.shard0.shardName: { "a" : { "$minKey" : 1 } } -->> { "a" : 10 }
+    // st.shard1.shardName: { "a" : 10 } -->> { "a" : "a"}
     // shard0002: { "a" : "a" } -->> { "a" : { "$maxKey" : 1 }}
     assert.commandWorked(
         testDB.adminCommand({split: collCaseInsensitive.getFullName(), middle: {a: 10}}));
     assert.commandWorked(
         testDB.adminCommand({split: collCaseInsensitive.getFullName(), middle: {a: "a"}}));
     assert.commandWorked(testDB.adminCommand(
-        {moveChunk: collCaseInsensitive.getFullName(), find: {a: 1}, to: "shard0000"}));
+        {moveChunk: collCaseInsensitive.getFullName(), find: {a: 1}, to: st.shard0.shardName}));
     assert.commandWorked(testDB.adminCommand(
-        {moveChunk: collCaseInsensitive.getFullName(), find: {a: "FOO"}, to: "shard0001"}));
+        {moveChunk: collCaseInsensitive.getFullName(), find: {a: "FOO"}, to: st.shard1.shardName}));
     assert.commandWorked(testDB.adminCommand(
-        {moveChunk: collCaseInsensitive.getFullName(), find: {a: "foo"}, to: "shard0002"}));
+        {moveChunk: collCaseInsensitive.getFullName(), find: {a: "foo"}, to: st.shard2.shardName}));
 
     // Put data on each shard.
     // Note that the balancer is off by default, so the chunks will stay put.
-    // shard0000: {a: 1}
-    // shard0001: {a: 100}, {a: "FOO"}
+    // st.shard0.shardName: {a: 1}
+    // st.shard1.shardName: {a: 100}, {a: "FOO"}
     // shard0002: {a: "foo"}
     // Include geo field to test geoNear.
     var a_1 = {_id: 0, a: 1, geo: {type: "Point", coordinates: [0, 0]}};
@@ -77,6 +77,49 @@
     // collection default. This should be single-shard.
     assert.eq(1, collCaseInsensitive.aggregate([{$match: {a: 100}}]).itcount());
     explain = collCaseInsensitive.explain().aggregate([{$match: {a: 100}}]);
+    assert.commandWorked(explain);
+    assert.eq(1, Object.keys(explain.shards).length);
+
+    // Aggregate with $geoNear.
+    const geoJSONPoint = {type: "Point", coordinates: [0, 0]};
+
+    // Test $geoNear with a query on strings with a non-simple collation inherited from the
+    // collection default. This should scatter-gather.
+    const geoNearStageStringQuery = [{
+        $geoNear: {
+            near: geoJSONPoint,
+            distanceField: "dist",
+            spherical: true,
+            query: {a: "foo"},
+        }
+    }];
+    assert.eq(2, collCaseInsensitive.aggregate(geoNearStageStringQuery).itcount());
+    explain = collCaseInsensitive.explain().aggregate(geoNearStageStringQuery);
+    assert.commandWorked(explain);
+    assert.eq(3, Object.keys(explain.shards).length);
+
+    // Test $geoNear with a query on strings with a simple collation. This should be single-shard.
+    assert.eq(
+        1,
+        collCaseInsensitive.aggregate(geoNearStageStringQuery, {collation: {locale: "simple"}})
+            .itcount());
+    explain = collCaseInsensitive.explain().aggregate(geoNearStageStringQuery,
+                                                      {collation: {locale: "simple"}});
+    assert.commandWorked(explain);
+    assert.eq(1, Object.keys(explain.shards).length);
+
+    // Test a $geoNear with a query on numbers with a non-simple collation inherited from the
+    // collection default. This should be single-shard.
+    const geoNearStageNumericalQuery = [{
+        $geoNear: {
+            near: geoJSONPoint,
+            distanceField: "dist",
+            spherical: true,
+            query: {a: 100},
+        }
+    }];
+    assert.eq(1, collCaseInsensitive.aggregate(geoNearStageNumericalQuery).itcount());
+    explain = collCaseInsensitive.explain().aggregate(geoNearStageNumericalQuery);
     assert.commandWorked(explain);
     assert.eq(1, Object.keys(explain.shards).length);
 
@@ -183,31 +226,6 @@
         collCaseInsensitive.explain().findAndModify({query: {a: 100}, update: {$set: {b: 1}}});
     assert.commandWorked(explain);
     assert.eq(1, explain.queryPlanner.winningPlan.shards.length);
-
-    // GeoNear.
-
-    // Test geoNear on strings with a non-simple collation inherited from collection default.
-    assert.eq(2,
-              assert
-                  .commandWorked(testDB.runCommand({
-                      geoNear: collCaseInsensitive.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {a: "foo"}
-                  }))
-                  .results.length);
-
-    // Test geoNear on strings with a simple collation.
-    assert.eq(1,
-              assert
-                  .commandWorked(testDB.runCommand({
-                      geoNear: collCaseInsensitive.getName(),
-                      near: {type: "Point", coordinates: [0, 0]},
-                      spherical: true,
-                      query: {a: "foo"},
-                      collation: {locale: "simple"}
-                  }))
-                  .results.length);
 
     // MapReduce.
 

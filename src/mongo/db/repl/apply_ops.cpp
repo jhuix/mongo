@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,6 +38,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -47,34 +50,31 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collation_spec.h"
-#include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+namespace repl {
+
+constexpr StringData ApplyOps::kPreconditionFieldName;
+constexpr StringData ApplyOps::kOplogApplicationModeFieldName;
+
 namespace {
 
-const auto kPreconditionFieldName = "preCondition"_sd;
-
 // If enabled, causes loop in _applyOps() to hang after applying current operation.
-MONGO_FP_DECLARE(applyOpsPauseBetweenOperations);
+MONGO_FAIL_POINT_DEFINE(applyOpsPauseBetweenOperations);
 
 /**
  * Return true iff the applyOpsCmd can be executed in a single WriteUnitOfWork.
  */
-bool _areOpsCrudOnly(const BSONObj& applyOpCmd) {
+bool _parseAreOpsCrudOnly(const BSONObj& applyOpCmd) {
     for (const auto& elem : applyOpCmd.firstElement().Obj()) {
-        const char* names[] = {"ns", "op"};
-        BSONElement fields[2];
-        elem.Obj().getFields(2, names, fields);
-        BSONElement& fieldNs = fields[0];
-        BSONElement& fieldOp = fields[1];
-
-        const char* opType = fieldOp.valuestrsafe();
-        const StringData ns = fieldNs.valueStringData();
+        const char* opType = elem.Obj().getField("op").valuestrsafe();
 
         // All atomic ops have an opType of length 1.
         if (opType[0] == '\0' || opType[1] != '\0')
@@ -87,8 +87,7 @@ bool _areOpsCrudOnly(const BSONObj& applyOpCmd) {
             case 'u':
                 break;
             case 'i':
-                if (nsToCollectionSubstring(ns) != "system.indexes")
-                    break;
+                break;
             // Fallthrough.
             default:
                 return false;
@@ -101,24 +100,22 @@ bool _areOpsCrudOnly(const BSONObj& applyOpCmd) {
 Status _applyOps(OperationContext* opCtx,
                  const std::string& dbName,
                  const BSONObj& applyOpCmd,
+                 const ApplyOpsCommandInfo& info,
+                 repl::OplogApplication::Mode oplogApplicationMode,
                  BSONObjBuilder* result,
-                 int* numApplied) {
-    BSONObj ops = applyOpCmd.firstElement().Obj();
-
+                 int* numApplied,
+                 BSONArrayBuilder* opsBuilder) {
+    const auto& ops = info.getOperations();
     // apply
     *numApplied = 0;
     int errors = 0;
 
-    BSONObjIterator i(ops);
     BSONArrayBuilder ab;
-    const bool alwaysUpsert =
-        applyOpCmd.hasField("alwaysUpsert") ? applyOpCmd["alwaysUpsert"].trueValue() : true;
+    const auto& alwaysUpsert = info.getAlwaysUpsert();
     const bool haveWrappingWUOW = opCtx->lockState()->inAWriteUnitOfWork();
 
-    while (i.more()) {
-        BSONElement e = i.next();
-        const BSONObj& opObj = e.Obj();
-
+    // Apply each op in the given 'applyOps' command object.
+    for (const auto& opObj : ops) {
         // Ignore 'n' operations.
         const char* opType = opObj["op"].valuestrsafe();
         if (*opType == 'n')
@@ -133,17 +130,20 @@ Status _applyOps(OperationContext* opCtx,
         Status status(ErrorCodes::InternalError, "");
 
         if (haveWrappingWUOW) {
-            invariant(opCtx->lockState()->isW());
+            // Only CRUD operations are allowed in atomic mode.
             invariant(*opType != 'c');
 
-            auto db = dbHolder().get(opCtx, nss.ns());
+            // ApplyOps does not have the global writer lock when applying transaction
+            // operations, so we need to acquire the DB and Collection locks.
+            Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
+            auto databaseHolder = DatabaseHolder::get(opCtx);
+            auto db = databaseHolder->getDb(opCtx, nss.ns());
             if (!db) {
                 // Retry in non-atomic mode, since MMAP cannot implicitly create a new database
                 // within an active WriteUnitOfWork.
-                throw DBException(
-                    ErrorCodes::AtomicityFailure,
-                    "cannot create a database in atomic applyOps mode; will retry without "
-                    "atomicity");
+                uasserted(ErrorCodes::AtomicityFailure,
+                          "cannot create a database in atomic applyOps mode; will retry without "
+                          "atomicity");
             }
 
             // When processing an update on a non-existent collection, applyOperation_inlock()
@@ -151,9 +151,10 @@ Status _applyOps(OperationContext* opCtx,
             // implicitly created on upserts. We detect both cases here and fail early with
             // NamespaceNotFound.
             // Additionally for inserts, we fail early on non-existent collections.
+            Lock::CollectionLock collectionLock(opCtx->lockState(), nss.ns(), MODE_IX);
             auto collection = db->getCollection(opCtx, nss);
-            if (!collection && !nss.isSystemDotIndexes() && (*opType == 'i' || *opType == 'u')) {
-                throw DBException(
+            if (!collection && (*opType == 'i' || *opType == 'u')) {
+                uasserted(
                     ErrorCodes::AtomicityFailure,
                     str::stream()
                         << "cannot apply insert or update operation on a non-existent namespace "
@@ -162,88 +163,86 @@ Status _applyOps(OperationContext* opCtx,
                         << redact(opObj));
             }
 
-            // Cannot specify timestamp values in an atomic applyOps.
-            if (opObj.hasField("ts")) {
-                throw DBException(ErrorCodes::AtomicityFailure,
-                                  "cannot apply an op with a timestamp in atomic applyOps mode; "
-                                  "will retry without atomicity");
+            // Reject malformed operations in an atomic applyOps.
+            try {
+                ReplOperation::parse(IDLParserErrorContext("applyOps"), opObj);
+            } catch (...) {
+                uasserted(ErrorCodes::AtomicityFailure,
+                          str::stream()
+                              << "cannot apply a malformed operation in atomic applyOps mode: "
+                              << redact(opObj)
+                              << "; will retry without atomicity: "
+                              << exceptionToStatus().toString());
             }
 
             OldClientContext ctx(opCtx, nss.ns());
 
-            status = repl::applyOperation_inlock(opCtx, ctx.db(), opObj, alwaysUpsert);
+            status = repl::applyOperation_inlock(
+                opCtx, ctx.db(), opObj, alwaysUpsert, oplogApplicationMode);
             if (!status.isOK())
                 return status;
+
+            // Append completed op, including UUID if available, to 'opsBuilder'.
+            if (opsBuilder) {
+                if (opObj.hasField("ui") || !(collection && collection->uuid())) {
+                    // No changes needed to operation document.
+                    opsBuilder->append(opObj);
+                } else {
+                    // Operation document has no "ui" field and collection has a UUID.
+                    auto uuid = collection->uuid();
+                    BSONObjBuilder opBuilder;
+                    opBuilder.appendElements(opObj);
+                    uuid->appendToBuilder(&opBuilder, "ui");
+                    opsBuilder->append(opBuilder.obj());
+                }
+            }
         } else {
             try {
                 status = writeConflictRetry(
-                    opCtx, "applyOps", nss.ns(), [opCtx, nss, opObj, opType, alwaysUpsert] {
+                    opCtx,
+                    "applyOps",
+                    nss.ns(),
+                    [opCtx, nss, opObj, opType, alwaysUpsert, oplogApplicationMode] {
+                        BSONObjBuilder builder;
+                        builder.appendElements(opObj);
+                        if (!builder.hasField(OplogEntry::kTimestampFieldName)) {
+                            builder.append(OplogEntry::kTimestampFieldName, Timestamp());
+                        }
+                        if (!builder.hasField(OplogEntry::kHashFieldName)) {
+                            builder.append(OplogEntry::kHashFieldName, 0LL);
+                        }
+                        auto entryObj = builder.done();
+                        auto entry = uassertStatusOK(OplogEntry::parse(entryObj));
                         if (*opType == 'c') {
                             invariant(opCtx->lockState()->isW());
-                            return repl::applyCommand_inlock(opCtx, opObj, true);
+                            uassertStatusOK(repl::applyCommand_inlock(
+                                opCtx, opObj, entry, oplogApplicationMode));
+                            return Status::OK();
                         }
 
                         AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-                        if (!autoColl.getCollection() && !nss.isSystemDotIndexes()) {
+                        if (!autoColl.getCollection()) {
                             // For idempotency reasons, return success on delete operations.
                             if (*opType == 'd') {
                                 return Status::OK();
                             }
-                            throw DBException(ErrorCodes::NamespaceNotFound,
-                                              str::stream()
-                                                  << "cannot apply insert or update operation on a "
-                                                     "non-existent namespace "
-                                                  << nss.ns()
-                                                  << ": "
-                                                  << mongo::redact(opObj));
+                            uasserted(ErrorCodes::NamespaceNotFound,
+                                      str::stream()
+                                          << "cannot apply insert or update operation on a "
+                                             "non-existent namespace "
+                                          << nss.ns()
+                                          << ": "
+                                          << mongo::redact(opObj));
                         }
 
                         OldClientContext ctx(opCtx, nss.ns());
 
-                        if (!nss.isSystemDotIndexes()) {
-                            return repl::applyOperation_inlock(
-                                opCtx, ctx.db(), opObj, alwaysUpsert);
-                        }
-
-                        auto fieldO = opObj["o"];
-                        BSONObj indexSpec;
-                        NamespaceString indexNss;
-                        std::tie(indexSpec, indexNss) =
-                            repl::prepForApplyOpsIndexInsert(fieldO, opObj, nss);
-                        if (!indexSpec["collation"]) {
-                            // If the index spec does not include a collation, explicitly specify
-                            // the simple collation, so the index does not inherit the collection
-                            // default collation.
-                            auto indexVersion = indexSpec["v"];
-                            // The index version is populated by prepForApplyOpsIndexInsert().
-                            invariant(indexVersion);
-                            if (indexVersion.isNumber() &&
-                                (indexVersion.numberInt() >=
-                                 static_cast<int>(IndexDescriptor::IndexVersion::kV2))) {
-                                BSONObjBuilder bob;
-                                bob.append("collation", CollationSpec::kSimpleSpec);
-                                bob.appendElements(indexSpec);
-                                indexSpec = bob.obj();
-                            }
-                        }
-                        BSONObjBuilder command;
-                        command.append("createIndexes", indexNss.coll());
-                        {
-                            BSONArrayBuilder indexes(command.subarrayStart("indexes"));
-                            indexes.append(indexSpec);
-                            indexes.doneFast();
-                        }
-                        const BSONObj commandObj = command.done();
-
-                        DBDirectClient client(opCtx);
-                        BSONObj infoObj;
-                        client.runCommand(nss.db().toString(), commandObj, infoObj);
-
-                        // Uassert to stop applyOps only when building indexes, but not for CRUD
-                        // ops.
-                        uassertStatusOK(getStatusFromCommandResult(infoObj));
-
-                        return Status::OK();
+                        // We return the status rather than merely aborting so failure of CRUD
+                        // ops doesn't stop the applyOps from trying to process the rest of the
+                        // ops.  This is to leave the door open to parallelizing CRUD op
+                        // application in the future.
+                        return repl::applyOperation_inlock(
+                            opCtx, ctx.db(), opObj, alwaysUpsert, oplogApplicationMode);
                     });
             } catch (const DBException& ex) {
                 ab.append(false);
@@ -252,7 +251,7 @@ Status _applyOps(OperationContext* opCtx,
                 result->append("codeName", ErrorCodes::errorString(ex.code()));
                 result->append("errmsg", ex.what());
                 result->append("results", ab.arr());
-                return Status(ErrorCodes::UnknownError, ex.what());
+                return Status(ex.code(), ex.what());
             }
         }
 
@@ -265,15 +264,6 @@ Status _applyOps(OperationContext* opCtx,
         (*numApplied)++;
 
         if (MONGO_FAIL_POINT(applyOpsPauseBetweenOperations)) {
-            // While holding a database lock under MMAPv1, we would be implicitly holding the
-            // flush lock here. This would prevent other threads from acquiring the global
-            // lock or any database locks. We release all locks temporarily while the fail
-            // point is enabled to allow other threads to make progress.
-            boost::optional<Lock::TempRelease> release;
-            auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
-            if (storageEngine->isMmapV1() && !opCtx->lockState()->isW()) {
-                release.emplace(opCtx->lockState());
-            }
             MONGO_FAIL_POINT_PAUSE_WHILE_SET(applyOpsPauseBetweenOperations);
         }
     }
@@ -288,18 +278,84 @@ Status _applyOps(OperationContext* opCtx,
     return Status::OK();
 }
 
-bool _hasPrecondition(const BSONObj& applyOpCmd) {
-    return applyOpCmd[kPreconditionFieldName].type() == Array;
+Status _applyPrepareTransaction(OperationContext* opCtx,
+                                const repl::OplogEntry& entry,
+                                repl::OplogApplication::Mode oplogApplicationMode) {
+    const auto info = ApplyOpsCommandInfo::parse(entry.getObject());
+    invariant(info.getPrepare() && *info.getPrepare());
+    uassert(
+        50946,
+        "applyOps with prepared must only include CRUD operations and cannot have precondition.",
+        !info.getPreCondition() && info.areOpsCrudOnly());
+
+    // Transaction operations are in its own batch, so we can modify their opCtx.
+    invariant(entry.getSessionId());
+    invariant(entry.getTxnNumber());
+    opCtx->setLogicalSessionId(*entry.getSessionId());
+    opCtx->setTxnNumber(*entry.getTxnNumber());
+    // The write on transaction table may be applied concurrently, so refreshing state
+    // from disk may read that write, causing starting a new transaction on an existing
+    // txnNumber. Thus, we start a new transaction without refreshing state from disk.
+    MongoDOperationContextSessionWithoutRefresh sessionCheckout(opCtx);
+
+    auto transaction = TransactionParticipant::get(opCtx);
+    transaction->unstashTransactionResources(opCtx, "prepareTransaction");
+
+    // Apply the operations via applysOps functionality.
+    int numApplied = 0;
+    BSONObjBuilder resultWeDontCareAbout;
+    auto status = _applyOps(opCtx,
+                            entry.getNss().db().toString(),
+                            entry.getObject(),
+                            info,
+                            oplogApplicationMode,
+                            &resultWeDontCareAbout,
+                            &numApplied,
+                            nullptr);
+    if (!status.isOK()) {
+        return status;
+    }
+    invariant(!entry.getOpTime().isNull());
+    transaction->prepareTransaction(opCtx, entry.getOpTime());
+    transaction->stashTransactionResources(opCtx);
+    return Status::OK();
+}
+
+/**
+ * Make sure that if we are in replication recovery, we don't apply the prepare transaction oplog
+ * entry as part of recovery until the very end of recovery. Otherwise, only apply the prepare
+ * transaction oplog entry if we are a secondary.
+ */
+Status _applyPrepareTransactionOplogEntry(OperationContext* opCtx,
+                                          const repl::OplogEntry& entry,
+                                          repl::OplogApplication::Mode oplogApplicationMode) {
+    // Wait until the end of recovery to apply the operations from the prepared transaction.
+    if (oplogApplicationMode == OplogApplication::Mode::kRecovering) {
+        if (!serverGlobalParams.enableMajorityReadConcern) {
+            error() << "Cannot replay a prepared transaction when 'enableMajorityReadConcern' is "
+                       "set to false. Restart the server with --enableMajorityReadConcern=true "
+                       "to complete recovery.";
+        }
+        fassert(50964, serverGlobalParams.enableMajorityReadConcern);
+        return Status::OK();
+    }
+    // Return error if run via applyOps command.
+    uassert(50945,
+            "applyOps with prepared flag is only used internally by secondaries.",
+            oplogApplicationMode != repl::OplogApplication::Mode::kApplyOpsCmd);
+
+    // TODO: SERVER-36492 Only run on secondary until we support initial sync.
+    invariant(oplogApplicationMode == repl::OplogApplication::Mode::kSecondary);
+
+    return _applyPrepareTransaction(opCtx, entry, oplogApplicationMode);
 }
 
 Status _checkPrecondition(OperationContext* opCtx,
-                          const BSONObj& applyOpCmd,
+                          const std::vector<BSONObj>& preConditions,
                           BSONObjBuilder* result) {
     invariant(opCtx->lockState()->isW());
-    invariant(_hasPrecondition(applyOpCmd));
 
-    for (auto elem : applyOpCmd[kPreconditionFieldName].Obj()) {
-        auto preCondition = elem.Obj();
+    for (const auto& preCondition : preConditions) {
         if (preCondition["ns"].type() != BSONType::String) {
             return {ErrorCodes::InvalidNamespace,
                     str::stream() << "ns in preCondition must be a string, but found type: "
@@ -314,7 +370,8 @@ Status _checkPrecondition(OperationContext* opCtx,
         BSONObj realres = db.findOne(nss.ns(), preCondition["q"].Obj());
 
         // Get collection default collation.
-        Database* database = dbHolder().get(opCtx, nss.db());
+        auto databaseHolder = DatabaseHolder::get(opCtx);
+        auto database = databaseHolder->getDb(opCtx, nss.db());
         if (!database) {
             return {ErrorCodes::NamespaceNotFound, "database in ns does not exist: " + nss.ns()};
         }
@@ -339,55 +396,103 @@ Status _checkPrecondition(OperationContext* opCtx,
 }
 }  // namespace
 
+// static
+ApplyOpsCommandInfo ApplyOpsCommandInfo::parse(const BSONObj& applyOpCmd) {
+    try {
+        return ApplyOpsCommandInfo(applyOpCmd);
+    } catch (DBException& ex) {
+        ex.addContext(str::stream() << "Failed to parse applyOps command: " << redact(applyOpCmd));
+        throw;
+    }
+}
+
+bool ApplyOpsCommandInfo::areOpsCrudOnly() const {
+    return _areOpsCrudOnly;
+}
+
+bool ApplyOpsCommandInfo::isAtomic() const {
+    return getAllowAtomic() && areOpsCrudOnly();
+}
+
+ApplyOpsCommandInfo::ApplyOpsCommandInfo(const BSONObj& applyOpCmd)
+    : _areOpsCrudOnly(_parseAreOpsCrudOnly(applyOpCmd)) {
+    parseProtected(IDLParserErrorContext("applyOps"), applyOpCmd);
+
+    if (getPreCondition()) {
+        uassert(ErrorCodes::InvalidOptions,
+                "Cannot use preCondition with {allowAtomic: false}",
+                getAllowAtomic());
+        uassert(ErrorCodes::InvalidOptions,
+                "Cannot use preCondition when operations include commands.",
+                areOpsCrudOnly());
+    }
+}
+
+Status applyApplyOpsOplogEntry(OperationContext* opCtx,
+                               const OplogEntry& entry,
+                               repl::OplogApplication::Mode oplogApplicationMode) {
+    // Apply prepare transaction operation if "prepare" is true.
+    // The lock requirement of transaction operations should be the same as that on the primary,
+    // so we don't acquire the locks conservatively for them.
+    if (entry.shouldPrepare()) {
+        return _applyPrepareTransactionOplogEntry(opCtx, entry, oplogApplicationMode);
+    }
+    BSONObjBuilder resultWeDontCareAbout;
+    return applyOps(opCtx,
+                    entry.getNss().db().toString(),
+                    entry.getObject(),
+                    oplogApplicationMode,
+                    &resultWeDontCareAbout);
+}
+
+Status applyRecoveredPrepareTransaction(OperationContext* opCtx, const OplogEntry& entry) {
+    UnreplicatedWritesBlock uwb(opCtx);
+    return _applyPrepareTransaction(opCtx, entry, OplogApplication::Mode::kRecovering);
+}
+
 Status applyOps(OperationContext* opCtx,
                 const std::string& dbName,
                 const BSONObj& applyOpCmd,
+                repl::OplogApplication::Mode oplogApplicationMode,
                 BSONObjBuilder* result) {
-    bool allowAtomic = false;
-    uassertStatusOK(
-        bsonExtractBooleanFieldWithDefault(applyOpCmd, "allowAtomic", true, &allowAtomic));
-    auto areOpsCrudOnly = _areOpsCrudOnly(applyOpCmd);
-    auto isAtomic = allowAtomic && areOpsCrudOnly;
-    auto hasPrecondition = _hasPrecondition(applyOpCmd);
+    auto info = ApplyOpsCommandInfo::parse(applyOpCmd);
 
-    if (hasPrecondition) {
-        uassert(ErrorCodes::InvalidOptions,
-                "Cannot use preCondition with {allowAtomic: false}.",
-                allowAtomic);
-        uassert(ErrorCodes::InvalidOptions,
-                "Cannot use preCondition when operations include commands.",
-                areOpsCrudOnly);
-    }
+    int numApplied = 0;
 
     boost::optional<Lock::GlobalWrite> globalWriteLock;
     boost::optional<Lock::DBLock> dbWriteLock;
 
+    uassert(
+        ErrorCodes::BadValue, "applyOps command can't have 'prepare' field", !info.getPrepare());
+
     // There's only one case where we are allowed to take the database lock instead of the global
     // lock - no preconditions; only CRUD ops; and non-atomic mode.
-    if (!hasPrecondition && areOpsCrudOnly && !allowAtomic) {
+    if (!info.getPreCondition() && info.areOpsCrudOnly() && !info.getAllowAtomic()) {
         dbWriteLock.emplace(opCtx, dbName, MODE_IX);
     } else {
         globalWriteLock.emplace(opCtx);
     }
 
-    bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(opCtx, dbName);
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    bool userInitiatedWritesAndNotPrimary =
+        opCtx->writesAreReplicated() && !replCoord->canAcceptWritesForDatabase(opCtx, dbName);
 
     if (userInitiatedWritesAndNotPrimary)
         return Status(ErrorCodes::NotMaster,
                       str::stream() << "Not primary while applying ops to database " << dbName);
 
-    if (hasPrecondition) {
-        invariant(isAtomic);
-        auto status = _checkPrecondition(opCtx, applyOpCmd, result);
+    if (auto preCondition = info.getPreCondition()) {
+        invariant(info.isAtomic());
+        auto status = _checkPrecondition(opCtx, *preCondition, result);
         if (!status.isOK()) {
             return status;
         }
     }
 
-    int numApplied = 0;
-    if (!isAtomic)
-        return _applyOps(opCtx, dbName, applyOpCmd, result, &numApplied);
+    if (!info.isAtomic()) {
+        return _applyOps(
+            opCtx, dbName, applyOpCmd, info, oplogApplicationMode, result, &numApplied, nullptr);
+    }
 
     // Perform write ops atomically
     invariant(globalWriteLock);
@@ -395,13 +500,23 @@ Status applyOps(OperationContext* opCtx,
     try {
         writeConflictRetry(opCtx, "applyOps", dbName, [&] {
             BSONObjBuilder intermediateResult;
+            std::unique_ptr<BSONArrayBuilder> opsBuilder;
+            if (opCtx->writesAreReplicated()) {
+                opsBuilder = stdx::make_unique<BSONArrayBuilder>();
+            }
             WriteUnitOfWork wunit(opCtx);
             numApplied = 0;
             {
                 // Suppress replication for atomic operations until end of applyOps.
                 repl::UnreplicatedWritesBlock uwb(opCtx);
-                uassertStatusOK(
-                    _applyOps(opCtx, dbName, applyOpCmd, &intermediateResult, &numApplied));
+                uassertStatusOK(_applyOps(opCtx,
+                                          dbName,
+                                          applyOpCmd,
+                                          info,
+                                          oplogApplicationMode,
+                                          &intermediateResult,
+                                          &numApplied,
+                                          opsBuilder.get()));
             }
             // Generate oplog entry for all atomic ops collectively.
             if (opCtx->writesAreReplicated()) {
@@ -410,11 +525,16 @@ Status applyOps(OperationContext* opCtx,
 
                 BSONObjBuilder cmdBuilder;
 
+                auto opsFieldName = applyOpCmd.firstElement().fieldNameStringData();
                 for (auto elem : applyOpCmd) {
                     auto name = elem.fieldNameStringData();
-                    if (name == kPreconditionFieldName)
+                    if (name == opsFieldName && opsBuilder) {
+                        cmdBuilder.append(opsFieldName, opsBuilder->arr());
                         continue;
-                    if (name == "bypassDocumentValidation")
+                    }
+                    if (name == ApplyOps::kPreconditionFieldName)
+                        continue;
+                    if (name == bypassDocumentValidationCommandOption())
                         continue;
                     cmdBuilder.append(elem);
                 }
@@ -431,7 +551,14 @@ Status applyOps(OperationContext* opCtx,
     } catch (const DBException& ex) {
         if (ex.code() == ErrorCodes::AtomicityFailure) {
             // Retry in non-atomic mode.
-            return _applyOps(opCtx, dbName, applyOpCmd, result, &numApplied);
+            return _applyOps(opCtx,
+                             dbName,
+                             applyOpCmd,
+                             info,
+                             oplogApplicationMode,
+                             result,
+                             &numApplied,
+                             nullptr);
         }
         BSONArrayBuilder ab;
         ++numApplied;
@@ -442,10 +569,44 @@ Status applyOps(OperationContext* opCtx,
         result->append("codeName", ErrorCodes::errorString(ex.code()));
         result->append("errmsg", ex.what());
         result->append("results", ab.arr());
-        return Status(ErrorCodes::UnknownError, ex.what());
+        return ex.toStatus();
     }
 
     return Status::OK();
 }
 
+// static
+MultiApplier::Operations ApplyOps::extractOperations(const OplogEntry& applyOpsOplogEntry) {
+    uassert(ErrorCodes::TypeMismatch,
+            str::stream() << "ApplyOps::extractOperations(): not a command: "
+                          << redact(applyOpsOplogEntry.toBSON()),
+            applyOpsOplogEntry.isCommand());
+
+    uassert(ErrorCodes::CommandNotSupported,
+            str::stream() << "ApplyOps::extractOperations(): not applyOps command: "
+                          << redact(applyOpsOplogEntry.toBSON()),
+            OplogEntry::CommandType::kApplyOps == applyOpsOplogEntry.getCommandType());
+
+    auto cmdObj = applyOpsOplogEntry.getOperationToApply();
+    auto operationDocs = cmdObj.firstElement().Obj();
+
+    if (operationDocs.isEmpty()) {
+        return {};
+    }
+
+    MultiApplier::Operations operations;
+
+    auto topLevelDoc = applyOpsOplogEntry.toBSON();
+    for (const auto& elem : operationDocs) {
+        auto operationDoc = elem.Obj();
+        BSONObjBuilder builder(operationDoc);
+        builder.appendElementsUnique(topLevelDoc);
+        auto operation = builder.obj();
+        operations.emplace_back(operation);
+    }
+
+    return operations;
+}
+
+}  // namespace repl
 }  // namespace mongo

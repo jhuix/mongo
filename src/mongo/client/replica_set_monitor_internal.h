@@ -1,28 +1,31 @@
-/*    Copyright 2014 MongoDB Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 /**
@@ -137,12 +140,21 @@ public:
 
     typedef std::vector<Node> Nodes;
 
+    struct Waiter {
+        Date_t deadline;
+        ReadPreferenceSetting criteria;
+        Promise<HostAndPort> promise;
+    };
+
     /**
      * seedNodes must not be empty
      */
-    SetState(StringData name, const std::set<HostAndPort>& seedNodes);
+    SetState(StringData name,
+             const std::set<HostAndPort>& seedNodes,
+             executor::TaskExecutor* = nullptr,
+             MongoURI uri = {});
 
-    SetState(const MongoURI& uri);
+    SetState(const MongoURI& uri, executor::TaskExecutor* = nullptr);
 
     bool isUsable() const;
 
@@ -179,40 +191,48 @@ public:
     std::string getUnconfirmedServerAddress() const;
 
     /**
+     * Call this to notify waiters after a scan processes a valid reply or finishes.
+     */
+    void notify(bool finishedScan);
+
+    Date_t now() const {
+        return executor ? executor->now() : Date_t::now();
+    }
+
+    Status makeUnsatisfedReadPrefError(const ReadPreferenceSetting& criteria) const;
+
+    /**
      * Before unlocking, do DEV checkInvariants();
      */
     void checkInvariants() const;
 
     stdx::mutex mutex;  // must hold this to access any other member or method (except name).
 
-    // If Refresher::getNextStep returns WAIT, you should wait on the condition_variable,
-    // releasing mutex. It will be notified when either getNextStep will return something other
-    // than WAIT, or a new host is available for consideration by getMatchingHost. Essentially,
-    // this will be hit whenever the _refreshUntilMatches loop has the potential to make
-    // progress.
-    // TODO consider splitting cv into two: one for when looking for a master, one for all other
-    // cases.
-    stdx::condition_variable cv;
-
     const std::string name;  // safe to read outside lock since it is const
     int consecutiveFailedScans;
     std::set<HostAndPort> seedNodes;  // updated whenever a master reports set membership changes
+    bool isMocked = false;            // True if this set is using nodes from MockReplicaSet
     OID maxElectionId;                // largest election id observed by this ReplicaSetMonitor
     int configVersion{0};             // version number of the replica set config.
     HostAndPort lastSeenMaster;  // empty if we have never seen a master. can be same as current
     Nodes nodes;                 // maintained sorted and unique by host
     ScanStatePtr currentScan;    // NULL if no scan in progress
     int64_t latencyThresholdMicros;
-    mutable PseudoRandom rand;  // only used for host selection to balance load
-    mutable int roundRobin;     // used when useDeterministicHostSelection is true
-    MongoURI setUri;            // URI that may have constructed this
+    mutable PseudoRandom rand;   // only used for host selection to balance load
+    mutable int roundRobin;      // used when useDeterministicHostSelection is true
+    const MongoURI setUri;       // URI that may have constructed this
+    Seconds refreshPeriod;       // Normal refresh period when not expedited
+    bool isExpedited = false;    // True when we are doing more frequent refreshes due to waiters
+    stdx::list<Waiter> waiters;  // Everyone waiting for some ReadPreference to be satisfied
+
+    executor::TaskExecutor* const executor;
 };
 
 struct ReplicaSetMonitor::ScanState {
     MONGO_DISALLOW_COPYING(ScanState);
 
 public:
-    ScanState() : foundUpMaster(false), foundAnyUpNodes(false) {}
+    ScanState() = default;
 
     /**
      * Adds all hosts in container that aren't in triedHosts to hostsToScan, then shuffles the
@@ -221,9 +241,12 @@ public:
     template <typename Container>
     void enqueAllUntriedHosts(const Container& container, PseudoRandom& rand);
 
+    // This is only for logging and should not effect behavior otherwise.
+    Timer timer;
+
     // Access to fields is guarded by associated SetState's mutex.
-    bool foundUpMaster;
-    bool foundAnyUpNodes;
+    bool foundUpMaster = false;
+    bool foundAnyUpNodes = false;
     std::deque<HostAndPort> hostsToScan;  // Work queue.
     std::set<HostAndPort> possibleNodes;  // Nodes reported by non-primary hosts.
     std::set<HostAndPort> waitingFor;     // Hosts we have dispatched but haven't replied yet.

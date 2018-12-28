@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,158 +30,101 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
-
 #include "mongo/base/disallow_copying.h"
-#include "mongo/bson/timestamp.h"
 #include "mongo/db/logical_session_id.h"
-#include "mongo/db/repl/oplog_entry.h"
-#include "mongo/db/session_txn_record.h"
-#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 
 class OperationContext;
-class UpdateRequest;
 
 /**
- * A write through cache for the state of a particular session. All modifications to the underlying
- * session transactions collection must be performed through an object of this class.
- *
- * The cache state can be 'up-to-date' (it is in sync with the persistent contents) or 'needs
- * refresh' (in which case refreshFromStorageIfNeeded needs to be called in order to make it
- * up-to-date).
+ * A decorable container for state associated with an active session running on a MongoD or MongoS
+ * server. Refer to SessionCatalog for more information on the semantics of sessions.
  */
-class Session {
+class Session : public Decorable<Session> {
     MONGO_DISALLOW_COPYING(Session);
+
+    friend class SessionCatalog;
 
 public:
     explicit Session(LogicalSessionId sessionId);
 
+    /**
+     * The logical session id that this object represents.
+     */
     const LogicalSessionId& getSessionId() const {
         return _sessionId;
     }
 
     /**
-     * Blocking method, which loads the transaction state from storage if it has been marked as
-     * needing refresh.
-     *
-     * In order to avoid the possibility of deadlock, this method must not be called while holding a
-     * lock.
+     * Returns a pointer to the current operation running on this Session, or nullptr if there is no
+     * operation currently running on this Session.
      */
-    void refreshFromStorageIfNeeded(OperationContext* opCtx);
+    OperationContext* currentOperation() const;
 
     /**
-     * Starts a new transaction on the session, must be called after refreshFromStorageIfNeeded has
-     * been called. If an attempt is made to start a transaction with number less than the latest
-     * transaction this session has seen, an exception will be thrown.
+     * Increments the number of "killers" for this session and returns a 'kill token' to to be
+     * passed later on to 'checkOutSessionForKill' method of the SessionCatalog in order to permit
+     * the caller to execute any kill cleanup tasks. This token is later on passed to
+     * '_markNotKilled' in order to decrement the number of "killers".
      *
-     * Throws if the session has been invalidated or if an attempt is made to start a transaction
-     * older than the active.
+     * Marking session as killed is an internal property only that will cause any further calls to
+     * 'checkOutSession' to block until 'checkOutSessionForKill' is called the same number of times
+     * as 'kill' was called and the returned scoped object destroyed.
      *
-     * In order to avoid the possibility of deadlock, this method must not be called while holding a
-     * lock.
+     * If the first killer finds the session checked-out, this method will also interrupt the
+     * operation context which has it checked-out.
+     *
+     * Must be called under the owning SessionCatalog's lock.
      */
-    void beginTxn(OperationContext* opCtx, TxnNumber txnNumber);
+    struct KillToken {
+        KillToken(LogicalSessionId lsid) : lsidToKill(std::move(lsid)) {}
+        KillToken(KillToken&&) = default;
+        KillToken& operator=(KillToken&&) = default;
+
+        LogicalSessionId lsidToKill;
+    };
+    KillToken kill(WithLock sessionCatalogLock, ErrorCodes::Error reason = ErrorCodes::Interrupted);
 
     /**
-     * Called after a write under the specified transaction completes while the node is a primary
-     * and specifies the statement ids which were written. Must be called while the caller is still
-     * in the write's WUOW. Updates the on-disk state of the session to match the specified
-     * transaction/opTime and keeps the cached state in sync.
-     *
-     * Must only be called with the session checked-out.
-     *
-     * Throws if the session has been invalidated or the active transaction number doesn't match.
+     * Returns whether 'kill' has been called on this session.
      */
-    void onWriteOpCompletedOnPrimary(OperationContext* opCtx,
-                                     TxnNumber txnNumber,
-                                     std::vector<StmtId> stmtIdsWritten,
-                                     const repl::OpTime& lastStmtIdWriteOpTime);
-
-    /**
-     * Called after a replication batch has been applied on a secondary node. Keeps the session
-     * transaction entry in sync with the oplog chain which has been written.
-     *
-     * In order to avoid the possibility of deadlock, this method must not be called while holding a
-     * lock.
-     */
-    static void updateSessionRecordOnSecondary(OperationContext* opCtx,
-                                               const SessionTxnRecord& sessionTxnRecord);
-
-    /**
-     * Marks the session as requiring refresh. Used when the session state has been modified
-     * externally, such as through a direct write to the transactions table.
-     */
-    void invalidate();
-
-    /**
-     * Returns the op time of the last committed write for this session and transaction. If no write
-     * has completed yet, returns an empty timestamp.
-     *
-     * Throws if the session has been invalidated or the active transaction number doesn't match.
-     */
-    repl::OpTime getLastWriteOpTime(TxnNumber txnNumber) const;
-
-    /**
-     * Returns the oplog entry with the given statementId for the specified transaction, if it
-     * exists. If an actual oplog entry is returned, this means the specified write statement has
-     * already executed and shouldn't be performed again.
-     *
-     * Must only be called with the session checked-out.
-     *
-     * Throws if the session has been invalidated or the active transaction number doesn't match.
-     */
-    boost::optional<repl::OplogEntry> checkStatementExecuted(OperationContext* opCtx,
-                                                             TxnNumber txnNumber,
-                                                             StmtId stmtId) const;
+    bool killed() const;
 
 private:
-    void _beginTxn(WithLock, TxnNumber txnNumber);
+    /**
+     * Set/clear the current check-out state of the session by storing the operation which has this
+     * session currently checked-out.
+     *
+     * Must be called under the SessionCatalog mutex and internally will acquire the Session mutex.
+     */
+    void _markCheckedOut(WithLock sessionCatalogLock, OperationContext* checkoutOpCtx);
+    void _markCheckedIn(WithLock sessionCatalogLock);
 
-    void _checkValid(WithLock) const;
+    /**
+     * Used by the session catalog when checking a session back in after a call to 'kill'. See the
+     * comments for 'kill for more details.
+     */
+    void _markNotKilled(WithLock sessionCatalogLock, KillToken killToken);
 
-    void _checkIsActiveTransaction(WithLock, TxnNumber txnNumber) const;
-
-    boost::optional<repl::OpTime> _checkStatementExecuted(WithLock,
-                                                          TxnNumber txnNumber,
-                                                          StmtId stmtId) const;
-
-    UpdateRequest _makeUpdateRequest(WithLock,
-                                     TxnNumber newTxnNumber,
-                                     const repl::OpTime& newLastWriteTs) const;
-
-    void _registerUpdateCacheOnCommit(OperationContext* opCtx,
-                                      TxnNumber newTxnNumber,
-                                      std::vector<StmtId> stmtIdsWritten,
-                                      const repl::OpTime& lastStmtIdWriteTs);
-
+    // The id of the session with which this object is associated
     const LogicalSessionId _sessionId;
 
-    // Protects the member variables below.
+    // Protects the member variables below. The order of lock acquisition should always be:
+    //
+    // 1) SessionCatalog mutex (if applicable)
+    // 2) Session mutex
+    // 3) Any decoration mutexes and/or the currently running Client's lock
     mutable stdx::mutex _mutex;
 
-    // Specifies whether the session information needs to be refreshed from storage
-    bool _isValid{false};
+    // A pointer back to the currently running operation on this Session, or nullptr if there
+    // is no operation currently running for the Session.
+    OperationContext* _checkoutOpCtx{nullptr};
 
-    // Counter, incremented with each call to invalidate in order to discern invalidations, which
-    // happen during refresh
-    int _numInvalidations{0};
-
-    // Caches what is known to be the last written transaction record for the session
-    boost::optional<SessionTxnRecord> _lastWrittenSessionRecord;
-
-    // Tracks the last seen txn number for the session and is always >= to the transaction number in
-    // the last written txn record. When it is > than that in the last written txn record, this
-    // means a new transaction has begun on the session, but it hasn't yet performed any writes.
-    TxnNumber _activeTxnNumber{kUninitializedTxnNumber};
-
-    // For the active txn, tracks which statement ids have been committed and at which oplog
-    // opTime. Used for fast retryability check and retrieving the previous write's data without
-    // having to scan through the oplog.
-    using CommittedStatementTimestampMap = stdx::unordered_map<StmtId, repl::OpTime>;
-    CommittedStatementTimestampMap _activeTxnCommittedStatements;
+    // Incremented every time 'kill' is invoked and decremented by '_markNotKilled'.
+    int _killsRequested{0};
 };
 
 }  // namespace mongo

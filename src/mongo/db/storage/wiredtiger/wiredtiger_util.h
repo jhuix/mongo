@@ -1,25 +1,27 @@
 // wiredtiger_util.h
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -45,6 +47,8 @@ namespace mongo {
 class BSONObjBuilder;
 class OperationContext;
 class WiredTigerConfigParser;
+class WiredTigerKVEngine;
+class WiredTigerSession;
 
 inline bool wt_keeptxnopen() {
     return false;
@@ -90,6 +94,37 @@ struct WiredTigerItem : public WT_ITEM {
     }
 };
 
+/**
+ * Returns a WT_EVENT_HANDLER with MongoDB's default handlers.
+ * The default handlers just log so it is recommended that you consider calling them even if
+ * you are capturing the output.
+ *
+ * There is no default "close" handler. You only need to provide one if you need to call a
+ * destructor.
+ */
+class WiredTigerEventHandler : private WT_EVENT_HANDLER {
+public:
+    WiredTigerEventHandler();
+
+    WT_EVENT_HANDLER* getWtEventHandler();
+
+    bool wasStartupSuccessful() {
+        return _startupSuccessful;
+    }
+
+    void setStartupSuccessful() {
+        _startupSuccessful = true;
+    }
+
+private:
+    int suppressibleStartupErrorLog(WT_EVENT_HANDLER* handler,
+                                    WT_SESSION* sesion,
+                                    int errorCode,
+                                    const char* message);
+
+    bool _startupSuccessful = false;
+};
+
 class WiredTigerUtil {
     MONGO_DISALLOW_COPYING(WiredTigerUtil);
 
@@ -114,6 +149,37 @@ public:
                                     const std::string& uri,
                                     const std::string& config,
                                     BSONObjBuilder* bob);
+
+    /**
+     * Fetches the operation statistics, converts those into a BSONObj and resets the statistics
+     * at the end.
+     */
+    static Status exportOperationStatsInfoToBSON(WT_SESSION* s,
+                                                 const std::string& uri,
+                                                 const std::string& config,
+                                                 BSONObjBuilder* bob);
+    /**
+     * Appends information about the storage engine's currently available snapshots and the settings
+     * that affect that window of maintained history.
+     *
+     * "snapshot-window-settings" : {
+     *      "cache pressure percentage threshold" : <num>,
+     *      "current cache pressure percentage" : <num>,
+     *      "max target available snapshots window size in seconds" : <num>,
+     *      "target available snapshots window size in seconds" : <num>,
+     *      "current available snapshots window size in seconds" : <num>,
+     *      "latest majority snapshot timestamp available" : <num>,
+     *      "oldest majority snapshot timestamp available" : <num>
+     * }
+     */
+    static void appendSnapshotWindowSettings(WiredTigerKVEngine* engine,
+                                             WiredTigerSession* session,
+                                             BSONObjBuilder* bob);
+
+    /**
+     * Gets entire metadata string for collection/index at URI with the provided session.
+     */
+    static StatusWith<std::string> getMetadataRaw(WT_SESSION* session, StringData uri);
 
     /**
      * Gets entire metadata string for collection/index at URI.
@@ -182,16 +248,6 @@ public:
      * option chosen or the amount of available memory on the host.
      */
     static size_t getCacheSizeMB(double requestedCacheSizeGB);
-
-    /**
-     * Returns a WT_EVENT_HANDER with MongoDB's default handlers.
-     * The default handlers just log so it is recommended that you consider calling them even if
-     * you are capturing the output.
-     *
-     * There is no default "close" handler. You only need to provide one if you need to call a
-     * destructor.
-     */
-    static WT_EVENT_HANDLER defaultEventHandlers();
 
     class ErrorAccumulator : public WT_EVENT_HANDLER {
     public:

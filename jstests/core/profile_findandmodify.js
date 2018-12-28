@@ -1,4 +1,5 @@
 // Confirms that profiled findAndModify execution contains all expected metrics with proper values.
+// @tags: [requires_profiling]
 
 (function() {
     "use strict";

@@ -1,24 +1,26 @@
 // counters.h
-/*
- *    Copyright (C) 2010 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,8 +34,8 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/basic.h"
+#include "mongo/rpc/message.h"
 #include "mongo/util/concurrency/spin_lock.h"
-#include "mongo/util/net/message.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/with_alignment.h"
 
@@ -45,48 +47,64 @@ namespace mongo {
  */
 class OpCounters {
 public:
-    OpCounters();
-    void gotInserts(int n);
-    void gotInsert();
-    void gotQuery();
-    void gotUpdate();
-    void gotDelete();
-    void gotGetMore();
-    void gotCommand();
+    OpCounters() = default;
+
+    void gotInserts(int n) {
+        _checkWrap(&OpCounters::_insert, n);
+    }
+    void gotInsert() {
+        _checkWrap(&OpCounters::_insert, 1);
+    }
+    void gotQuery() {
+        _checkWrap(&OpCounters::_query, 1);
+    }
+    void gotUpdate() {
+        _checkWrap(&OpCounters::_update, 1);
+    }
+    void gotDelete() {
+        _checkWrap(&OpCounters::_delete, 1);
+    }
+    void gotGetMore() {
+        _checkWrap(&OpCounters::_getmore, 1);
+    }
+    void gotCommand() {
+        _checkWrap(&OpCounters::_command, 1);
+    }
 
     void gotOp(int op, bool isCommand);
 
     BSONObj getObj() const;
 
     // thse are used by snmp, and other things, do not remove
-    const AtomicUInt32* getInsert() const {
+    const AtomicInt64* getInsert() const {
         return &_insert;
     }
-    const AtomicUInt32* getQuery() const {
+    const AtomicInt64* getQuery() const {
         return &_query;
     }
-    const AtomicUInt32* getUpdate() const {
+    const AtomicInt64* getUpdate() const {
         return &_update;
     }
-    const AtomicUInt32* getDelete() const {
+    const AtomicInt64* getDelete() const {
         return &_delete;
     }
-    const AtomicUInt32* getGetMore() const {
+    const AtomicInt64* getGetMore() const {
         return &_getmore;
     }
-    const AtomicUInt32* getCommand() const {
+    const AtomicInt64* getCommand() const {
         return &_command;
     }
 
 private:
-    void _checkWrap();
+    // Increment member `counter` by `n`, resetting all counters if it was > 2^60.
+    void _checkWrap(CacheAligned<AtomicInt64> OpCounters::*counter, int n);
 
-    CacheAligned<AtomicUInt32> _insert;
-    CacheAligned<AtomicUInt32> _query;
-    CacheAligned<AtomicUInt32> _update;
-    CacheAligned<AtomicUInt32> _delete;
-    CacheAligned<AtomicUInt32> _getmore;
-    CacheAligned<AtomicUInt32> _command;
+    CacheAligned<AtomicInt64> _insert;
+    CacheAligned<AtomicInt64> _query;
+    CacheAligned<AtomicInt64> _update;
+    CacheAligned<AtomicInt64> _delete;
+    CacheAligned<AtomicInt64> _getmore;
+    CacheAligned<AtomicInt64> _command;
 };
 
 extern OpCounters globalOpCounters;

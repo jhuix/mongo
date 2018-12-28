@@ -1,29 +1,31 @@
+
 /**
- * Copyright 2016 (c) 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -45,8 +47,7 @@ using boost::intrusive_ptr;
 /**
  * This class implements the transformation logic for the $replaceRoot stage.
  */
-class ReplaceRootTransformation final
-    : public DocumentSourceSingleDocumentTransformation::TransformerInterface {
+class ReplaceRootTransformation final : public TransformerInterface {
 
 public:
     ReplaceRootTransformation(const boost::intrusive_ptr<ExpressionContext>& expCtx)
@@ -80,15 +81,16 @@ public:
         _newRoot->optimize();
     }
 
-    Document serializeStageOptions(boost::optional<ExplainOptions::Verbosity> explain) const final {
+    Document serializeTransformation(
+        boost::optional<ExplainOptions::Verbosity> explain) const final {
         return Document{{"newRoot", _newRoot->serialize(static_cast<bool>(explain))}};
     }
 
-    DocumentSource::GetDepsReturn addDependencies(DepsTracker* deps) const final {
+    DepsTracker::State addDependencies(DepsTracker* deps) const final {
         _newRoot->addDependencies(deps);
         // This stage will replace the entire document with a new document, so any existing fields
         // will be replaced and cannot be required as dependencies.
-        return DocumentSource::EXHAUSTIVE_FIELDS;
+        return DepsTracker::State::EXHAUSTIVE_FIELDS;
     }
 
     DocumentSource::GetModPathsReturn getModifiedPaths() const final {
@@ -148,8 +150,12 @@ REGISTER_DOCUMENT_SOURCE(replaceRoot,
 intrusive_ptr<DocumentSource> DocumentSourceReplaceRoot::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
 
+    const bool isIndependentOfAnyCollection = false;
     return new DocumentSourceSingleDocumentTransformation(
-        pExpCtx, ReplaceRootTransformation::create(pExpCtx, elem), "$replaceRoot");
+        pExpCtx,
+        ReplaceRootTransformation::create(pExpCtx, elem),
+        "$replaceRoot",
+        isIndependentOfAnyCollection);
 }
 
 }  // namespace mongo

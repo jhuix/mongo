@@ -17,18 +17,18 @@
 
     // Enable sharding.
     assert.commandWorked(db.adminCommand({enableSharding: db.getName()}));
-    st.ensurePrimaryShard(db.getName(), 'shard0001');
+    st.ensurePrimaryShard(db.getName(), st.shard1.shardName);
     db.adminCommand({shardCollection: collSharded.getFullName(), key: {a: 1}});
 
     // Pre-split the collection to ensure that both shards have chunks. Explicitly
     // move chunks since the balancer is disabled.
-    for (var i = 1; i <= 2; i++) {
-        assert.commandWorked(db.adminCommand({split: collSharded.getFullName(), middle: {a: i}}));
+    assert.commandWorked(db.adminCommand({split: collSharded.getFullName(), middle: {a: 1}}));
+    printjson(db.adminCommand(
+        {moveChunk: collSharded.getFullName(), find: {a: 1}, to: st.shard0.shardName}));
 
-        var shardName = "shard000" + (i - 1);
-        printjson(
-            db.adminCommand({moveChunk: collSharded.getFullName(), find: {a: i}, to: shardName}));
-    }
+    assert.commandWorked(db.adminCommand({split: collSharded.getFullName(), middle: {a: 2}}));
+    printjson(db.adminCommand(
+        {moveChunk: collSharded.getFullName(), find: {a: 2}, to: st.shard1.shardName}));
 
     // Put data on each shard.
     for (var i = 0; i < 3; i++) {
@@ -72,44 +72,6 @@
         collUnsharded.insert({_id: i, a: i, b: 1});
     }
     assert.eq(3, collUnsharded.count({b: 1}));
-
-    explain = db.runCommand({
-        explain: {
-            group: {
-                ns: collUnsharded.getName(),
-                key: "a",
-                cond: "b",
-                $reduce: function(curr, result) {},
-                initial: {}
-            }
-        },
-        verbosity: "allPlansExecution"
-    });
-
-    // Basic validation: a group command can only be passed through to an unsharded collection,
-    // so we should confirm that the mongos stage is always SINGLE_SHARD.
-    printjson(explain);
-    assert.commandWorked(explain);
-    assert("queryPlanner" in explain);
-    assert("executionStats" in explain);
-    assert.eq("SINGLE_SHARD", explain.queryPlanner.winningPlan.stage);
-
-    // The same group should fail over the sharded collection, because group is only supported
-    // if it is passed through to an unsharded collection.
-    explain = db.runCommand({
-        explain: {
-            group: {
-                ns: collSharded.getName(),
-                key: "a",
-                cond: "b",
-                $reduce: function(curr, result) {},
-                initial: {}
-            }
-        },
-        verbosity: "allPlansExecution"
-    });
-    printjson(explain);
-    assert.commandFailed(explain);
 
     // -------
 

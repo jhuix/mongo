@@ -10,6 +10,10 @@ load('jstests/multiVersion/libs/auth_helpers.js');
 
 (function() {
     "use strict";
+
+    // TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+    TestData.disableImplicitSessions = true;
+
     var replTest = new ReplSetTest(
         {name: 'UserManagementWCSet', nodes: 3, settings: {chainingAllowed: false}});
     replTest.startSet();
@@ -63,30 +67,6 @@ load('jstests/multiVersion/libs/auth_helpers.js');
     });
 
     commands.push({
-        req: {authSchemaUpgrade: 1},
-        setupFunc: function() {
-            adminDB.system.version.update(
-                {_id: "authSchema"}, {"currentVersion": 3}, {upsert: true});
-
-            db.createUser({user: 'user1', pwd: 'pass', roles: jsTest.basicUserRoles});
-            assert(db.auth({mechanism: 'MONGODB-CR', user: 'user1', pwd: 'pass'}));
-
-            db.createUser({user: 'user2', pwd: 'pass', roles: jsTest.basicUserRoles});
-            assert(db.auth({mechanism: 'MONGODB-CR', user: 'user2', pwd: 'pass'}));
-        },
-        confirmFunc: function() {
-            // All users should only have SCRAM credentials.
-            verifyUserDoc(db, 'user1', false, true);
-            verifyUserDoc(db, 'user2', false, true);
-
-            // After authSchemaUpgrade MONGODB-CR no longer works.
-            verifyAuth(db, 'user1', 'pass', false, true);
-            verifyAuth(db, 'user2', 'pass', false, true);
-        },
-        admin: true
-    });
-
-    commands.push({
         req: {
             _mergeAuthzCollections: 1,
             tempUsersCollection: 'admin.tempusers',
@@ -125,9 +105,8 @@ load('jstests/multiVersion/libs/auth_helpers.js');
     });
 
     function assertUserManagementWriteConcernError(res) {
-        assert(!res.ok);
-        assert(res.errmsg);
-        assert(res.code);
+        assert.commandFailed(res);
+        assert.commandWorkedIgnoringWriteConcernErrors(res);
         assertWriteConcernError(res);
     }
 
@@ -160,4 +139,5 @@ load('jstests/multiVersion/libs/auth_helpers.js');
         testInvalidWriteConcern(cmd);
     });
 
+    replTest.stopSet();
 })();

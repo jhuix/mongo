@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -42,10 +44,11 @@ namespace {
 
 const BSONField<bool> kNoBalance("noBalance");
 const BSONField<bool> kDropped("dropped");
+const auto kIsAssignedShardKey = "isAssignedShardKey"_sd;
 
 }  // namespace
 
-const std::string CollectionType::ConfigNS = "config.collections";
+const NamespaceString CollectionType::ConfigNS("config.collections");
 
 const BSONField<std::string> CollectionType::fullNs("_id");
 const BSONField<OID> CollectionType::epoch("lastmodEpoch");
@@ -110,7 +113,7 @@ StatusWith<CollectionType> CollectionType::fromBSON(const BSONObj& source) {
         } else if (status == ErrorCodes::NoSuchKey) {
             // Sharding key can only be missing if the collection is dropped
             if (!coll.getDropped()) {
-                return {status.code(),
+                return {ErrorCodes::NoSuchKey,
                         str::stream() << "Shard key for collection " << coll._fullNs->ns()
                                       << " is missing, but the collection is not marked as "
                                          "dropped. This is an indication of corrupted sharding "
@@ -173,6 +176,18 @@ StatusWith<CollectionType> CollectionType::fromBSON(const BSONObj& source) {
             coll._allowBalance = !collNoBalance;
         } else if (status == ErrorCodes::NoSuchKey) {
             // No balance can be missing in which case it is presumed as false
+        } else {
+            return status;
+        }
+    }
+
+    {
+        bool isAssignedShardKey;
+        Status status = bsonExtractBooleanField(source, kIsAssignedShardKey, &isAssignedShardKey);
+        if (status.isOK()) {
+            coll._isAssignedShardKey = isAssignedShardKey;
+        } else if (status == ErrorCodes::NoSuchKey) {
+            // isAssignedShardKey can be missing in which case it is presumed as true.
         } else {
             return status;
         }
@@ -249,6 +264,10 @@ BSONObj CollectionType::toBSON() const {
 
     if (_allowBalance.is_initialized()) {
         builder.append(kNoBalance.name(), !_allowBalance.get());
+    }
+
+    if (_isAssignedShardKey) {
+        builder.append(kIsAssignedShardKey, !_isAssignedShardKey.get());
     }
 
     return builder.obj();

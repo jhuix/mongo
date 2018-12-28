@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,6 +33,7 @@
 #include <set>
 
 #include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/drop_database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -39,6 +42,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/op_observer_noop.h"
+#include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
@@ -66,12 +70,14 @@ public:
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) override;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
-                                  OptionalCollectionUUID uuid) override;
+                                  OptionalCollectionUUID uuid,
+                                  CollectionDropType dropType) override;
 
     std::set<std::string> droppedDatabaseNames;
     std::set<NamespaceString> droppedCollectionNames;
     Database* db = nullptr;
     bool onDropCollectionThrowsException = false;
+    const repl::OpTime dropOpTime = {Timestamp(Seconds(100), 1U), 1LL};
 };
 
 void OpObserverMock::onDropDatabase(OperationContext* opCtx, const std::string& dbName) {
@@ -83,9 +89,11 @@ void OpObserverMock::onDropDatabase(OperationContext* opCtx, const std::string& 
 
 repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
                                               const NamespaceString& collectionName,
-                                              OptionalCollectionUUID uuid) {
+                                              OptionalCollectionUUID uuid,
+                                              const CollectionDropType dropType) {
     ASSERT_TRUE(opCtx->lockState()->inAWriteUnitOfWork());
-    auto opTime = OpObserverNoop::onDropCollection(opCtx, collectionName, uuid);
+    auto opTime = OpObserverNoop::onDropCollection(opCtx, collectionName, uuid, dropType);
+    invariant(opTime.isNull());
     // Do not update 'droppedCollectionNames' if OpObserverNoop::onDropCollection() throws.
     droppedCollectionNames.insert(collectionName);
 
@@ -97,7 +105,8 @@ repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
     uassert(
         ErrorCodes::OperationFailed, "onDropCollection() failed", !onDropCollectionThrowsException);
 
-    return opTime;
+    OpObserver::Times::get(opCtx).reservedOpTimes.push_back(dropOpTime);
+    return {};
 }
 
 class DropDatabaseTest : public ServiceContextMongoDTest {
@@ -136,16 +145,18 @@ void DropDatabaseTest::setUp() {
     auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(service);
     _replCoord = replCoord.get();
     repl::ReplicationCoordinator::set(service, std::move(replCoord));
-    repl::setOplogCollectionName();
+    repl::setOplogCollectionName(service);
     repl::createOplog(_opCtx.get());
 
     // Ensure that we are primary.
     ASSERT_OK(_replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
     // Use OpObserverMock to track notifications for collection and database drops.
-    auto opObserver = stdx::make_unique<OpObserverMock>();
-    _opObserver = opObserver.get();
-    service->setOpObserver(std::move(opObserver));
+    OpObserverRegistry* opObserverRegistry =
+        dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
+    auto mockObserver = stdx::make_unique<OpObserverMock>();
+    _opObserver = mockObserver.get();
+    opObserverRegistry->addObserver(std::move(mockObserver));
 
     _nss = NamespaceString("test.foo");
 }
@@ -187,8 +198,12 @@ void _removeDatabaseFromCatalog(OperationContext* opCtx, StringData dbName) {
     Lock::GlobalWrite lk(opCtx);
     AutoGetDb autoDB(opCtx, dbName, MODE_X);
     auto db = autoDB.getDb();
-    ASSERT_TRUE(db);
-    Database::dropDatabase(opCtx, db);
+    // dropDatabase can call awaitReplication more than once, so do not attempt to drop the database
+    // twice.
+    if (db) {
+        auto databaseHolder = DatabaseHolder::get(opCtx);
+        databaseHolder->dropDb(opCtx, db);
+    }
 }
 
 TEST_F(DropDatabaseTest, DropDatabaseReturnsNamespaceNotFoundIfDatabaseDoesNotExist) {
@@ -279,16 +294,6 @@ TEST_F(DropDatabaseTest, DropDatabasePassedThroughAwaitReplicationErrorForDropPe
     ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, dropDatabase(_opCtx.get(), _nss.db().toString()));
 }
 
-TEST_F(DropDatabaseTest, DropDatabaseSkipsSystemDotIndexesCollectionWhenDroppingCollections) {
-    NamespaceString systemDotIndexesNss(_nss.getSystemIndexesCollection());
-    _testDropDatabase(_opCtx.get(), _opObserver, systemDotIndexesNss, false);
-}
-
-TEST_F(DropDatabaseTest, DropDatabaseSkipsSystemNamespacesCollectionWhenDroppingCollections) {
-    NamespaceString systemNamespacesNss(_nss.getSisterNS("system.namespaces"));
-    _testDropDatabase(_opCtx.get(), _opObserver, systemNamespacesNss, false);
-}
-
 TEST_F(DropDatabaseTest, DropDatabaseSkipsSystemProfileCollectionWhenDroppingCollections) {
     repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
     NamespaceString profileNss(_nss.getSisterNS("system.profile"));
@@ -305,7 +310,7 @@ TEST_F(DropDatabaseTest, DropDatabaseResetsDropPendingStateOnException) {
     auto db = autoDb.getDb();
     ASSERT_TRUE(db);
 
-    ASSERT_THROWS_CODE_AND_WHAT(dropDatabase(_opCtx.get(), _nss.db().toString()).ignore(),
+    ASSERT_THROWS_CODE_AND_WHAT(dropDatabase(_opCtx.get(), _nss.db().toString()),
                                 AssertionException,
                                 ErrorCodes::OperationFailed,
                                 "onDropCollection() failed");
@@ -334,7 +339,7 @@ void _testDropDatabaseResetsDropPendingStateIfAwaitReplicationFails(OperationCon
 
 TEST_F(DropDatabaseTest,
        DropDatabaseResetsDropPendingStateIfAwaitReplicationFailsAndDatabaseIsPresent) {
-    // Update ReplicationCoordinatorMock so that awaitReplicationOfLastOpForClient() fails.
+    // Update ReplicationCoordinatorMock so that awaitReplication() fails.
     _replCoord->setAwaitReplicationReturnValueFunction([](const repl::OpTime&) {
         return repl::ReplicationCoordinator::StatusAndDuration(
             Status(ErrorCodes::WriteConcernFailed, ""), Milliseconds(0));
@@ -345,7 +350,7 @@ TEST_F(DropDatabaseTest,
 
 TEST_F(DropDatabaseTest,
        DropDatabaseResetsDropPendingStateIfAwaitReplicationFailsAndDatabaseIsMissing) {
-    // Update ReplicationCoordinatorMock so that awaitReplicationOfLastOpForClient() fails.
+    // Update ReplicationCoordinatorMock so that awaitReplication() fails.
     _replCoord->setAwaitReplicationReturnValueFunction([this](const repl::OpTime&) {
         _removeDatabaseFromCatalog(_opCtx.get(), _nss.db());
         return repl::ReplicationCoordinator::StatusAndDuration(
@@ -359,10 +364,11 @@ TEST_F(DropDatabaseTest,
        DropDatabaseReleasesLocksWhileCallingAwaitReplicationIfCalledWhileHoldingGlobalLock) {
     // The applyOps command holds the global lock while calling dropDatabase().
     // dropDatabase() should detect this and release the global lock temporarily if it needs to call
-    // ReplicationCoordinator::awaitReplicationOfLastOpForClient().
+    // ReplicationCoordinator::awaitReplication().
     bool isAwaitReplicationCalled = false;
     _replCoord->setAwaitReplicationReturnValueFunction([&, this](const repl::OpTime& opTime) {
         isAwaitReplicationCalled = true;
+        // This test does not set the client's last optime.
         ASSERT_EQUALS(opTime, repl::OpTime());
         ASSERT_FALSE(_opCtx->lockState()->isW());
         ASSERT_FALSE(_opCtx->lockState()->isDbLockedForMode(_nss.db(), MODE_X));
@@ -407,7 +413,7 @@ TEST_F(DropDatabaseTest,
 
 TEST_F(DropDatabaseTest,
        DropDatabaseReturnsNamespaceNotFoundIfDatabaseIsRemovedAfterCollectionsDropsAreReplicated) {
-    // Update ReplicationCoordinatorMock so that awaitReplicationOfLastOpForClient() fails.
+    // Update ReplicationCoordinatorMock so that awaitReplication() fails.
     _replCoord->setAwaitReplicationReturnValueFunction([this](const repl::OpTime&) {
         _removeDatabaseFromCatalog(_opCtx.get(), _nss.db());
         return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
@@ -419,11 +425,49 @@ TEST_F(DropDatabaseTest,
 
     auto status = dropDatabase(_opCtx.get(), _nss.db().toString());
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
-    ASSERT_EQUALS(status.reason(),
-                  str::stream() << "Could not drop database " << _nss.db()
-                                << " because it does not exist after dropping 1 collection(s).");
+    ASSERT_EQUALS(
+        status.reason(),
+        std::string(str::stream() << "Could not drop database " << _nss.db()
+                                  << " because it does not exist after dropping 1 collection(s)."));
 
     ASSERT_FALSE(AutoGetDb(_opCtx.get(), _nss.db(), MODE_X).getDb());
+}
+
+TEST_F(DropDatabaseTest,
+       DropDatabaseReturnsNotMasterIfNotPrimaryAfterCollectionsDropsAreReplicated) {
+    // Transition from PRIMARY to SECONDARY while awaiting replication of collection drops.
+    _replCoord->setAwaitReplicationReturnValueFunction([this](const repl::OpTime&) {
+        ASSERT_OK(_replCoord->setFollowerMode(repl::MemberState::RS_SECONDARY));
+        ASSERT_TRUE(_opCtx->writesAreReplicated());
+        ASSERT_FALSE(_replCoord->canAcceptWritesForDatabase(_opCtx.get(), _nss.db()));
+        return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
+    });
+
+    _createCollection(_opCtx.get(), _nss);
+
+    ASSERT_TRUE(AutoGetDb(_opCtx.get(), _nss.db(), MODE_X).getDb());
+
+    auto status = dropDatabase(_opCtx.get(), _nss.db().toString());
+    ASSERT_EQUALS(ErrorCodes::PrimarySteppedDown, status);
+    ASSERT_EQUALS(status.reason(),
+                  std::string(str::stream() << "Could not drop database " << _nss.db()
+                                            << " because we transitioned from PRIMARY to SECONDARY"
+                                            << " while waiting for 1 pending collection drop(s)."));
+
+    // Check drop-pending flag in Database after dropDatabase() fails.
+    AutoGetDb autoDb(_opCtx.get(), _nss.db(), MODE_X);
+    auto db = autoDb.getDb();
+    ASSERT_TRUE(db);
+    ASSERT_FALSE(db->isDropPending(_opCtx.get()));
+}
+
+TEST_F(DropDatabaseTest, DropDatabaseFailsToDropAdmin) {
+    NamespaceString adminNSS(NamespaceString::kAdminDb, "foo");
+    _createCollection(_opCtx.get(), adminNSS);
+    ASSERT_THROWS_CODE_AND_WHAT(dropDatabase(_opCtx.get(), adminNSS.db().toString()),
+                                AssertionException,
+                                ErrorCodes::IllegalOperation,
+                                "Dropping the 'admin' database is prohibited.");
 }
 
 }  // namespace

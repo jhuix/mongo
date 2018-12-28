@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -113,7 +115,15 @@ protected:
     /**
      * Returns how long the `find` command should wait before timing out.
      */
-    virtual Milliseconds _getFindMaxTime() const;
+    virtual Milliseconds _getInitialFindMaxTime() const;
+
+    /**
+     * Returns how long the `find` command should wait before timing out, if we are retrying the
+     * 'find' due to an error. This timeout should be considerably smaller than our initial oplog
+     * find time, since a communication failure with an upstream node may indicate it is
+     * unreachable.
+     */
+    virtual Milliseconds _getRetriedFindMaxTime() const;
 
     /**
      * Returns how long the `getMore` command should wait before timing out.
@@ -156,7 +166,8 @@ private:
      * it can begin its Fetcher from the middle of the oplog.
      */
     virtual BSONObj _makeFindCommandObject(const NamespaceString& nss,
-                                           OpTime lastOpTimeFetched) const = 0;
+                                           OpTime lastOpTimeFetched,
+                                           Milliseconds findMaxTime) const = 0;
 
     /**
      * This function must be overriden by subclass oplog fetchers to specify what metadata object
@@ -177,7 +188,8 @@ private:
      * This function creates a Fetcher with the given `find` command and metadata.
      */
     std::unique_ptr<Fetcher> _makeFetcher(const BSONObj& findCommandObj,
-                                          const BSONObj& metadataObj);
+                                          const BSONObj& metadataObj,
+                                          Milliseconds findTimeout);
     /**
      * Callback used to make a Fetcher, and then save and schedule it in a lock.
      */

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -95,12 +95,16 @@ struct __wt_btree {
 	uint32_t maxleafkey;		/* Leaf page max key size */
 	uint32_t maxleafvalue;		/* Leaf page max value size */
 	uint64_t maxmempage;		/* In-memory page max size */
+	uint32_t maxmempage_image;	/* In-memory page image max size */
 	uint64_t splitmempage;		/* In-memory split trigger size */
 
-#define	WT_ASSERT_COMMIT_TS_ALWAYS	0x0001
-#define	WT_ASSERT_COMMIT_TS_NEVER	0x0002
-#define	WT_ASSERT_READ_TS_ALWAYS	0x0004
-#define	WT_ASSERT_READ_TS_NEVER		0x0008
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_ASSERT_COMMIT_TS_ALWAYS	0x01u
+#define	WT_ASSERT_COMMIT_TS_KEYS	0x02u
+#define	WT_ASSERT_COMMIT_TS_NEVER	0x04u
+#define	WT_ASSERT_READ_TS_ALWAYS	0x08u
+#define	WT_ASSERT_READ_TS_NEVER		0x10u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 	uint32_t assert_flags;		/* Debugging assertion information */
 
 	void *huffman_key;		/* Key huffman encoding */
@@ -126,6 +130,16 @@ struct __wt_btree {
 	int   split_pct;		/* Split page percent */
 
 	WT_COMPRESSOR *compressor;	/* Page compressor */
+	/*
+	 * When doing compression, the pre-compression in-memory byte size is
+	 * optionally adjusted based on previous compression results.
+	 * It's an 8B value because it's updated without a lock.
+	 */
+	bool	 leafpage_compadjust;	/* Run-time compression adjustment */
+	uint64_t maxleafpage_precomp;	/* Leaf page pre-compression size */
+	bool	 intlpage_compadjust;	/* Run-time compression adjustment */
+	uint64_t maxintlpage_precomp;	/* Internal page pre-compression size */
+
 	WT_KEYED_ENCRYPTOR *kencryptor;	/* Page encryptor */
 
 	WT_RWLOCK ovfl_lock;		/* Overflow lock */
@@ -134,13 +148,13 @@ struct __wt_btree {
 	u_int	rec_multiblock_max;	/* Maximum blocks written for a page */
 
 	uint64_t last_recno;		/* Column-store last record number */
-	uint64_t las_pageid;		/* Lookaside table page ID counter */
 
 	WT_REF	root;			/* Root page reference */
 	bool	modified;		/* If the tree ever modified */
 	uint8_t	original;		/* Newly created: bulk-load possible
 					   (want a bool but needs atomic cas) */
 
+	bool lookaside_entries;		/* Has entries in the lookaside table */
 	bool lsm_primary;		/* Handle is/was the LSM primary */
 
 	WT_BM	*bm;			/* Block manager reference */
@@ -148,16 +162,36 @@ struct __wt_btree {
 
 	uint64_t write_gen;		/* Write generation */
 	uint64_t rec_max_txn;		/* Maximum txn seen (clean trees) */
-	WT_DECL_TIMESTAMP(rec_max_timestamp)
+	wt_timestamp_t rec_max_timestamp;
 
 	uint64_t checkpoint_gen;	/* Checkpoint generation */
+	WT_SESSION_IMPL *sync_session;	/* Syncing session */
 	volatile enum {
-		WT_CKPT_OFF, WT_CKPT_PREPARE, WT_CKPT_RUNNING
-	} checkpointing;		/* Checkpoint in progress */
+		WT_BTREE_SYNC_OFF, WT_BTREE_SYNC_WAIT, WT_BTREE_SYNC_RUNNING
+	} syncing;			/* Sync status */
 
-	uint64_t    bytes_inmem;	/* Cache bytes in memory. */
+	/*
+	 * Helper macros:
+	 * WT_BTREE_SYNCING indicates if a sync is active (either waiting to
+	 * start or already running), so no new operations should start that
+	 * would conflict with the sync.
+	 * WT_SESSION_BTREE_SYNC indicates if the session is performing a sync
+	 * on its current tree.
+	 * WT_SESSION_BTREE_SYNC_SAFE checks whether it is safe to perform an
+	 * operation that would conflict with a sync.
+	 */
+#define	WT_BTREE_SYNCING(btree)						\
+	((btree)->syncing != WT_BTREE_SYNC_OFF)
+#define	WT_SESSION_BTREE_SYNC(session)					\
+	(S2BT(session)->sync_session == (session))
+#define	WT_SESSION_BTREE_SYNC_SAFE(session, btree)			\
+	((btree)->syncing != WT_BTREE_SYNC_RUNNING ||			\
+	    (btree)->sync_session == (session))
+
+	uint64_t    bytes_inmem;        /* Cache bytes in memory. */
 	uint64_t    bytes_dirty_intl;	/* Bytes in dirty internal pages. */
 	uint64_t    bytes_dirty_leaf;	/* Bytes in dirty leaf pages. */
+	uint64_t    bytes_dirty_total;	/* Bytes ever dirtied in cache. */
 
 	/*
 	 * We flush pages from the tree (in order to make checkpoint faster),
@@ -178,6 +212,8 @@ struct __wt_btree {
 	 */
 	WT_REF	   *evict_ref;		/* Eviction thread's location */
 	uint64_t    evict_priority;	/* Relative priority of cached pages */
+	uint32_t    evict_walk_progress;/* Eviction walk progress */
+	uint32_t    evict_walk_target;  /* Eviction walk target */
 	u_int	    evict_walk_period;	/* Skip this many LRU walks */
 	u_int	    evict_walk_saved;	/* Saved walk skips for checkpoints */
 	u_int	    evict_walk_skips;	/* Number of walks skipped */
@@ -192,21 +228,24 @@ struct __wt_btree {
 	} evict_start_type;
 
 	/*
-	 * Flag values up to 0xff are reserved for WT_DHANDLE_XXX.
+	 * Flag values up to 0xff are reserved for WT_DHANDLE_XXX. We don't
+	 * automatically generate these flag values for that reason, there's
+	 * no way to start at an offset.
 	 */
-#define	WT_BTREE_ALTER		0x000100 /* Handle is for alter */
-#define	WT_BTREE_BULK		0x000200 /* Bulk-load handle */
-#define	WT_BTREE_CLOSED		0x000400 /* Handle closed */
-#define	WT_BTREE_IGNORE_CACHE	0x000800 /* Cache-resident object */
-#define	WT_BTREE_IN_MEMORY	0x001000 /* Cache-resident object */
-#define	WT_BTREE_LOOKASIDE	0x002000 /* Look-aside table */
-#define	WT_BTREE_NO_CHECKPOINT	0x004000 /* Disable checkpoints */
-#define	WT_BTREE_NO_LOGGING	0x008000 /* Disable logging */
-#define	WT_BTREE_REBALANCE	0x010000 /* Handle is for rebalance */
-#define	WT_BTREE_SALVAGE	0x020000 /* Handle is for salvage */
-#define	WT_BTREE_SKIP_CKPT	0x040000 /* Handle skipped checkpoint */
-#define	WT_BTREE_UPGRADE	0x080000 /* Handle is for upgrade */
-#define	WT_BTREE_VERIFY		0x100000 /* Handle is for verify */
+#define	WT_BTREE_ALTER		0x000100u	/* Handle is for alter */
+#define	WT_BTREE_BULK		0x000200u	/* Bulk-load handle */
+#define	WT_BTREE_CLOSED		0x000400u	/* Handle closed */
+#define	WT_BTREE_IGNORE_CACHE	0x000800u	/* Cache-resident object */
+#define	WT_BTREE_IN_MEMORY	0x001000u	/* Cache-resident object */
+#define	WT_BTREE_LOOKASIDE	0x002000u	/* Look-aside table */
+#define	WT_BTREE_NO_CHECKPOINT	0x004000u	/* Disable checkpoints */
+#define	WT_BTREE_NO_LOGGING	0x008000u	/* Disable logging */
+#define	WT_BTREE_READONLY	0x010000u	/* Handle is readonly */
+#define	WT_BTREE_REBALANCE	0x020000u	/* Handle is for rebalance */
+#define	WT_BTREE_SALVAGE	0x040000u	/* Handle is for salvage */
+#define	WT_BTREE_SKIP_CKPT	0x080000u	/* Handle skipped checkpoint */
+#define	WT_BTREE_UPGRADE	0x100000u	/* Handle is for upgrade */
+#define	WT_BTREE_VERIFY		0x200000u	/* Handle is for verify */
 	uint32_t flags;
 };
 

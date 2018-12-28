@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,28 +34,29 @@
 
 #include "mongo/s/query/establish_cursors.h"
 
+#include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/cursor_id.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/killcursors_request.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
-#include "mongo/s/async_requests_sender.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/multi_statement_transaction_requests_sender.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-StatusWith<std::vector<ClusterClientCursorParams::RemoteCursor>> establishCursors(
-    OperationContext* opCtx,
-    executor::TaskExecutor* executor,
-    const NamespaceString& nss,
-    const ReadPreferenceSetting readPref,
-    const std::vector<std::pair<ShardId, BSONObj>>& remotes,
-    bool allowPartialResults,
-    BSONObj* viewDefinition) {
+std::vector<RemoteCursor> establishCursors(OperationContext* opCtx,
+                                           executor::TaskExecutor* executor,
+                                           const NamespaceString& nss,
+                                           const ReadPreferenceSetting readPref,
+                                           const std::vector<std::pair<ShardId, BSONObj>>& remotes,
+                                           bool allowPartialResults,
+                                           Shard::RetryPolicy retryPolicy) {
     // Construct the requests
     std::vector<AsyncRequestsSender::Request> requests;
     for (const auto& remote : remotes) {
@@ -61,111 +64,108 @@ StatusWith<std::vector<ClusterClientCursorParams::RemoteCursor>> establishCursor
     }
 
     // Send the requests
-    AsyncRequestsSender ars(opCtx,
-                            executor,
-                            nss.db().toString(),
-                            std::move(requests),
-                            readPref,
-                            Shard::RetryPolicy::kIdempotent);
+    MultiStatementTransactionRequestsSender ars(
+        opCtx, executor, nss.db().toString(), std::move(requests), readPref, retryPolicy);
 
-    // Get the responses
-    std::vector<ClusterClientCursorParams::RemoteCursor> remoteCursors;
-    Status status = Status::OK();
-    while (!ars.done()) {
-        auto response = ars.next();
-
-        StatusWith<CursorResponse> swCursorResponse(
-            response.swResponse.isOK()
-                ? CursorResponse::parseFromBSON(response.swResponse.getValue().data)
-                : response.swResponse.getStatus());
-
-        if (swCursorResponse.isOK()) {
-            remoteCursors.emplace_back(std::move(response.shardId),
-                                       std::move(*response.shardHostAndPort),
-                                       std::move(swCursorResponse.getValue()));
-            continue;
-        }
-
-        // In the case a read is performed against a view, the shard primary can return an error
-        // indicating that the underlying collection may be sharded. When this occurs the return
-        // message will include an expanded view definition and collection namespace which we
-        // need to store. This allows for a second attempt at the read directly against the
-        // underlying collection.
-        if (swCursorResponse.getStatus() == ErrorCodes::CommandOnShardedViewNotSupportedOnMongod) {
-            auto& responseObj = response.swResponse.getValue().data;
-            if (!responseObj.hasField("resolvedView")) {
-                status = Status(ErrorCodes::InternalError,
-                                str::stream() << "Missing field 'resolvedView' in document: "
-                                              << responseObj);
-                break;
-            }
-
-            auto resolvedViewObj = responseObj.getObjectField("resolvedView");
-            if (resolvedViewObj.isEmpty()) {
-                status = Status(ErrorCodes::InternalError,
-                                str::stream() << "Field 'resolvedView' must be an object: "
-                                              << responseObj);
-                break;
-            }
-
-            status = std::move(swCursorResponse.getStatus());
-            if (viewDefinition) {
-                *viewDefinition = BSON("resolvedView" << resolvedViewObj.getOwned());
-            }
-            break;
-        }
-
-        // Unreachable host errors are swallowed if the 'allowPartialResults' option is set.
-        if (allowPartialResults) {
-            continue;
-        }
-        status = std::move(swCursorResponse.getStatus());
-        break;
-    }
-
-    // If one of the remotes had an error, we make a best effort to finish retrieving responses for
-    // other requests that were already sent, so that we can send killCursors to any cursors that we
-    // know were established.
-    if (!status.isOK()) {
-        // Do not schedule any new requests.
-        ars.stopRetrying();
-
-        // Collect responses from all requests that were already sent.
+    std::vector<RemoteCursor> remoteCursors;
+    try {
+        // Get the responses
         while (!ars.done()) {
-            auto response = ars.next();
+            try {
+                auto response = ars.next();
+                // Note the shardHostAndPort may not be populated if there was an error, so be sure
+                // to do this after parsing the cursor response to ensure the response was ok.
+                // Additionally, be careful not to push into 'remoteCursors' until we are sure we
+                // have a valid cursor, since the error handling path will attempt to clean up
+                // anything in 'remoteCursors'
+                auto cursors = CursorResponse::parseFromBSONMany(
+                    uassertStatusOK(std::move(response.swResponse)).data);
 
-            // Check if the response contains an established cursor, and if so, store it.
-            StatusWith<CursorResponse> swCursorResponse(
-                response.swResponse.isOK()
-                    ? CursorResponse::parseFromBSON(response.swResponse.getValue().data)
-                    : response.swResponse.getStatus());
+                for (auto& cursor : cursors) {
+                    if (cursor.isOK()) {
+                        RemoteCursor remoteCursor;
+                        remoteCursor.setCursorResponse(std::move(cursor.getValue()));
+                        remoteCursor.setShardId(std::move(response.shardId));
+                        remoteCursor.setHostAndPort(*response.shardHostAndPort);
+                        remoteCursors.push_back(std::move(remoteCursor));
+                    }
+                }
 
-            if (swCursorResponse.isOK()) {
-                remoteCursors.emplace_back(std::move(response.shardId),
-                                           *response.shardHostAndPort,
-                                           std::move(swCursorResponse.getValue()));
+                // Throw if there is any error and then the catch block below will do the cleanup.
+                for (auto& cursor : cursors) {
+                    uassertStatusOK(cursor.getStatus());
+                }
+
+            } catch (const DBException& ex) {
+                // Retriable errors are swallowed if 'allowPartialResults' is true.
+                if (allowPartialResults &&
+                    std::find(RemoteCommandRetryScheduler::kAllRetriableErrors.begin(),
+                              RemoteCommandRetryScheduler::kAllRetriableErrors.end(),
+                              ex.code()) !=
+                        RemoteCommandRetryScheduler::kAllRetriableErrors.end()) {
+                    continue;
+                }
+                throw;  // Fail this loop.
             }
         }
+        return remoteCursors;
+    } catch (const DBException&) {
+        // If one of the remotes had an error, we make a best effort to finish retrieving responses
+        // for other requests that were already sent, so that we can send killCursors to any cursors
+        // that we know were established.
+        try {
+            // Do not schedule any new requests.
+            ars.stopRetrying();
 
-        // Schedule killCursors against all cursors that were established.
-        for (const auto& remoteCursor : remoteCursors) {
-            BSONObj cmdObj =
-                KillCursorsRequest(nss, {remoteCursor.cursorResponse.getCursorId()}).toBSON();
-            executor::RemoteCommandRequest request(
-                remoteCursor.hostAndPort, nss.db().toString(), cmdObj, opCtx);
+            // Collect responses from all requests that were already sent.
+            while (!ars.done()) {
+                auto response = ars.next();
 
-            // We do not process the response to the killCursors request (we make a good-faith
-            // attempt at cleaning up the cursors, but ignore any returned errors).
-            executor
-                ->scheduleRemoteCommand(
-                    request, [](const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {})
-                .status_with_transitional_ignore();
+                // Check if the response contains an established cursor, and if so, store it.
+                StatusWith<CursorResponse> swCursorResponse(
+                    response.swResponse.isOK()
+                        ? CursorResponse::parseFromBSON(response.swResponse.getValue().data)
+                        : response.swResponse.getStatus());
+
+                if (swCursorResponse.isOK()) {
+                    RemoteCursor cursor;
+                    cursor.setShardId(std::move(response.shardId));
+                    cursor.setHostAndPort(*response.shardHostAndPort);
+                    cursor.setCursorResponse(std::move(swCursorResponse.getValue()));
+                    remoteCursors.push_back(std::move(cursor));
+                }
+            }
+
+            // Schedule killCursors against all cursors that were established.
+            killRemoteCursors(opCtx, executor, std::move(remoteCursors), nss);
+        } catch (const DBException&) {
+            // Ignore the new error and rethrow the original one.
         }
 
-        return status;
+        throw;
     }
+}
 
-    return std::move(remoteCursors);
+void killRemoteCursors(OperationContext* opCtx,
+                       executor::TaskExecutor* executor,
+                       std::vector<RemoteCursor>&& remoteCursors,
+                       const NamespaceString& nss) {
+    for (auto&& remoteCursor : remoteCursors) {
+        killRemoteCursor(opCtx, executor, std::move(remoteCursor), nss);
+    }
+}
+
+void killRemoteCursor(OperationContext* opCtx,
+                      executor::TaskExecutor* executor,
+                      RemoteCursor&& cursor,
+                      const NamespaceString& nss) {
+    BSONObj cmdObj = KillCursorsRequest(nss, {cursor.getCursorResponse().getCursorId()}).toBSON();
+    executor::RemoteCommandRequest request(
+        cursor.getHostAndPort(), nss.db().toString(), cmdObj, opCtx);
+
+    // We do not process the response to the killCursors request (we make a good-faith
+    // attempt at cleaning up the cursors, but ignore any returned errors).
+    executor->scheduleRemoteCommand(request, [](auto const&) {}).getStatus().ignore();
 }
 
 }  // namespace mongo

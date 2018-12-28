@@ -1,3 +1,5 @@
+// @tags: [does_not_support_stepdowns]
+
 /** Demonstrate that mapReduce can accept functions represented by strings.
  * Some drivers do not have a type which represents a Javascript function. These languages represent
  * the arguments to mapReduce as strings.
@@ -32,7 +34,6 @@
     whereFunction += ";";
     assert.eq(1, col.find({$where: whereFunction}).itcount());
 
-    // db.eval does not need to be tested, as it accepts code fragments, not functions.
     // system.js does not need to be tested, as its contents types' are preserved, and
     // strings are not promoted into functions.
 })();

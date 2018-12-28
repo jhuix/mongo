@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -250,8 +250,6 @@ cursor_ops(WT_SESSION *session)
 	error_check(cursor->equals(cursor, other, &equal));
 	if (equal) {
 		/* Cursors reference the same key */
-	} else {
-		/* Cursors don't reference the same key */
 	}
 	/*! [Cursor equality] */
 	}
@@ -333,6 +331,8 @@ cursor_ops(WT_SESSION *session)
 	error_check(cursor->insert(cursor));
 	}
 
+	/* Modify requires an explicit transaction. */
+	error_check(session->begin_transaction(session, NULL));
 	{
 	/*! [Modify an existing record] */
 	WT_MODIFY entries[3];
@@ -363,6 +363,7 @@ cursor_ops(WT_SESSION *session)
 	error_check(cursor->modify(cursor, entries, 3));
 	/*! [Modify an existing record] */
 	}
+	error_check(session->commit_transaction(session, NULL));
 
 	{
 	/*! [Update an existing record or insert a new record] */
@@ -577,6 +578,11 @@ cursor_statistics(WT_SESSION *session)
 	    "statistics:table:mytable",
 	    NULL, "statistics=(all,clear)", &cursor));
 	/*! [Statistics cursor clear configuration] */
+
+	/*! [Statistics cursor session] */
+	error_check(session->open_cursor(
+	    session, "statistics:session", NULL, NULL, &cursor));
+	/*! [Statistics cursor session] */
 }
 
 static void
@@ -900,6 +906,25 @@ transaction_ops(WT_SESSION *session_arg)
 	error_check(session->commit_transaction(session, NULL));
 	/*! [transaction isolation] */
 
+	{
+	/*! [transaction prepare] */
+	/*
+	 * Prepare a transaction which guarantees a subsequent commit will
+	 * succeed. Only commit and rollback are allowed on a transaction after
+	 * it has been prepared.
+	 */
+	error_check(session->open_cursor(
+	    session, "table:mytable", NULL, NULL, &cursor));
+	error_check(session->begin_transaction(session, NULL));
+	cursor->set_key(cursor, "key");
+	cursor->set_value(cursor, "value");
+	error_check(session->prepare_transaction(
+	    session, "prepare_timestamp=2a"));
+	error_check(session->commit_transaction(
+	    session, "commit_timestamp=2b"));
+	/*! [transaction prepare] */
+	}
+
 	/*! [session isolation configuration] */
 	/* Open a session configured for read-uncommitted isolation. */
 	error_check(conn->open_session(
@@ -925,10 +950,9 @@ transaction_ops(WT_SESSION *session_arg)
 
 	error_check(session->begin_transaction(session, NULL));
 
-#ifdef HAVE_TIMESTAMPS
 	{
 	/*! [query timestamp] */
-	char timestamp_buf[2 * WT_TIMESTAMP_SIZE + 1];
+	char timestamp_buf[2 * sizeof(uint64_t) + 1];
 
 	/*! [transaction timestamp] */
 	error_check(
@@ -957,7 +981,6 @@ transaction_ops(WT_SESSION *session_arg)
 	/*! [rollback to stable] */
 	error_check(conn->rollback_to_stable(conn, NULL));
 	/*! [rollback to stable] */
-#endif
 }
 
 /*! [Implement WT_COLLATOR] */
@@ -1331,6 +1354,37 @@ main(int argc, char *argv[])
 	printf("WiredTiger version is %d, %d (patch %d)\n",
 	    major_v, minor_v, patch);
 	/*! [Get the WiredTiger library version #2] */
+	}
+
+	{
+	/*! [Calculate a modify operation] */
+	WT_MODIFY mod[3];
+	int nmod = 3;
+	WT_ITEM prev, newv;
+	prev.data = "the quick brown fox jumped over the lazy dog. " \
+		"THE QUICK BROWN FOX JUMPED OVER THE LAZY DOG. " \
+		"the quick brown fox jumped over the lazy dog. " \
+		"THE QUICK BROWN FOX JUMPED OVER THE LAZY DOG. ";
+	prev.size = strlen(prev.data);
+	newv.data = "A quick brown fox jumped over the lazy dog. " \
+		"THE QUICK BROWN FOX JUMPED OVER THE LAZY DOG. " \
+		"then a quick brown fox jumped over the lazy dog. " \
+		"THE QUICK BROWN FOX JUMPED OVER THE LAZY DOG. " \
+		"then what?";
+	newv.size = strlen(newv.data);
+	error_check(wiredtiger_calc_modify(NULL, &prev, &newv, 20, mod, &nmod));
+	/*! [Calculate a modify operation] */
+	}
+
+	{
+	const char *buffer = "some string";
+	size_t len = strlen(buffer);
+	/*! [Checksum a buffer] */
+	uint32_t crc32c, (*func)(const void *, size_t);
+	func = wiredtiger_crc32c_func();
+	crc32c = func(buffer, len);
+	/*! [Checksum a buffer] */
+	(void)crc32c;
 	}
 
 	return (EXIT_SUCCESS);

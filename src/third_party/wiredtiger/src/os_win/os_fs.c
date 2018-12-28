@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -41,10 +41,10 @@ static int
 __win_fs_remove(WT_FILE_SYSTEM *file_system,
     WT_SESSION *wt_session, const char *name, uint32_t flags)
 {
-	DWORD windows_error;
 	WT_DECL_ITEM(name_wide);
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
+	DWORD windows_error;
 
 	WT_UNUSED(file_system);
 	WT_UNUSED(flags);
@@ -74,11 +74,11 @@ static int
 __win_fs_rename(WT_FILE_SYSTEM *file_system,
     WT_SESSION *wt_session, const char *from, const char *to, uint32_t flags)
 {
-	DWORD windows_error;
 	WT_DECL_ITEM(from_wide);
 	WT_DECL_ITEM(to_wide);
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
+	DWORD windows_error;
 
 	WT_UNUSED(file_system);
 	WT_UNUSED(flags);
@@ -153,10 +153,10 @@ err:	__wt_scr_free(session, &name_wide);
 static int
 __win_file_close(WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session)
 {
-	DWORD windows_error;
 	WT_DECL_RET;
 	WT_FILE_HANDLE_WIN *win_fh;
 	WT_SESSION_IMPL *session;
+	DWORD windows_error;
 
 	win_fh = (WT_FILE_HANDLE_WIN *)file_handle;
 	session = (WT_SESSION_IMPL *)wt_session;
@@ -201,10 +201,10 @@ static int
 __win_file_lock(
     WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session, bool lock)
 {
-	DWORD windows_error;
 	WT_DECL_RET;
 	WT_FILE_HANDLE_WIN *win_fh;
 	WT_SESSION_IMPL *session;
+	DWORD windows_error;
 
 	win_fh = (WT_FILE_HANDLE_WIN *)file_handle;
 	session = (WT_SESSION_IMPL *)wt_session;
@@ -279,6 +279,8 @@ __win_file_read(WT_FILE_HANDLE *file_handle,
 		    win_fh->filehandle, addr, chunk, &nr, &overlapped)) {
 			windows_error = __wt_getlasterror();
 			ret = __wt_map_windows_error(windows_error);
+			if (ret == WT_ERROR)
+				F_SET(S2C(session), WT_CONN_DATA_CORRUPTION);
 			__wt_err(session, ret,
 			    "%s: handle-read: ReadFile: failed to read %lu "
 			    "bytes at offset %" PRIuMAX ": %s",
@@ -327,10 +329,10 @@ __win_file_size(
 static int
 __win_file_sync(WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session)
 {
-	DWORD windows_error;
 	WT_DECL_RET;
 	WT_FILE_HANDLE_WIN *win_fh;
 	WT_SESSION_IMPL *session;
+	DWORD windows_error;
 
 	win_fh = (WT_FILE_HANDLE_WIN *)file_handle;
 	session = (WT_SESSION_IMPL *)wt_session;
@@ -393,7 +395,7 @@ __win_file_set_end(
 
 	if (SetEndOfFile(win_fh->filehandle_secondary) == FALSE) {
 		if (GetLastError() == ERROR_USER_MAPPED_FILE)
-			return (EBUSY);
+			return (__wt_set_return(session, EBUSY));
 		windows_error = __wt_getlasterror();
 		ret = __wt_map_windows_error(windows_error);
 		__wt_err(session, ret,
@@ -464,13 +466,13 @@ __win_open_file(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session,
     const char *name, WT_FS_OPEN_FILE_TYPE file_type, uint32_t flags,
     WT_FILE_HANDLE **file_handlep)
 {
-	DWORD dwCreationDisposition, windows_error;
 	WT_CONNECTION_IMPL *conn;
 	WT_DECL_ITEM(name_wide);
 	WT_DECL_RET;
 	WT_FILE_HANDLE *file_handle;
 	WT_FILE_HANDLE_WIN *win_fh;
 	WT_SESSION_IMPL *session;
+	DWORD dwCreationDisposition, windows_error;
 	int desired_access, f;
 
 	WT_UNUSED(file_system);
@@ -651,6 +653,7 @@ __wt_os_win(WT_SESSION_IMPL *session)
 
 	/* Initialize the Windows jump table. */
 	file_system->fs_directory_list = __wt_win_directory_list;
+	file_system->fs_directory_list_single = __wt_win_directory_list_single;
 	file_system->fs_directory_list_free = __wt_win_directory_list_free;
 	file_system->fs_exist = __win_fs_exist;
 	file_system->fs_open_file = __win_open_file;

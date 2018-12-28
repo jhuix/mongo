@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,6 +35,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
@@ -42,7 +45,7 @@
 namespace mongo {
 namespace {
 
-TEST(KVDatabaseCatalogEntryTest, CreateCollectionValidNamespace) {
+TEST_F(ServiceContextTest, CreateCollectionValidNamespace) {
     KVStorageEngine storageEngine(
         new DevNullKVEngine(), KVStorageEngineOptions{}, kvDatabaseCatalogEntryMockFactory);
     storageEngine.finishInit();
@@ -54,7 +57,7 @@ TEST(KVDatabaseCatalogEntryTest, CreateCollectionValidNamespace) {
     ASSERT_FALSE(collectionNamespaces.empty());
 }
 
-TEST(KVDatabaseCatalogEntryTest, CreateCollectionEmptyNamespace) {
+TEST_F(ServiceContextTest, CreateCollectionEmptyNamespace) {
     KVStorageEngine storageEngine(
         new DevNullKVEngine(), KVStorageEngineOptions{}, kvDatabaseCatalogEntryMockFactory);
     storageEngine.finishInit();
@@ -84,7 +87,7 @@ public:
 };
 
 // After createCollection fails, collection namespaces should remain empty.
-TEST(KVDatabaseCatalogEntryTest, CreateCollectionInvalidRecordStore) {
+TEST_F(ServiceContextTest, CreateCollectionInvalidRecordStore) {
     KVStorageEngine storageEngine(new InvalidRecordStoreKVEngine(),
                                   KVStorageEngineOptions{},
                                   kvDatabaseCatalogEntryMockFactory);

@@ -1,28 +1,31 @@
-/*    Copyright 2012 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
@@ -37,15 +40,17 @@
 #include "mongo/base/status_with.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/user_cache_invalidator_job_parameters_gen.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
@@ -53,43 +58,58 @@
 namespace mongo {
 namespace {
 
-// How often to check with the config servers whether authorization information has changed.
-AtomicInt32 userCacheInvalidationIntervalSecs(30);  // 30 second default
-stdx::mutex invalidationIntervalMutex;
-stdx::condition_variable invalidationIntervalChangedCondition;
-Date_t lastInvalidationTime;
+class ThreadSleepInterval {
 
-class ExportedInvalidationIntervalParameter
-    : public ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime> {
 public:
-    ExportedInvalidationIntervalParameter()
-        : ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime>(
-              ServerParameterSet::getGlobal(),
-              "userCacheInvalidationIntervalSecs",
-              &userCacheInvalidationIntervalSecs) {}
+    explicit ThreadSleepInterval(Seconds interval) : _interval(interval) {}
 
-    virtual Status validate(const int& potentialNewValue) {
-        if (potentialNewValue < 1 || potentialNewValue > 86400) {
-            return Status(ErrorCodes::BadValue,
-                          "userCacheInvalidationIntervalSecs must be between 1 "
-                          "and 86400 (24 hours)");
+    void setInterval(Seconds interval) {
+        {
+            stdx::lock_guard<stdx::mutex> twiddle(_mutex);
+            MONGO_LOG(5) << "setInterval: old=" << _interval << ", new=" << interval;
+            _interval = interval;
         }
-        return Status::OK();
+        _condition.notify_all();
     }
 
-    // Without this the compiler complains that defining set(const int&)
-    // hides set(const BSONElement&)
-    using ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime>::set;
-
-    virtual Status set(const int& newValue) {
-        stdx::unique_lock<stdx::mutex> lock(invalidationIntervalMutex);
-        Status status =
-            ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime>::set(newValue);
-        invalidationIntervalChangedCondition.notify_all();
-        return status;
+    void start() {
+        _last = Date_t::now();
     }
 
-} exportedIntervalParam;
+    void wait() {
+        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        while (true) {
+            Date_t now = Date_t::now();
+            Date_t expiry = _last + _interval;
+            MONGO_LOG(5) << "wait: now=" << now << ", expiry=" << expiry;
+
+            if (now >= expiry) {
+                _last = now;
+                MONGO_LOG(5) << "wait: done";
+                return;
+            }
+
+            MONGO_LOG(5) << "wait: blocking";
+            MONGO_IDLE_THREAD_BLOCK;
+            _condition.wait_until(lock, expiry.toSystemTimePoint());
+        }
+    }
+
+private:
+    Seconds _interval;
+    stdx::mutex _mutex;
+    stdx::condition_variable _condition;
+    Date_t _last;
+};
+
+Seconds loadInterval() {
+    return Seconds(userCacheInvalidationIntervalSecs.load());
+}
+
+ThreadSleepInterval* globalInvalidationInterval() {
+    static auto p = new ThreadSleepInterval(loadInterval());
+    return p;
+}
 
 StatusWith<OID> getCurrentCacheGeneration(OperationContext* opCtx) {
     try {
@@ -108,6 +128,11 @@ StatusWith<OID> getCurrentCacheGeneration(OperationContext* opCtx) {
 }
 
 }  // namespace
+
+Status userCacheInvalidationIntervalSecsNotify(const int& value) {
+    globalInvalidationInterval()->setInterval(loadInterval());
+    return Status::OK();
+}
 
 UserCacheInvalidator::UserCacheInvalidator(AuthorizationManager* authzManager)
     : _authzManager(authzManager) {}
@@ -139,21 +164,10 @@ void UserCacheInvalidator::initialize(OperationContext* opCtx) {
 
 void UserCacheInvalidator::run() {
     Client::initThread("UserCacheInvalidator");
-    lastInvalidationTime = Date_t::now();
-
+    auto interval = globalInvalidationInterval();
+    interval->start();
     while (true) {
-        stdx::unique_lock<stdx::mutex> lock(invalidationIntervalMutex);
-        Date_t sleepUntil =
-            lastInvalidationTime + Seconds(userCacheInvalidationIntervalSecs.load());
-        Date_t now = Date_t::now();
-        while (now < sleepUntil) {
-            MONGO_IDLE_THREAD_BLOCK;
-            invalidationIntervalChangedCondition.wait_until(lock, sleepUntil.toSystemTimePoint());
-            sleepUntil = lastInvalidationTime + Seconds(userCacheInvalidationIntervalSecs.load());
-            now = Date_t::now();
-        }
-        lastInvalidationTime = now;
-        lock.unlock();
+        interval->wait();
 
         if (globalInShutdownDeprecated()) {
             break;
@@ -172,14 +186,23 @@ void UserCacheInvalidator::run() {
                           << currentGeneration.getStatus();
             }
             // When in doubt, invalidate the cache
-            _authzManager->invalidateUserCache();
+            try {
+                _authzManager->invalidateUserCache(opCtx.get());
+            } catch (const DBException& e) {
+                warning() << "Error invalidating user cache: " << e.toStatus();
+            }
             continue;
         }
 
         if (currentGeneration.getValue() != _previousCacheGeneration) {
             log() << "User cache generation changed from " << _previousCacheGeneration << " to "
                   << currentGeneration.getValue() << "; invalidating user cache";
-            _authzManager->invalidateUserCache();
+            try {
+                _authzManager->invalidateUserCache(opCtx.get());
+            } catch (const DBException& e) {
+                warning() << "Error invalidating user cache: " << e.toStatus();
+            }
+
             _previousCacheGeneration = currentGeneration.getValue();
         }
     }

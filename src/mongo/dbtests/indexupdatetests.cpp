@@ -1,31 +1,33 @@
 //@file indexupdatetests.cpp : mongo/db/index_update.{h,cpp} tests
 
+
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -34,13 +36,13 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
+#include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace IndexUpdateTests {
@@ -81,7 +83,7 @@ protected:
             uassertStatusOK(indexer.init(key));
             uassertStatusOK(indexer.insertAllDocumentsInCollection());
             WriteUnitOfWork wunit(&_opCtx);
-            indexer.commit();
+            ASSERT_OK(indexer.commit());
             wunit.commit();
         } catch (const DBException& e) {
             if (ErrorCodes::isInterruption(e.code()))
@@ -94,7 +96,7 @@ protected:
 
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
-    OldClientWriteContext _ctx;
+    dbtests::WriteContextForTests _ctx;
     DBDirectClient _client;
 };
 
@@ -149,7 +151,7 @@ public:
         ASSERT_OK(indexer.insertAllDocumentsInCollection());
 
         WriteUnitOfWork wunit(&_opCtx);
-        indexer.commit();
+        ASSERT_OK(indexer.commit());
         wunit.commit();
     }
 };
@@ -162,61 +164,6 @@ public:
         // Create a new collection.
         Database* db = _ctx.db();
         Collection* coll;
-        {
-            WriteUnitOfWork wunit(&_opCtx);
-            db->dropCollection(&_opCtx, _ns).transitional_ignore();
-            coll = db->createCollection(&_opCtx, _ns);
-
-            OpDebug* const nullOpDebug = nullptr;
-            coll->insertDocument(&_opCtx,
-                                 InsertStatement(BSON("_id" << 1 << "a"
-                                                            << "dup")),
-                                 nullOpDebug,
-                                 true)
-                .transitional_ignore();
-            coll->insertDocument(&_opCtx,
-                                 InsertStatement(BSON("_id" << 2 << "a"
-                                                            << "dup")),
-                                 nullOpDebug,
-                                 true)
-                .transitional_ignore();
-            wunit.commit();
-        }
-
-        MultiIndexBlock indexer(&_opCtx, coll);
-        indexer.allowBackgroundBuilding();
-        indexer.allowInterruption();
-        // indexer.ignoreUniqueConstraint(); // not calling this
-
-        const BSONObj spec = BSON("name"
-                                  << "a"
-                                  << "ns"
-                                  << coll->ns().ns()
-                                  << "key"
-                                  << BSON("a" << 1)
-                                  << "v"
-                                  << static_cast<int>(kIndexVersion)
-                                  << "unique"
-                                  << true
-                                  << "background"
-                                  << background);
-
-        ASSERT_OK(indexer.init(spec).getStatus());
-        const Status status = indexer.insertAllDocumentsInCollection();
-        ASSERT_EQUALS(status.code(), ErrorCodes::DuplicateKey);
-    }
-};
-
-/** Index creation fills a passed-in set of dups rather than failing. */
-template <bool background>
-class InsertBuildFillDups : public IndexBuildBase {
-public:
-    void run() {
-        // Create a new collection.
-        Database* db = _ctx.db();
-        Collection* coll;
-        RecordId loc1;
-        RecordId loc2;
         {
             WriteUnitOfWork wunit(&_opCtx);
             db->dropCollection(&_opCtx, _ns).transitional_ignore();
@@ -255,18 +202,22 @@ public:
                                   << background);
 
         ASSERT_OK(indexer.init(spec).getStatus());
+        auto desc =
+            coll->getIndexCatalog()->findIndexByName(&_opCtx, "a", true /* includeUnfinished */);
+        ASSERT(desc);
 
-        std::set<RecordId> dups;
-        ASSERT_OK(indexer.insertAllDocumentsInCollection(&dups));
-
-        // either loc1 or loc2 should be in dups but not both.
-        ASSERT_EQUALS(dups.size(), 1U);
-        for (auto recordId : dups) {
-            ASSERT_NOT_EQUALS(recordId, RecordId());
-            BSONObj obj = coll->docFor(&_opCtx, recordId).value();
-            int id = obj["_id"].Int();
-            ASSERT(id == 1 || id == 2);
+        const Status status = indexer.insertAllDocumentsInCollection();
+        if (!coll->getIndexCatalog()->getEntry(desc)->isBuilding()) {
+            ASSERT_EQUALS(status.code(), ErrorCodes::DuplicateKey);
+            return;
         }
+
+        // Hybrid index builds, with an interceptor, do not detect duplicates until they commit.
+        ASSERT_OK(status);
+
+        WriteUnitOfWork wunit(&_opCtx);
+        ASSERT_THROWS_CODE(indexer.commit(), AssertionException, ErrorCodes::DuplicateKey);
+        wunit.commit();
     }
 };
 
@@ -283,11 +234,11 @@ public:
             coll = db->createCollection(&_opCtx, _ns);
             // Drop all indexes including id index.
             coll->getIndexCatalog()->dropAllIndexes(&_opCtx, true);
-            // Insert some documents with enforceQuota=true.
+            // Insert some documents.
             int32_t nDocs = 1000;
             OpDebug* const nullOpDebug = nullptr;
             for (int32_t i = 0; i < nDocs; ++i) {
-                coll->insertDocument(&_opCtx, InsertStatement(BSON("a" << i)), nullOpDebug, true)
+                coll->insertDocument(&_opCtx, InsertStatement(BSON("a" << i)), nullOpDebug)
                     .transitional_ignore();
             }
             wunit.commit();
@@ -347,6 +298,11 @@ public:
 class InsertBuildIdIndexInterrupt : public IndexBuildBase {
 public:
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         // Recreate the collection as capped, without an _id index.
         Database* db = _ctx.db();
         Collection* coll;
@@ -386,6 +342,11 @@ public:
 class InsertBuildIdIndexInterruptDisallowed : public IndexBuildBase {
 public:
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         // Recreate the collection as capped, without an _id index.
         Database* db = _ctx.db();
         Collection* coll;
@@ -435,7 +396,7 @@ Status IndexBuildBase::createIndex(const std::string& dbname, const BSONObj& ind
         return status;
     }
     WriteUnitOfWork wunit(&_opCtx);
-    indexer.commit();
+    ASSERT_OK(indexer.commit());
     wunit.commit();
     return Status::OK();
 }
@@ -649,7 +610,7 @@ public:
         const std::string storageEngineName = "wiredTiger";
 
         // Run 'wiredTiger' tests if the storage engine is supported.
-        if (getGlobalServiceContext()->isRegisteredStorageEngine(storageEngineName)) {
+        if (isRegisteredStorageEngine(getGlobalServiceContext(), storageEngineName)) {
             // Every field under "storageEngine" has to be an object.
             ASSERT_NOT_OK(createIndex("unittest", _createSpec(BSON(storageEngineName << 1))));
 
@@ -686,14 +647,16 @@ protected:
     }
 };
 
-class IndexCatatalogFixIndexKey {
+class IndexCatatalogFixIndexKey : public IndexBuildBase {
 public:
     void run() {
-        ASSERT_BSONOBJ_EQ(BSON("x" << 1), IndexCatalog::fixIndexKey(BSON("x" << 1)));
+        auto indexCatalog = collection()->getIndexCatalog();
 
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), IndexCatalog::fixIndexKey(BSON("_id" << 1)));
+        ASSERT_BSONOBJ_EQ(BSON("x" << 1), indexCatalog->fixIndexKey(BSON("x" << 1)));
 
-        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), IndexCatalog::fixIndexKey(BSON("_id" << true)));
+        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), indexCatalog->fixIndexKey(BSON("_id" << 1)));
+
+        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), indexCatalog->fixIndexKey(BSON("_id" << true)));
     }
 };
 
@@ -808,12 +771,16 @@ public:
     IndexUpdateTests() : Suite("indexupdate") {}
 
     void setupTests() {
-        add<InsertBuildIgnoreUnique<true>>();
-        add<InsertBuildIgnoreUnique<false>>();
+
+        if (mongo::storageGlobalParams.engine != "mobile") {
+            // These tests check that index creation ignores the unique constraint when told to.
+            // The mobile storage engine does not support duplicate keys in unique indexes so these
+            // tests are disabled.
+            add<InsertBuildIgnoreUnique<true>>();
+            add<InsertBuildIgnoreUnique<false>>();
+        }
         add<InsertBuildEnforceUnique<true>>();
         add<InsertBuildEnforceUnique<false>>();
-        add<InsertBuildFillDups<true>>();
-        add<InsertBuildFillDups<false>>();
         add<InsertBuildIndexInterrupt>();
         add<InsertBuildIndexInterruptDisallowed>();
         add<InsertBuildIdIndexInterrupt>();

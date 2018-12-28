@@ -1,29 +1,31 @@
+
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -44,6 +46,7 @@
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/db/server_options.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/mongoutils/str.h"
@@ -56,18 +59,35 @@ class BSONObjBuilder;
 class DocumentSource;
 
 /**
- * Registers an Parser so it can be called from parseExpression and friends.
+ * Registers a Parser so it can be called from parseExpression and friends.
  *
  * As an example, if your expression looks like {"$foo": [1,2,3]} you would add this line:
  * REGISTER_EXPRESSION(foo, ExpressionFoo::parse);
+ *
+ * An expression registered this way can be used in any featureCompatibilityVersion.
  */
 #define REGISTER_EXPRESSION(key, parser)                                     \
     MONGO_INITIALIZER(addToExpressionParserMap_##key)(InitializerContext*) { \
-        Expression::registerExpression("$" #key, (parser));                  \
+        Expression::registerExpression("$" #key, (parser), boost::none);     \
         return Status::OK();                                                 \
     }
 
-class Expression : public IntrusiveCounterUnsigned {
+/**
+ * Registers a Parser so it can be called from parseExpression and friends. Use this version if your
+ * expression can only be persisted to a catalog data structure in a feature compatibility version
+ * >= X.
+ *
+ * As an example, if your expression looks like {"$foo": [1,2,3]}, and can only be used in a feature
+ * compatibility version >= X, you would add this line:
+ * REGISTER_EXPRESSION_WITH_MIN_VERSION(foo, ExpressionFoo::parse, X);
+ */
+#define REGISTER_EXPRESSION_WITH_MIN_VERSION(key, parser, minVersion)        \
+    MONGO_INITIALIZER(addToExpressionParserMap_##key)(InitializerContext*) { \
+        Expression::registerExpression("$" #key, (parser), (minVersion));    \
+        return Status::OK();                                                 \
+    }
+
+class Expression : public RefCountable {
 public:
     using Parser = stdx::function<boost::intrusive_ptr<Expression>(
         const boost::intrusive_ptr<ExpressionContext>&, BSONElement, const VariablesParseState&)>;
@@ -208,7 +228,10 @@ public:
      * DO NOT call this method directly. Instead, use the REGISTER_EXPRESSION macro defined in this
      * file.
      */
-    static void registerExpression(std::string key, Parser parser);
+    static void registerExpression(
+        std::string key,
+        Parser parser,
+        boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion);
 
 protected:
     Expression(const boost::intrusive_ptr<ExpressionContext>& expCtx) : _expCtx(expCtx) {
@@ -412,7 +435,7 @@ public:
     explicit ExpressionSingleNumericArg(const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : ExpressionFixedArity<SubClass, 1>(expCtx) {}
 
-    virtual ~ExpressionSingleNumericArg() {}
+    virtual ~ExpressionSingleNumericArg() = default;
 
     Value evaluate(const Document& root) const final {
         Value arg = this->vpOperand[0]->evaluate(root);
@@ -428,6 +451,49 @@ public:
     }
 
     virtual Value evaluateNumericArg(const Value& numericArg) const = 0;
+};
+
+/**
+ * Inherit from this class if your expression takes exactly two numeric arguments.
+ */
+template <typename SubClass>
+class ExpressionTwoNumericArgs : public ExpressionFixedArity<SubClass, 2> {
+public:
+    explicit ExpressionTwoNumericArgs(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : ExpressionFixedArity<SubClass, 2>(expCtx) {}
+
+    virtual ~ExpressionTwoNumericArgs() = default;
+
+    /**
+     * Evaluate performs the type checking necessary to make sure that both arguments are numeric,
+     * then calls the evaluateNumericArgs on the two numeric args:
+     * 1. If either input is nullish, it returns null.
+     * 2. If either input is not numeric, it throws an error.
+     * 3. Call evaluateNumericArgs on the two numeric args.
+     */
+    Value evaluate(const Document& root) const final {
+        Value arg1 = this->vpOperand[0]->evaluate(root);
+        if (arg1.nullish())
+            return Value(BSONNULL);
+        uassert(51044,
+                str::stream() << this->getOpName() << " only supports numeric types, not "
+                              << typeName(arg1.getType()),
+                arg1.numeric());
+        Value arg2 = this->vpOperand[1]->evaluate(root);
+        if (arg2.nullish())
+            return Value(BSONNULL);
+        uassert(51045,
+                str::stream() << this->getOpName() << " only supports numeric types, not "
+                              << typeName(arg2.getType()),
+                arg2.numeric());
+
+        return evaluateNumericArgs(arg1, arg2);
+    }
+
+    /**
+     *  Evaluate the expression on exactly two numeric arguments.
+     */
+    virtual Value evaluateNumericArgs(const Value& numericArg1, const Value& numericArg2) const = 0;
 };
 
 /**
@@ -519,8 +585,10 @@ public:
                               << timeZoneId.toString()
                               << ")",
                 timeZoneId.getType() == BSONType::String);
-        auto timeZone = TimeZoneDatabase::get(getExpressionContext()->opCtx->getServiceContext())
-                            ->getTimeZone(timeZoneId.getString());
+
+        invariant(getExpressionContext()->timeZoneDatabase);
+        auto timeZone =
+            getExpressionContext()->timeZoneDatabase->getTimeZone(timeZoneId.getString());
         return evaluateDate(date, timeZone);
     }
 
@@ -640,7 +708,6 @@ public:
     const char* getOpName() const final;
 };
 
-
 class ExpressionAdd final : public ExpressionVariadic<ExpressionAdd> {
 public:
     explicit ExpressionAdd(const boost::intrusive_ptr<ExpressionContext>& expCtx)
@@ -705,6 +772,7 @@ public:
 
     Value evaluate(const Document& root) const final;
     Value serialize(bool explain) const final;
+    boost::intrusive_ptr<Expression> optimize() final;
     const char* getOpName() const final;
 };
 
@@ -871,10 +939,16 @@ protected:
 private:
     ExpressionDateFromString(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                              boost::intrusive_ptr<Expression> dateString,
-                             boost::intrusive_ptr<Expression> timeZone);
+                             boost::intrusive_ptr<Expression> timeZone,
+                             boost::intrusive_ptr<Expression> format,
+                             boost::intrusive_ptr<Expression> onNull,
+                             boost::intrusive_ptr<Expression> onError);
 
     boost::intrusive_ptr<Expression> _dateString;
     boost::intrusive_ptr<Expression> _timeZone;
+    boost::intrusive_ptr<Expression> _format;
+    boost::intrusive_ptr<Expression> _onNull;
+    boost::intrusive_ptr<Expression> _onError;
 };
 
 class ExpressionDateFromParts final : public Expression {
@@ -906,16 +980,22 @@ private:
                             boost::intrusive_ptr<Expression> timeZone);
 
     /**
-     * Evaluates the value in field as number, and makes sure it fits in the minValue..maxValue
-     * range. If the field is missing or empty, the function returns the defaultValue.
+     * This function checks whether a field is a number.
+     *
+     * If 'field' is null, the default value is returned trough the 'returnValue' out
+     * parameter and the function returns true.
+     *
+     * If 'field' is not null:
+     * - if the value is "nullish", the function returns false.
+     * - if the value can not be coerced to an integral value, a UserException is thrown.
+     * - otherwise, the coerced integral value is returned through the 'returnValue'
+     *   out parameter, and the function returns true.
      */
-    bool evaluateNumberWithinRange(const Document& root,
+    bool evaluateNumberWithDefault(const Document& root,
                                    boost::intrusive_ptr<Expression> field,
                                    StringData fieldName,
-                                   int defaultValue,
-                                   int minValue,
-                                   int maxValue,
-                                   int* returnValue) const;
+                                   long long defaultValue,
+                                   long long* returnValue) const;
 
     boost::intrusive_ptr<Expression> _year;
     boost::intrusive_ptr<Expression> _month;
@@ -976,13 +1056,15 @@ protected:
 
 private:
     ExpressionDateToString(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                           const std::string& format,                   // The format string.
-                           boost::intrusive_ptr<Expression> date,       // The date to format.
-                           boost::intrusive_ptr<Expression> timeZone);  // The optional timezone.
+                           boost::intrusive_ptr<Expression> format,
+                           boost::intrusive_ptr<Expression> date,
+                           boost::intrusive_ptr<Expression> timeZone,
+                           boost::intrusive_ptr<Expression> onNull);
 
-    const std::string _format;
+    boost::intrusive_ptr<Expression> _format;
     boost::intrusive_ptr<Expression> _date;
     boost::intrusive_ptr<Expression> _timeZone;
+    boost::intrusive_ptr<Expression> _onNull;
 };
 
 class ExpressionDayOfMonth final : public DateExpressionAcceptingTimeZone<ExpressionDayOfMonth> {
@@ -1069,6 +1151,12 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const std::string& raw,
         const VariablesParseState& vps);
+
+    /**
+     * Returns true if this expression logically represents the path 'dottedPath'. For example, if
+     * 'dottedPath' is 'a.b' and this FieldPath is '$$CURRENT.a.b', returns true.
+     */
+    bool representsPath(const std::string& dottedPath) const;
 
     const FieldPath& getFieldPath() const {
         return _fieldPath;
@@ -1181,13 +1269,39 @@ public:
 };
 
 
-class ExpressionIndexOfArray final : public ExpressionRangedArity<ExpressionIndexOfArray, 2, 4> {
+class ExpressionIndexOfArray : public ExpressionRangedArity<ExpressionIndexOfArray, 2, 4> {
 public:
     explicit ExpressionIndexOfArray(const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : ExpressionRangedArity<ExpressionIndexOfArray, 2, 4>(expCtx) {}
 
-    Value evaluate(const Document& root) const final;
+
+    Value evaluate(const Document& root) const;
+    boost::intrusive_ptr<Expression> optimize() final;
     const char* getOpName() const final;
+
+protected:
+    struct Arguments {
+        Arguments(Value targetOfSearch, int startIndex, int endIndex)
+            : targetOfSearch(targetOfSearch), startIndex(startIndex), endIndex(endIndex) {}
+
+        Value targetOfSearch;
+        int startIndex;
+        int endIndex;
+    };
+    /**
+     * When given 'operands' which correspond to the arguments to $indexOfArray, evaluates and
+     * validates the target value, starting index, and ending index arguments and returns their
+     * values as a Arguments struct. The starting index and ending index are optional, so as default
+     * 'startIndex' will be 0 and 'endIndex' will be the length of the input array. Throws a
+     * UserException if the values are found to be invalid in some way, e.g. if the indexes are not
+     * numbers.
+     */
+    Arguments evaluateAndValidateArguments(const Document& root,
+                                           const ExpressionVector& operands,
+                                           size_t arrayLength) const;
+
+private:
+    class Optimized;
 };
 
 
@@ -1768,6 +1882,74 @@ public:
 };
 
 
+/**
+ * This class is used to implement all three trim expressions: $trim, $ltrim, and $rtrim.
+ */
+class ExpressionTrim final : public Expression {
+private:
+    enum class TrimType {
+        kBoth,
+        kLeft,
+        kRight,
+    };
+
+public:
+    ExpressionTrim(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                   TrimType trimType,
+                   StringData name,
+                   const boost::intrusive_ptr<Expression>& input,
+                   const boost::intrusive_ptr<Expression>& charactersToTrim)
+        : Expression(expCtx),
+          _trimType(trimType),
+          _name(name.toString()),
+          _input(input),
+          _characters(charactersToTrim) {}
+
+    Value evaluate(const Document& root) const final;
+    boost::intrusive_ptr<Expression> optimize() final;
+    static boost::intrusive_ptr<Expression> parse(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        BSONElement expr,
+        const VariablesParseState& vpsIn);
+    Value serialize(bool explain) const final;
+
+protected:
+    void _doAddDependencies(DepsTracker* deps) const final;
+
+private:
+    /**
+     * Returns true if the unicode character found at index 'indexIntoInput' of 'input' is equal to
+     * 'testCP'.
+     */
+    static bool codePointMatchesAtIndex(const StringData& input,
+                                        std::size_t indexIntoInput,
+                                        const StringData& testCP);
+
+    /**
+     * Given the input string and the code points to trim from that string, returns a substring of
+     * 'input' with any code point from 'trimCPs' trimmed from the left.
+     */
+    static StringData trimFromLeft(StringData input, const std::vector<StringData>& trimCPs);
+
+    /**
+     * Given the input string and the code points to trim from that string, returns a substring of
+     * 'input' with any code point from 'trimCPs' trimmed from the right.
+     */
+    static StringData trimFromRight(StringData input, const std::vector<StringData>& trimCPs);
+
+    /**
+     * Returns the trimmed version of 'input', with all code points in 'trimCPs' removed from the
+     * front, back, or both - depending on _trimType.
+     */
+    StringData doTrim(StringData input, const std::vector<StringData>& trimCPs) const;
+
+    TrimType _trimType;
+    std::string _name;  // "$trim", "$ltrim", or "$rtrim".
+    boost::intrusive_ptr<Expression> _input;
+    boost::intrusive_ptr<Expression> _characters;  // Optional, null if not specified.
+};
+
+
 class ExpressionTrunc final : public ExpressionSingleNumericArg<ExpressionTrunc> {
 public:
     explicit ExpressionTrunc(const boost::intrusive_ptr<ExpressionContext>& expCtx)
@@ -1864,5 +2046,43 @@ private:
     bool _useLongestLength = false;
     ExpressionVector _inputs;
     ExpressionVector _defaults;
+};
+
+class ExpressionConvert final : public Expression {
+public:
+    /**
+     * Creates a $convert expression converting from 'input' to the type given by 'toType'. Leaves
+     * 'onNull' and 'onError' unspecified.
+     */
+    static boost::intrusive_ptr<Expression> create(const boost::intrusive_ptr<ExpressionContext>&,
+                                                   const boost::intrusive_ptr<Expression>& input,
+                                                   BSONType toType);
+
+    static boost::intrusive_ptr<Expression> parse(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        BSONElement expr,
+        const VariablesParseState& vpsIn);
+
+    explicit ExpressionConvert(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : Expression(expCtx) {}
+    Value evaluate(const Document& root) const final;
+    boost::intrusive_ptr<Expression> optimize() final;
+    Value serialize(bool explain) const final;
+
+protected:
+    void _doAddDependencies(DepsTracker* deps) const final;
+
+private:
+    ExpressionConvert(const boost::intrusive_ptr<ExpressionContext>&,
+                      const boost::intrusive_ptr<Expression>& input,
+                      BSONType toType);
+
+    BSONType computeTargetType(Value typeName) const;
+    Value performConversion(BSONType targetType, Value inputValue) const;
+
+    boost::intrusive_ptr<Expression> _input;
+    boost::intrusive_ptr<Expression> _to;
+    boost::intrusive_ptr<Expression> _onError;
+    boost::intrusive_ptr<Expression> _onNull;
 };
 }

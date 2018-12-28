@@ -6,9 +6,6 @@
  *   filters results.
  * - When no read concern is specified, the secondary defaults to 'available' read concern.
  *
- * Since some commands are unversioned even against primaries or cannot be run on sharded
- * collections, this file declaratively defines the expected behavior for each command.
- *
  * If versioned secondary reads do not apply to a command, it should specify "skip" with the reason.
  *
  * The following fields are required for each command that is not skipped:
@@ -21,26 +18,18 @@
  *                 *when the range has not been deleted from the donor.*
  * - checkAvailableReadConcernResults: Same as checkResults above, except asserts the expected
  *                                     results for the command run with read concern 'available'.
- * - behavior: Must be one of "unshardedOnly", "unversioned", or "versioned". Determines what
- *             checks the test performs against the system profilers of the secondaries.
+ * - behavior: Must be one of "unshardedOnly", "targetsPrimaryUsesConnectionVersioning" or
+ * "versioned". Determines what system profiler checks are performed.
  */
 (function() {
     "use strict";
 
     load('jstests/libs/profiler.js');
+    load('jstests/sharding/libs/last_stable_mongos_commands.js');
 
     let db = "test";
     let coll = "foo";
     let nss = db + "." + coll;
-
-    // Given a command, build its expected shape in the system profiler.
-    let buildCommandProfile = function(command) {
-        let commandProfile = {ns: nss};
-        for (let key in command) {
-            commandProfile["command." + key] = command[key];
-        }
-        return commandProfile;
-    };
 
     // Check that a test case is well-formed.
     let validateTestCase = function(test) {
@@ -49,11 +38,14 @@
         assert(test.checkResults && typeof(test.checkResults) === "function");
         assert(test.checkAvailableReadConcernResults &&
                typeof(test.checkAvailableReadConcernResults) === "function");
-        assert(test.behavior === "unshardedOnly" || test.behavior === "unversioned" ||
+        assert(test.behavior === "unshardedOnly" ||
+               test.behavior === "targetsPrimaryUsesConnectionVersioning" ||
                test.behavior === "versioned");
     };
 
     let testCases = {
+        _addShard: {skip: "primary only"},
+        _cloneCatalogData: {skip: "primary only"},
         _configsvrAddShard: {skip: "primary only"},
         _configsvrAddShardToZone: {skip: "primary only"},
         _configsvrBalancerStart: {skip: "primary only"},
@@ -62,22 +54,27 @@
         _configsvrCommitChunkMerge: {skip: "primary only"},
         _configsvrCommitChunkMigration: {skip: "primary only"},
         _configsvrCommitChunkSplit: {skip: "primary only"},
+        _configsvrCommitMovePrimary: {skip: "primary only"},
+        _configsvrDropCollection: {skip: "primary only"},
+        _configsvrDropDatabase: {skip: "primary only"},
         _configsvrMoveChunk: {skip: "primary only"},
         _configsvrMovePrimary: {skip: "primary only"},
         _configsvrRemoveShardFromZone: {skip: "primary only"},
         _configsvrShardCollection: {skip: "primary only"},
-        _configsvrSetFeatureCompatibilityVersion: {skip: "primary only"},
         _configsvrUpdateZoneKeyRange: {skip: "primary only"},
+        _flushRoutingTableCacheUpdates: {skip: "does not return user data"},
         _getUserCacheGeneration: {skip: "does not return user data"},
         _hashBSONElement: {skip: "does not return user data"},
         _isSelf: {skip: "does not return user data"},
         _mergeAuthzCollections: {skip: "primary only"},
         _migrateClone: {skip: "primary only"},
+        _movePrimary: {skip: "primary only"},
         _recvChunkAbort: {skip: "primary only"},
         _recvChunkCommit: {skip: "primary only"},
         _recvChunkStart: {skip: "primary only"},
         _recvChunkStatus: {skip: "primary only"},
         _transferMods: {skip: "primary only"},
+        abortTransaction: {skip: "primary only"},
         addShard: {skip: "primary only"},
         addShardToZone: {skip: "primary only"},
         aggregate: {
@@ -113,6 +110,7 @@
         clone: {skip: "primary only"},
         cloneCollection: {skip: "primary only"},
         cloneCollectionAsCapped: {skip: "primary only"},
+        commitTransaction: {skip: "primary only"},
         collMod: {skip: "primary only"},
         collStats: {skip: "does not return user data"},
         compact: {skip: "does not return user data"},
@@ -121,9 +119,6 @@
         connPoolSync: {skip: "does not return user data"},
         connectionStatus: {skip: "does not return user data"},
         convertToCapped: {skip: "primary only"},
-        copydb: {skip: "primary only"},
-        copydbgetnonce: {skip: "primary only"},
-        copydbsaslstart: {skip: "primary only"},
         count: {
             setUp: function(mongosConn) {
                 assert.writeOK(mongosConn.getCollection(nss).insert({x: 1}));
@@ -172,14 +167,15 @@
         drop: {skip: "primary only"},
         dropAllRolesFromDatabase: {skip: "primary only"},
         dropAllUsersFromDatabase: {skip: "primary only"},
+        dropConnections: {skip: "does not return user data"},
         dropDatabase: {skip: "primary only"},
         dropIndexes: {skip: "primary only"},
         dropRole: {skip: "primary only"},
         dropUser: {skip: "primary only"},
+        echo: {skip: "does not return user data"},
         emptycapped: {skip: "primary only"},
         enableSharding: {skip: "primary only"},
         endSessions: {skip: "does not return user data"},
-        eval: {skip: "primary only"},
         explain: {skip: "TODO SERVER-30068"},
         features: {skip: "does not return user data"},
         filemd5: {skip: "does not return user data"},
@@ -203,28 +199,8 @@
         findAndModify: {skip: "primary only"},
         flushRouterConfig: {skip: "does not return user data"},
         forceerror: {skip: "does not return user data"},
-        forceRoutingTableRefresh: {skip: "does not return user data"},
         fsync: {skip: "does not return user data"},
         fsyncUnlock: {skip: "does not return user data"},
-        geoNear: {
-            setUp: function(mongosConn) {
-                assert.commandWorked(mongosConn.getCollection(nss).runCommand(
-                    {createIndexes: coll, indexes: [{key: {loc: "2d"}, name: "loc_2d"}]}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, loc: [1, 1]}));
-            },
-            command: {geoNear: coll, near: [1, 1]},
-            checkResults: function(res) {
-                assert.commandWorked(res);
-                // Expect the command to return correct results, since it will read orphaned data.
-                assert.eq(1, res.results.length, res);
-            },
-            checkAvailableReadConcernResults: function(res) {
-                assert.commandWorked(res);
-                // Command is unversioned, so 'available' has no additional effect.
-                assert.eq(1, res.results.length, res);
-            },
-            behavior: "unversioned"
-        },
         geoSearch: {skip: "not supported in mongos"},
         getCmdLineOpts: {skip: "does not return user data"},
         getDiagnosticData: {skip: "does not return user data"},
@@ -240,31 +216,12 @@
         grantPrivilegesToRole: {skip: "primary only"},
         grantRolesToRole: {skip: "primary only"},
         grantRolesToUser: {skip: "primary only"},
-        group: {
-            setUp: function(mongosConn) {
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 2, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 2, y: 1}));
-            },
-            command: {group: {ns: coll, key: {x: 1}}},
-            checkResults: function(res) {
-                // Expect the command to fail, since it cannot run on sharded collections.
-                assert.commandFailedWithCode(res, ErrorCodes.IllegalOperation, tojson(res));
-            },
-            checkAvailableReadConcernResults: function(res) {
-                // Expect the command to fail, since it cannot run on sharded collections.
-                assert.commandFailedWithCode(res, ErrorCodes.IllegalOperation, tojson(res));
-            },
-            behavior: "unshardedOnly"
-        },
         handshake: {skip: "does not return user data"},
         hostInfo: {skip: "does not return user data"},
         insert: {skip: "primary only"},
         invalidateUserCache: {skip: "does not return user data"},
         isdbgrid: {skip: "does not return user data"},
         isMaster: {skip: "does not return user data"},
-        journalLatencyTest: {skip: "does not return user data"},
         killCursors: {skip: "does not return user data"},
         killAllSessions: {skip: "does not return user data"},
         killAllSessionsByPattern: {skip: "does not return user data"},
@@ -280,13 +237,37 @@
         logRotate: {skip: "does not return user data"},
         logout: {skip: "does not return user data"},
         makeSnapshot: {skip: "does not return user data"},
-        mapReduce: {skip: "TODO SERVER-30068"},
+        mapReduce: {
+            setUp: function(mongosConn) {
+                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1}));
+                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1}));
+            },
+            command: {
+                mapReduce: coll,
+                map: function() {
+                    emit(this.x, 1);
+                },
+                reduce: function(key, values) {
+                    return Array.sum(values);
+                },
+                out: {inline: 1}
+            },
+            checkResults: function(res) {
+                assert.commandWorked(res);
+                assert.eq(1, res.results.length, tojson(res));
+                assert.eq(1, res.results[0]._id, tojson(res));
+                assert.eq(2, res.results[0].value, tojson(res));
+            },
+            checkAvailableReadConcernResults: function(res) {
+                assert.commandFailed(res);
+            },
+            behavior: "targetsPrimaryUsesConnectionVersioning"
+        },
         mergeChunks: {skip: "primary only"},
         moveChunk: {skip: "primary only"},
         movePrimary: {skip: "primary only"},
         multicast: {skip: "does not return user data"},
         netstat: {skip: "does not return user data"},
-        parallelCollectionScan: {skip: "is an internal command"},
         ping: {skip: "does not return user data"},
         planCacheClear: {skip: "does not return user data"},
         planCacheClearFilters: {skip: "does not return user data"},
@@ -295,7 +276,6 @@
         planCacheListQueryShapes: {skip: "does not return user data"},
         planCacheSetFilter: {skip: "does not return user data"},
         profile: {skip: "primary only"},
-        reIndex: {skip: "does not return user data"},
         reapLogicalSessionCacheNow: {skip: "does not return user data"},
         refreshLogicalSessionCacheNow: {skip: "does not return user data"},
         refreshSessions: {skip: "does not return user data"},
@@ -304,11 +284,8 @@
         removeShardFromZone: {skip: "primary only"},
         renameCollection: {skip: "primary only"},
         repairCursor: {skip: "does not return user data"},
-        repairDatabase: {skip: "does not return user data"},
         replSetAbortPrimaryCatchUp: {skip: "does not return user data"},
-        replSetElect: {skip: "does not return user data"},
         replSetFreeze: {skip: "does not return user data"},
-        replSetFresh: {skip: "does not return user data"},
         replSetGetConfig: {skip: "does not return user data"},
         replSetGetRBID: {skip: "does not return user data"},
         replSetGetStatus: {skip: "does not return user data"},
@@ -324,6 +301,7 @@
         replSetUpdatePosition: {skip: "does not return user data"},
         replSetResizeOplog: {skip: "does not return user data"},
         resetError: {skip: "does not return user data"},
+        restartCatalog: {skip: "internal-only command"},
         resync: {skip: "primary only"},
         revokePrivilegesFromRole: {skip: "primary only"},
         revokeRolesFromRole: {skip: "primary only"},
@@ -334,6 +312,7 @@
         serverStatus: {skip: "does not return user data"},
         setCommittedSnapshot: {skip: "does not return user data"},
         setFeatureCompatibilityVersion: {skip: "primary only"},
+        setFreeMonitoring: {skip: "primary only"},
         setParameter: {skip: "does not return user data"},
         setShardVersion: {skip: "does not return user data"},
         shardCollection: {skip: "primary only"},
@@ -355,14 +334,20 @@
         updateZoneKeyRange: {skip: "primary only"},
         usersInfo: {skip: "primary only"},
         validate: {skip: "does not return user data"},
+        waitForOngoingChunkSplits: {skip: "does not return user data"},
         whatsmyuri: {skip: "does not return user data"}
     };
+
+    commandsRemovedFromMongosIn42.forEach(function(cmd) {
+        testCases[cmd] = {skip: "must define test coverage for 4.0 backwards compatibility"};
+    });
 
     // Set the secondaries to priority 0 and votes 0 to prevent the primaries from stepping down.
     let rsOpts = {nodes: [{rsConfig: {votes: 1}}, {rsConfig: {priority: 0, votes: 0}}]};
     let st = new ShardingTest({mongos: 2, shards: {rs0: rsOpts, rs1: rsOpts}});
 
     let donorShardPrimary = st.rs0.getPrimary();
+    let recipientShardPrimary = st.rs1.getPrimary();
     let donorShardSecondary = st.rs0.getSecondary();
     let recipientShardSecondary = st.rs1.getSecondary();
 
@@ -389,15 +374,31 @@
         assert.commandWorked(freshMongos.adminCommand({enableSharding: db}));
         st.ensurePrimaryShard(db, st.shard0.shardName);
         assert.commandWorked(freshMongos.adminCommand({shardCollection: nss, key: {x: 1}}));
+
+        // We do this because we expect staleMongos to see that the collection is sharded, which
+        // it may not if the "nearest" config server it contacts has not replicated the
+        // shardCollection writes (or has not heard that they have reached a majority).
+        st.configRS.awaitReplication();
+
         assert.commandWorked(freshMongos.adminCommand({split: nss, middle: {x: 0}}));
 
-        // Do dummy read from the stale mongos so that it loads the routing table into memory once.
+        // Do dummy read from the stale mongos so it loads the routing table into memory once.
+        // Additionally, do a secondary read to ensure that the secondary has loaded the initial
+        // routing table -- the first read to the primary will refresh the mongos' shardVersion,
+        // which will then be used against the secondary to ensure the secondary is fresh.
         assert.commandWorked(staleMongos.getDB(db).runCommand({find: coll}));
+        assert.commandWorked(freshMongos.getDB(db).runCommand(
+            {find: coll, $readPreference: {mode: 'secondary'}, readConcern: {'level': 'local'}}));
 
         // Do any test-specific setup.
         test.setUp(staleMongos);
 
-        // Turn on system profiler on secondaries to collect data on all database operations.
+        // Wait for replication as a safety net, in case the individual setup function for a test
+        // case did not specify writeConcern itself
+        st.rs0.awaitReplication();
+        st.rs1.awaitReplication();
+
+        assert.commandWorked(recipientShardPrimary.getDB(db).setProfilingLevel(2));
         assert.commandWorked(donorShardSecondary.getDB(db).setProfilingLevel(2));
         assert.commandWorked(recipientShardSecondary.getDB(db).setProfilingLevel(2));
 
@@ -416,32 +417,31 @@
             writeConcern: {w: 2},
         }));
 
-        // Make a read preference secondary copy of the command.
-        let cmdReadPreferenceSecondary = JSON.parse(JSON.stringify(test.command));
-        Object.extend(cmdReadPreferenceSecondary, {$readPreference: {mode: 'secondary'}});
-
-        // Make a read preference secondary and read concern 'available' copy of the command.
+        let cmdReadPrefSecondary =
+            Object.assign({}, test.command, {$readPreference: {mode: 'secondary'}});
         let cmdPrefSecondaryConcernAvailable =
-            JSON.parse(JSON.stringify(cmdReadPreferenceSecondary));
-        Object.extend(cmdPrefSecondaryConcernAvailable, {readConcern: {level: 'available'}});
-
-        // Make a read preference secondary and read concern 'local' copy of the command.
-        let cmdPrefSecondaryConcernLocal = JSON.parse(JSON.stringify(cmdReadPreferenceSecondary));
-        Object.extend(cmdPrefSecondaryConcernLocal, {readConcern: {level: 'local'}});
+            Object.assign({}, cmdReadPrefSecondary, {readConcern: {level: 'available'}});
+        let cmdPrefSecondaryConcernLocal =
+            Object.assign({}, cmdReadPrefSecondary, {readConcern: {level: 'local'}});
 
         let availableReadConcernRes =
             staleMongos.getDB(db).runCommand(cmdPrefSecondaryConcernAvailable);
         test.checkAvailableReadConcernResults(availableReadConcernRes);
 
-        // A request sent to a secondary without read concern defaults to 'available' read concern.
-        let defaultReadConcernRes = staleMongos.getDB(db).runCommand(cmdReadPreferenceSecondary);
-        test.checkAvailableReadConcernResults(defaultReadConcernRes);
+        let defaultReadConcernRes = staleMongos.getDB(db).runCommand(cmdReadPrefSecondary);
+        if (command === 'mapReduce') {
+            // mapReduce is always sent to a primary, which defaults to 'local' readConcern
+            test.checkResults(defaultReadConcernRes);
+        } else {
+            // Secondaries default to the 'available' readConcern
+            test.checkAvailableReadConcernResults(defaultReadConcernRes);
+        }
 
         let localReadConcernRes = staleMongos.getDB(db).runCommand(cmdPrefSecondaryConcernLocal);
         test.checkResults(localReadConcernRes);
 
-        // Build the query to identify the command in the system profiler.
-        let commandProfile = buildCommandProfile(test.command);
+        // Build the query to identify the operation in the system profiler.
+        let commandProfile = buildCommandProfile(test.command, true /* sharded */);
 
         if (test.behavior === "unshardedOnly") {
             // Check that neither the donor nor recipient shard secondaries received either request.
@@ -449,33 +449,19 @@
                 {profileDB: donorShardSecondary.getDB(db), filter: commandProfile});
             profilerHasZeroMatchingEntriesOrThrow(
                 {profileDB: recipientShardSecondary.getDB(db), filter: commandProfile});
-        } else if (test.behavior === "unversioned") {
-            // Check that the donor shard secondary received both requests *without* an attached
-            // shardVersion and returned success for both.
+        } else if (test.behavior === "targetsPrimaryUsesConnectionVersioning") {
+            // Check that the recipient shard primary received the request without a shardVersion
+            // field and returned success.
             profilerHasSingleMatchingEntryOrThrow({
-                profileDB: donorShardSecondary.getDB(db),
+                profileDB: recipientShardPrimary.getDB(db),
                 filter: Object.extend({
                     "command.shardVersion": {"$exists": false},
-                    "command.$readPreference": {"mode": "secondary"},
-                    "command.readConcern": {"level": 'available'},
-                    "exceptionCode": {"$exists": false}
-                },
-                                      commandProfile)
-            });
-            profilerHasSingleMatchingEntryOrThrow({
-                profileDB: donorShardSecondary.getDB(db),
-                filter: Object.extend({
-                    "command.shardVersion": {"$exists": false},
-                    "command.$readPreference": {"mode": "secondary"},
+                    "command.$readPreference": {$exists: false},
                     "command.readConcern": {"level": "local"},
-                    "exceptionCode": {"$exists": false}
+                    "errCode": {"$exists": false},
                 },
                                       commandProfile)
             });
-
-            // Check that the recipient shard secondary did not receive either request.
-            profilerHasZeroMatchingEntriesOrThrow(
-                {profileDB: recipientShardSecondary.getDB(db), filter: commandProfile});
         } else if (test.behavior === "versioned") {
             // Check that the donor shard secondary received both the 'available' read concern
             // request and read concern not specified request and returned success for both, despite
@@ -486,7 +472,7 @@
                     "command.shardVersion": {"$exists": true},
                     "command.$readPreference": {"mode": "secondary"},
                     "command.readConcern": {"level": "available"},
-                    "exceptionCode": {"$exists": false}
+                    "errCode": {"$ne": ErrorCodes.StaleConfig},
                 },
                                       commandProfile)
             });
@@ -496,7 +482,7 @@
                     "command.shardVersion": {"$exists": true},
                     "command.$readPreference": {"mode": "secondary"},
                     "command.readConcern": {"$exists": false},
-                    "exceptionCode": {"$exists": false}
+                    "errCode": {"$ne": ErrorCodes.StaleConfig},
                 },
                                       commandProfile)
             });
@@ -509,7 +495,7 @@
                     "command.shardVersion": {"$exists": true},
                     "command.$readPreference": {"mode": "secondary"},
                     "command.readConcern": {"level": "local"},
-                    "exceptionCode": ErrorCodes.StaleConfig
+                    "errCode": ErrorCodes.StaleConfig
                 },
                                       commandProfile)
             });
@@ -523,7 +509,7 @@
                     "command.shardVersion": {"$exists": true},
                     "command.$readPreference": {"mode": "secondary"},
                     "command.readConcern": {"level": "local"},
-                    "exceptionCode": ErrorCodes.StaleConfig
+                    "errCode": ErrorCodes.StaleConfig
                 },
                                       commandProfile)
             });
@@ -536,7 +522,7 @@
                     "command.shardVersion": {"$exists": true},
                     "command.$readPreference": {"mode": "secondary"},
                     "command.readConcern": {"level": "local"},
-                    "exceptionCode": {"$exists": false}
+                    "errCode": {"$ne": ErrorCodes.StaleConfig},
                 },
                                       commandProfile)
             });

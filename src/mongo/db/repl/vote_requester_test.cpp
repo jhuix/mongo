@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,6 +33,7 @@
 #include <memory>
 
 #include "mongo/base/status.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/vote_requester.h"
@@ -61,6 +64,8 @@ public:
                                          << "rs0"
                                          << "version"
                                          << 2
+                                         << "protocolVersion"
+                                         << 1
                                          << "members"
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                   << "host0")
@@ -99,9 +104,9 @@ public:
 
 protected:
     int64_t countLogLinesContaining(const std::string& needle) {
-        return std::count_if(getCapturedLogMessages().begin(),
-                             getCapturedLogMessages().end(),
-                             stdx::bind(stringContains, stdx::placeholders::_1, needle));
+        const auto& msgs = getCapturedLogMessages();
+        return std::count_if(
+            msgs.begin(), msgs.end(), [&](const auto& s) { return stringContains(s, needle); });
     }
 
     bool hasReceivedSufficientResponses() {
@@ -110,7 +115,16 @@ protected:
 
     void processResponse(const RemoteCommandRequest& request,
                          const RemoteCommandResponse& response) {
-        _requester->processResponse(request, response);
+        if (!response.isOK()) {
+            _requester->processResponse(request, response);
+            return;
+        }
+        BSONObjBuilder builder(response.data);
+        // Appends ok:1.0 (status ok) to response data if 'ok' field is missing.
+        CommandHelpers::appendCommandStatusNoThrow(builder, Status::OK());
+        RemoteCommandResponse responseWithCmdStatus = response;
+        responseWithCmdStatus.data = builder.obj();
+        _requester->processResponse(request, responseWithCmdStatus);
     }
 
     int getNumResponders() {
@@ -133,11 +147,26 @@ protected:
         return RemoteCommandResponse(ErrorCodes::NodeNotFound, "not on my watch");
     }
 
+    RemoteCommandResponse callbackCanceledCommandResponse() {
+        return RemoteCommandResponse(ErrorCodes::CallbackCanceled, "Testing canceled callback");
+    }
+
     RemoteCommandResponse votedYes() {
         ReplSetRequestVotesResponse response;
         response.setVoteGranted(true);
         response.setTerm(1);
-        return RemoteCommandResponse(response.toBSON(), BSONObj(), Milliseconds(10));
+        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
+    }
+
+    RemoteCommandResponse votedYesStatusNotOkBecauseFailedToStoreLastVote() {
+        ReplSetRequestVotesResponse response;
+        BSONObjBuilder result;
+        response.setVoteGranted(true);
+        response.setTerm(1);
+        response.addToBSON(&result);
+        auto status = Status(ErrorCodes::InterruptedDueToStepDown, "operation was interrupted");
+        CommandHelpers::appendCommandStatusNoThrow(result, status);
+        return RemoteCommandResponse(result.obj(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedNoBecauseConfigVersionDoesNotMatch() {
@@ -145,7 +174,7 @@ protected:
         response.setVoteGranted(false);
         response.setTerm(1);
         response.setReason("candidate's config version differs from mine");
-        return RemoteCommandResponse(response.toBSON(), BSONObj(), Milliseconds(10));
+        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedNoBecauseSetNameDiffers() {
@@ -153,7 +182,7 @@ protected:
         response.setVoteGranted(false);
         response.setTerm(1);
         response.setReason("candidate's set name differs from mine");
-        return RemoteCommandResponse(response.toBSON(), BSONObj(), Milliseconds(10));
+        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedNoBecauseLastOpTimeIsGreater() {
@@ -161,7 +190,7 @@ protected:
         response.setVoteGranted(false);
         response.setTerm(1);
         response.setReason("candidate's data is staler than mine");
-        return RemoteCommandResponse(response.toBSON(), BSONObj(), Milliseconds(10));
+        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedNoBecauseTermIsGreater() {
@@ -169,7 +198,7 @@ protected:
         response.setVoteGranted(false);
         response.setTerm(3);
         response.setReason("candidate's term is lower than mine");
-        return RemoteCommandResponse(response.toBSON(), BSONObj(), Milliseconds(10));
+        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
     }
 
     RemoteCommandResponse votedNoBecauseAlreadyVoted() {
@@ -177,7 +206,7 @@ protected:
         response.setVoteGranted(false);
         response.setTerm(2);
         response.setReason("already voted for another candidate this term");
-        return RemoteCommandResponse(response.toBSON(), BSONObj(), Milliseconds(10));
+        return RemoteCommandResponse(response.toBSON(), Milliseconds(10));
     }
 
     std::unique_ptr<VoteRequester::Algorithm> _requester;
@@ -191,6 +220,8 @@ public:
                                          << "rs0"
                                          << "version"
                                          << 2
+                                         << "protocolVersion"
+                                         << 1
                                          << "members"
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                   << "host0")
@@ -232,6 +263,8 @@ public:
                                          << "rs0"
                                          << "version"
                                          << 2
+                                         << "protocolVersion"
+                                         << 1
                                          << "members"
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                   << "host0")
@@ -264,6 +297,19 @@ TEST_F(VoteRequesterTest, ImmediateGoodResponseWinElection) {
     ASSERT_TRUE(hasReceivedSufficientResponses());
     ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
     ASSERT_EQUALS(1, getNumResponders());
+}
+
+TEST_F(VoteRequesterTest, VoterFailedToStoreLastVote) {
+    startCapturingLogMessages();
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedYesStatusNotOkBecauseFailedToStoreLastVote());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1, countLogLinesContaining("received an invalid response from host1:27017"));
+    processResponse(requestFrom("host2"), votedYes());
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    ASSERT(VoteRequester::Result::kSuccessfullyElected == getResult());
+    ASSERT_EQUALS(2, getNumResponders());
+    stopCapturingLogMessages();
 }
 
 TEST_F(VoteRequesterTest, BadConfigVersionWinElection) {
@@ -353,6 +399,22 @@ TEST_F(VoteRequesterTest, NotEnoughVotesLoseElection) {
     ASSERT_TRUE(hasReceivedSufficientResponses());
     ASSERT(VoteRequester::Result::kInsufficientVotes == getResult());
     ASSERT_EQUALS(1, getNumResponders());
+    stopCapturingLogMessages();
+}
+
+TEST_F(VoteRequesterTest, CallbackCanceledNotEnoughVotesLoseElection) {
+    startCapturingLogMessages();
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    processResponse(requestFrom("host1"), votedNoBecauseAlreadyVoted());
+    ASSERT_FALSE(hasReceivedSufficientResponses());
+    ASSERT_EQUALS(1, countLogLinesContaining("received a no vote from host1:27017"));
+    processResponse(requestFrom("host2"), callbackCanceledCommandResponse());
+    ASSERT_EQUALS(1, countLogLinesContaining("failed to receive response from host2:27017"));
+    // Make sure processing the callbackCanceled Response was necessary to get sufficient responses.
+    ASSERT_TRUE(hasReceivedSufficientResponses());
+    // Because of the CallbackCanceled Response, host2 doesn't count as a responder.
+    ASSERT_EQUALS(1, getNumResponders());
+    ASSERT(VoteRequester::Result::kInsufficientVotes == getResult());
     stopCapturingLogMessages();
 }
 

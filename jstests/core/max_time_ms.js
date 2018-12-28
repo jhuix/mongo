@@ -1,16 +1,28 @@
 // Tests query/command option $maxTimeMS.
+//
+// @tags: [
+//   # This test attempts to perform read operations after having enabled the maxTimeAlwaysTimeOut
+//   # failpoint. The former operations may be routed to a secondary in the replica set, whereas the
+//   # latter must be routed to the primary.
+//   assumes_read_preference_unchanged,
+//   requires_getmore,
+//   requires_fastcount,
+//
+//   # Uses $where operator
+//   requires_scripting,
+// ]
 
 var t = db.max_time_ms;
-var exceededTimeLimit = 50;  // ErrorCodes::ExceededTimeLimit
 var cursor;
 var res;
+var error;
 
 //
 // Simple positive test for query: a ~300ms query with a 100ms time limit should be aborted.
 //
 
 t.drop();
-t.insert([{}, {}, {}]);
+assert.commandWorked(t.insert([{}, {}, {}]));
 cursor = t.find({
     $where: function() {
         sleep(100);
@@ -18,9 +30,15 @@ cursor = t.find({
     }
 });
 cursor.maxTimeMS(100);
-assert.throws(function() {
+error = assert.throws(function() {
     cursor.itcount();
 }, [], "expected query to abort due to time limit");
+// TODO SERVER-32565: The error should always be MaxTimeMSExpired, but there are rare cases where
+// interrupting javascript execution on the server with a stepdown or timeout results in an error
+// code of InternalError or Interrupted instead, so we also accept those here.
+assert.contains(error.code,
+                [ErrorCodes.MaxTimeMSExpired, ErrorCodes.Interrupted, ErrorCodes.InternalError],
+                "Failed with error: " + tojson(error));
 
 //
 // Simple negative test for query: a ~300ms query with a 10s time limit should not hit the time
@@ -28,7 +46,7 @@ assert.throws(function() {
 //
 
 t.drop();
-t.insert([{}, {}, {}]);
+assert.commandWorked(t.insert([{}, {}, {}]));
 cursor = t.find({
     $where: function() {
         sleep(100);
@@ -48,8 +66,9 @@ assert.doesNotThrow(function() {
 //
 
 t.drop();
-t.insert([{_id: 0}, {_id: 1}, {_id: 2}]);                                      // fast batch
-t.insert([{_id: 3, slow: true}, {_id: 4, slow: true}, {_id: 5, slow: true}]);  // slow batch
+assert.commandWorked(t.insert([{_id: 0}, {_id: 1}, {_id: 2}]));  // fast batch
+assert.commandWorked(
+    t.insert([{_id: 3, slow: true}, {_id: 4, slow: true}, {_id: 5, slow: true}]));  // slow batch
 cursor = t.find({
               $where: function() {
                   if (this.slow) {
@@ -65,11 +84,17 @@ assert.doesNotThrow(function() {
     cursor.next();
     cursor.next();
 }, [], "expected batch 1 (query) to not hit the time limit");
-assert.throws(function() {
+error = assert.throws(function() {
     cursor.next();
     cursor.next();
     cursor.next();
 }, [], "expected batch 2 (getmore) to abort due to time limit");
+// TODO SERVER-32565: The error should always be MaxTimeMSExpired, but there are rare cases where
+// interrupting javascript execution on the server with a stepdown or timeout results in an error
+// code of InternalError or Interrupted instead, so we also accept those here.
+assert.contains(error.code,
+                [ErrorCodes.MaxTimeMSExpired, ErrorCodes.Interrupted, ErrorCodes.InternalError],
+                "Failed with error: " + tojson(error));
 
 //
 // Simple negative test for getmore:
@@ -79,8 +104,8 @@ assert.throws(function() {
 //
 
 t.drop();
-t.insert([{_id: 0}, {_id: 1}, {_id: 2}]);              // fast batch
-t.insert([{_id: 3}, {_id: 4}, {_id: 5, slow: true}]);  // slow batch
+assert.commandWorked(t.insert([{_id: 0}, {_id: 1}, {_id: 2}]));              // fast batch
+assert.commandWorked(t.insert([{_id: 3}, {_id: 4}, {_id: 5, slow: true}]));  // slow batch
 cursor = t.find({
               $where: function() {
                   if (this.slow) {
@@ -110,7 +135,8 @@ assert.doesNotThrow(function() {
 
 t.drop();
 for (var i = 0; i < 5; i++) {
-    t.insert([{_id: 3 * i}, {_id: (3 * i) + 1}, {_id: (3 * i) + 2, slow: true}]);
+    assert.commandWorked(
+        t.insert([{_id: 3 * i}, {_id: (3 * i) + 1}, {_id: (3 * i) + 2, slow: true}]));
 }
 cursor = t.find({
               $where: function() {
@@ -122,9 +148,15 @@ cursor = t.find({
           }).sort({_id: 1});
 cursor.batchSize(3);
 cursor.maxTimeMS(6 * 1000);
-assert.throws(function() {
+error = assert.throws(function() {
     cursor.itcount();
 }, [], "expected find() to abort due to time limit");
+// TODO SERVER-32565: The error should always be MaxTimeMSExpired, but there are rare cases where
+// interrupting javascript execution on the server with a stepdown or timeout results in an error
+// code of InternalError or Interrupted instead, so we also accept those here.
+assert.contains(error.code,
+                [ErrorCodes.MaxTimeMSExpired, ErrorCodes.Interrupted, ErrorCodes.InternalError],
+                "Failed with error: " + tojson(error));
 
 //
 // Many-batch negative test for getmore:
@@ -134,7 +166,8 @@ assert.throws(function() {
 
 t.drop();
 for (var i = 0; i < 5; i++) {
-    t.insert([{_id: 3 * i}, {_id: (3 * i) + 1}, {_id: (3 * i) + 2, slow: true}]);
+    assert.commandWorked(
+        t.insert([{_id: 3 * i}, {_id: (3 * i) + 1}, {_id: (3 * i) + 2, slow: true}]));
 }
 cursor = t.find({
               $where: function() {
@@ -156,7 +189,7 @@ assert.doesNotThrow(function() {
 
 t.drop();
 res = t.getDB().adminCommand({sleep: 1, millis: 300, maxTimeMS: 100});
-assert(res.ok == 0 && res.code == exceededTimeLimit,
+assert(res.ok == 0 && res.code == ErrorCodes.MaxTimeMSExpired,
        "expected sleep command to abort due to time limit, ok=" + res.ok + ", code=" + res.code);
 
 //
@@ -174,7 +207,7 @@ assert(res.ok == 1,
 //
 
 t.drop();
-t.insert({});
+assert.commandWorked(t.insert({}));
 
 // Verify lower boundary for acceptable input (0 is acceptable, 1 isn't).
 
@@ -284,7 +317,7 @@ t.drop();
 assert.eq(
     1, t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "alwaysOn"}).ok);
 res = t.getDB().runCommand({ping: 1, maxTimeMS: 10 * 1000});
-assert(res.ok == 0 && res.code == exceededTimeLimit,
+assert(res.ok == 0 && res.code == ErrorCodes.MaxTimeMSExpired,
        "expected command to trigger maxTimeAlwaysTimeOut fail point, ok=" + res.ok + ", code=" +
            res.code);
 assert.eq(1, t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "off"}).ok);
@@ -312,7 +345,7 @@ assert.eq(1, t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut",
 assert.eq(1,
           t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "alwaysOn"}).ok);
 t.drop();
-t.insert([{}, {}, {}]);
+assert.commandWorked(t.insert([{}, {}, {}]));
 cursor = t.find({
     $where: function() {
         sleep(100);
@@ -327,7 +360,7 @@ assert.eq(1, t.getDB().adminCommand({configureFailPoint: "maxTimeNeverTimeOut", 
 
 // maxTimeAlwaysTimeOut positive test for getmore.
 t.drop();
-t.insert([{}, {}, {}]);
+assert.commandWorked(t.insert([{}, {}, {}]));
 cursor = t.find().maxTimeMS(10 * 1000).batchSize(2);
 assert.doesNotThrow.automsg(function() {
     cursor.next();
@@ -342,8 +375,9 @@ assert.eq(1, t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut",
 
 // maxTimeNeverTimeOut positive test for getmore.
 t.drop();
-t.insert([{_id: 0}, {_id: 1}, {_id: 2}]);                                      // fast batch
-t.insert([{_id: 3, slow: true}, {_id: 4, slow: true}, {_id: 5, slow: true}]);  // slow batch
+assert.commandWorked(t.insert([{_id: 0}, {_id: 1}, {_id: 2}]));  // fast batch
+assert.commandWorked(
+    t.insert([{_id: 3, slow: true}, {_id: 4, slow: true}, {_id: 5, slow: true}]));  // slow batch
 cursor = t.find({
               $where: function() {
                   if (this.slow) {
@@ -385,20 +419,6 @@ assert(res.ok == 1,
 // "createIndexes" command.
 assert.commandWorked(
     t.runCommand("createIndexes", {indexes: [{key: {x: 1}, name: "x_1"}], maxTimeMS: 60 * 1000}));
-
-//
-// Test maxTimeMS for parallelCollectionScan
-//
-res = t.runCommand({parallelCollectionScan: t.getName(), numCursors: 1, maxTimeMS: 60 * 1000});
-assert.commandWorked(res);
-var cursor = new DBCommandCursor(t.getDB(), res.cursors[0], 5);
-assert.commandWorked(
-    t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "alwaysOn"}));
-assert.throws(function() {
-    cursor.itcount();
-}, [], "expected query to abort due to time limit");
-assert.commandWorked(
-    t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "off"}));
 
 //
 // test count shell helper SERVER-13334

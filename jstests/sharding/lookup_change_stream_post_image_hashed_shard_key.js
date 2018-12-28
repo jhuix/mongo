@@ -1,5 +1,6 @@
 // Tests the behavior of looking up the post image for change streams on collections which are
 // sharded with a hashed shard key.
+// @tags: [uses_change_streams]
 (function() {
     "use strict";
 
@@ -23,11 +24,11 @@
     });
 
     const mongosDB = st.s0.getDB(jsTestName());
-    const mongosColl = mongosDB[jsTestName()];
+    const mongosColl = mongosDB['coll'];
 
     assert.commandWorked(mongosDB.dropDatabase());
 
-    // Enable sharding on the test DB and ensure its primary is shard0000.
+    // Enable sharding on the test DB and ensure its primary is st.shard0.shardName.
     assert.commandWorked(mongosDB.adminCommand({enableSharding: mongosDB.getName()}));
     st.ensurePrimaryShard(mongosDB.getName(), st.rs0.getURL());
 
@@ -65,8 +66,7 @@
         assert.soon(() => changeStream.hasNext());
         let next = changeStream.next();
         assert.eq(next.operationType, "insert");
-        // TODO SERVER-30599 this documentKey should contain the shard key.
-        assert.eq(next.documentKey, {_id: id});
+        assert.eq(next.documentKey, {shardKey: id, _id: id});
 
         assert.soon(() => changeStream.hasNext());
         next = changeStream.next();

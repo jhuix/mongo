@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -97,26 +99,6 @@ BSONObj getOplogTruncateAfterPointDocument(OperationContext* opCtx,
         });
 }
 
-/**
- * Returns checkpoint timestamp document.
- */
-BSONObj getCheckpointTimestampDocument(OperationContext* opCtx,
-                                       const NamespaceString& checkpointTimestampNss) {
-    return writeConflictRetry(
-        opCtx,
-        "getCheckpointTimestampDocument",
-        checkpointTimestampNss.ns(),
-        [opCtx, checkpointTimestampNss] {
-            Lock::DBLock dblk(opCtx, checkpointTimestampNss.db(), MODE_IS);
-            Lock::CollectionLock lk(opCtx->lockState(), checkpointTimestampNss.ns(), MODE_IS);
-            BSONObj mv;
-            if (Helpers::getSingleton(opCtx, checkpointTimestampNss.ns().c_str(), mv)) {
-                return mv;
-            }
-            return mv;
-        });
-}
-
 class ReplicationConsistencyMarkersTest : public ServiceContextMongoDTest {
 protected:
     OperationContext* getOperationContext() {
@@ -167,11 +149,11 @@ bool RecoveryUnitWithDurabilityTracking::waitUntilDurable() {
 TEST_F(ReplicationConsistencyMarkersTest, InitialSyncFlag) {
     auto minValidNss = makeNamespace(_agent, "minValid");
     auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-    auto checkpointTimestampNss = makeNamespace(_agent, "checkpointTimestamp");
 
     ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss, checkpointTimestampNss);
+        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss);
     auto opCtx = getOperationContext();
+    ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
     consistencyMarkers.initializeMinValidDocument(opCtx);
 
     // Initial sync flag should be unset after initializing a new storage engine.
@@ -194,11 +176,11 @@ TEST_F(ReplicationConsistencyMarkersTest, InitialSyncFlag) {
 TEST_F(ReplicationConsistencyMarkersTest, GetMinValidAfterSettingInitialSyncFlagWorks) {
     auto minValidNss = makeNamespace(_agent, "minValid");
     auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-    auto checkpointTimestampNss = makeNamespace(_agent, "checkpointTimestamp");
 
     ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss, checkpointTimestampNss);
+        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss);
     auto opCtx = getOperationContext();
+    ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
     consistencyMarkers.initializeMinValidDocument(opCtx);
 
     // Initial sync flag should be unset after initializing a new storage engine.
@@ -213,21 +195,46 @@ TEST_F(ReplicationConsistencyMarkersTest, GetMinValidAfterSettingInitialSyncFlag
     ASSERT(consistencyMarkers.getOplogTruncateAfterPoint(opCtx).isNull());
 }
 
+TEST_F(ReplicationConsistencyMarkersTest, ClearInitialSyncFlagResetsOplogTruncateAfterPoint) {
+    auto minValidNss = makeNamespace(_agent, "minValid");
+    auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
+
+    ReplicationConsistencyMarkersImpl consistencyMarkers(
+        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss);
+    auto opCtx = getOperationContext();
+    ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
+    consistencyMarkers.initializeMinValidDocument(opCtx);
+
+    ASSERT(consistencyMarkers.getOplogTruncateAfterPoint(opCtx).isNull());
+    ASSERT_FALSE(consistencyMarkers.getInitialSyncFlag(opCtx));
+
+    // Set the oplog truncate after point and verify it has been set correctly.
+    OpTime endOpTime({Seconds(456), 0}, 1LL);
+    consistencyMarkers.setOplogTruncateAfterPoint(opCtx, endOpTime.getTimestamp());
+    ASSERT_EQ(consistencyMarkers.getOplogTruncateAfterPoint(opCtx), endOpTime.getTimestamp());
+
+    // Clear the initial sync flag.
+    consistencyMarkers.clearInitialSyncFlag(opCtx);
+    ASSERT_FALSE(consistencyMarkers.getInitialSyncFlag(opCtx));
+
+    // Make sure the oplog truncate after point no longer exists.
+    ASSERT(consistencyMarkers.getOplogTruncateAfterPoint(opCtx).isNull());
+}
+
 TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
     auto minValidNss = makeNamespace(_agent, "minValid");
     auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-    auto checkpointTimestampNss = makeNamespace(_agent, "checkpointTimestamp");
 
     ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss, checkpointTimestampNss);
+        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss);
     auto opCtx = getOperationContext();
+    ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
     consistencyMarkers.initializeMinValidDocument(opCtx);
 
     // MinValid boundaries should all be null after initializing a new storage engine.
     ASSERT(consistencyMarkers.getMinValid(opCtx).isNull());
     ASSERT(consistencyMarkers.getAppliedThrough(opCtx).isNull());
     ASSERT(consistencyMarkers.getOplogTruncateAfterPoint(opCtx).isNull());
-    ASSERT(consistencyMarkers.getCheckpointTimestamp(opCtx).isNull());
 
     // Setting min valid boundaries should affect getMinValid() result.
     OpTime startOpTime({Seconds(123), 0}, 1LL);
@@ -235,12 +242,10 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
     consistencyMarkers.setAppliedThrough(opCtx, startOpTime);
     consistencyMarkers.setMinValid(opCtx, endOpTime);
     consistencyMarkers.setOplogTruncateAfterPoint(opCtx, endOpTime.getTimestamp());
-    consistencyMarkers.writeCheckpointTimestamp(opCtx, endOpTime.getTimestamp());
 
     ASSERT_EQ(consistencyMarkers.getAppliedThrough(opCtx), startOpTime);
     ASSERT_EQ(consistencyMarkers.getMinValid(opCtx), endOpTime);
     ASSERT_EQ(consistencyMarkers.getOplogTruncateAfterPoint(opCtx), endOpTime.getTimestamp());
-    ASSERT_EQ(consistencyMarkers.getCheckpointTimestamp(opCtx), endOpTime.getTimestamp());
 
     // setMinValid always changes minValid, but setMinValidToAtLeast only does if higher.
     consistencyMarkers.setMinValid(opCtx, startOpTime);  // Forcibly lower it.
@@ -267,96 +272,18 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
                       [OplogTruncateAfterPointDocument::kOplogTruncateAfterPointFieldName]
                           .timestamp());
 
-    // Check checkpoint timestamp document.
-    auto checkpointTimestampDocument =
-        getCheckpointTimestampDocument(opCtx, checkpointTimestampNss);
-    ASSERT_EQUALS(
-        endOpTime.getTimestamp(),
-        checkpointTimestampDocument[CheckpointTimestampDocument::kCheckpointTimestampFieldName]
-            .timestamp());
-
     // Recovery unit will be owned by "opCtx".
     RecoveryUnitWithDurabilityTracking* recoveryUnit = new RecoveryUnitWithDurabilityTracking();
-    opCtx->setRecoveryUnit(recoveryUnit, OperationContext::kNotInUnitOfWork);
+    opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(recoveryUnit),
+                           WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 
     // Set min valid without waiting for the changes to be durable.
     OpTime endOpTime2({Seconds(789), 0}, 1LL);
     consistencyMarkers.setMinValid(opCtx, endOpTime2);
-    consistencyMarkers.setAppliedThrough(opCtx, {});
+    consistencyMarkers.clearAppliedThrough(opCtx, {});
     ASSERT_EQUALS(consistencyMarkers.getAppliedThrough(opCtx), OpTime());
     ASSERT_EQUALS(consistencyMarkers.getMinValid(opCtx), endOpTime2);
     ASSERT_FALSE(recoveryUnit->waitUntilDurableCalled);
 }
 
-TEST_F(ReplicationConsistencyMarkersTest, OplogTruncateAfterPointUpgrade) {
-    auto minValidNss = makeNamespace(_agent, "minValid");
-    auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-    auto checkpointTimestampNss = makeNamespace(_agent, "checkpointTimestamp");
-
-    ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss, checkpointTimestampNss);
-    auto opCtx = getOperationContext();
-    Timestamp time1(Seconds(123), 0);
-    Timestamp time2(Seconds(456), 0);
-    OpTime minValidTime(Timestamp(789), 2);
-
-    // Insert the old oplogDeleteFromPoint and make sure getOplogTruncateAfterPoint() returns it.
-    ASSERT_OK(getStorageInterface()->createCollection(opCtx, minValidNss, {}));
-    ASSERT_OK(getStorageInterface()->insertDocument(
-        opCtx,
-        minValidNss,
-        TimestampedBSONObj{BSON("_id" << OID::gen() << MinValidDocument::kMinValidTimestampFieldName
-                                      << minValidTime.getTimestamp()
-                                      << MinValidDocument::kMinValidTermFieldName
-                                      << minValidTime.getTerm()
-                                      << MinValidDocument::kOldOplogDeleteFromPointFieldName
-                                      << time1),
-                           SnapshotName(0)},
-        OpTime::kUninitializedTerm));
-    consistencyMarkers.initializeMinValidDocument(opCtx);
-
-    // Set the feature compatibility version to 3.6.
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::k36);
-
-    // Check that we see no oplog truncate after point in FCV 3.6.
-    ASSERT(consistencyMarkers.getOplogTruncateAfterPoint(opCtx).isNull());
-    ASSERT_EQ(consistencyMarkers.getMinValid(opCtx), minValidTime);
-
-    // Set the feature compatibility version to 3.4.
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::k34);
-
-    // Check that we see the old oplog delete from point in FCV 3.4.
-    ASSERT_EQ(consistencyMarkers.getOplogTruncateAfterPoint(opCtx), time1);
-    ASSERT_EQ(consistencyMarkers.getMinValid(opCtx), minValidTime);
-
-    // Check that the minValid document has the oplog delete from point.
-    auto minValidDocument = getMinValidDocument(opCtx, minValidNss);
-    ASSERT_TRUE(minValidDocument.hasField(MinValidDocument::kOldOplogDeleteFromPointFieldName));
-
-    consistencyMarkers.removeOldOplogDeleteFromPointField(opCtx);
-
-    // Check that the minValid document does not have the oplog delete from point.
-    minValidDocument = getMinValidDocument(opCtx, minValidNss);
-    ASSERT_FALSE(minValidDocument.hasField(MinValidDocument::kOldOplogDeleteFromPointFieldName));
-
-    // Check that after removing the old oplog delete from point, that we do not see the oplog
-    // truncate after point in FCV 3.4.
-    ASSERT(consistencyMarkers.getOplogTruncateAfterPoint(opCtx).isNull());
-    ASSERT_EQ(consistencyMarkers.getMinValid(opCtx), minValidTime);
-
-    // Set the feature compatibility version to 3.6.
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::k36);
-
-    // Check that after removing the old oplog delete from point, that we do not see the oplog
-    // truncate after point in FCV 3.6.
-    ASSERT(consistencyMarkers.getOplogTruncateAfterPoint(opCtx).isNull());
-    ASSERT_EQ(consistencyMarkers.getMinValid(opCtx), minValidTime);
-
-    // Check that we can set the oplog truncate after point.
-    consistencyMarkers.setOplogTruncateAfterPoint(opCtx, time2);
-    ASSERT_EQ(consistencyMarkers.getOplogTruncateAfterPoint(opCtx), time2);
-}
 }  // namespace

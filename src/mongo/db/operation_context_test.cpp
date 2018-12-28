@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,11 +38,11 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/operation_context_group.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/barrier.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/tick_source_mock.h"
@@ -76,7 +78,7 @@ std::ostream& operator<<(std::ostream& os, stdx::future_status futureStatus) {
 }
 
 TEST(OperationContextTest, NoSessionIdNoTransactionNumber) {
-    auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+    auto serviceCtx = ServiceContext::make();
     auto client = serviceCtx->makeClient("OperationContextTest");
     auto opCtx = client->makeOperationContext();
 
@@ -85,7 +87,7 @@ TEST(OperationContextTest, NoSessionIdNoTransactionNumber) {
 }
 
 TEST(OperationContextTest, SessionIdNoTransactionNumber) {
-    auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+    auto serviceCtx = ServiceContext::make();
     auto client = serviceCtx->makeClient("OperationContextTest");
     auto opCtx = client->makeOperationContext();
 
@@ -99,7 +101,7 @@ TEST(OperationContextTest, SessionIdNoTransactionNumber) {
 }
 
 TEST(OperationContextTest, SessionIdAndTransactionNumber) {
-    auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+    auto serviceCtx = ServiceContext::make();
     auto client = serviceCtx->makeClient("OperationContextTest");
     auto opCtx = client->makeOperationContext();
 
@@ -111,16 +113,44 @@ TEST(OperationContextTest, SessionIdAndTransactionNumber) {
     ASSERT_EQUALS(5, *opCtx->getTxnNumber());
 }
 
+DEATH_TEST(OperationContextTest, SettingSessionIdMoreThanOnceShouldCrash, "invariant") {
+    auto serviceCtx = ServiceContext::make();
+    auto client = serviceCtx->makeClient("OperationContextTest");
+    auto opCtx = client->makeOperationContext();
+
+    opCtx->setLogicalSessionId(makeLogicalSessionIdForTest());
+    opCtx->setLogicalSessionId(makeLogicalSessionIdForTest());
+}
+
+DEATH_TEST(OperationContextTest, SettingTransactionNumberMoreThanOnceShouldCrash, "invariant") {
+    auto serviceCtx = ServiceContext::make();
+    auto client = serviceCtx->makeClient("OperationContextTest");
+    auto opCtx = client->makeOperationContext();
+
+    opCtx->setLogicalSessionId(makeLogicalSessionIdForTest());
+
+    opCtx->setTxnNumber(5);
+    opCtx->setTxnNumber(5);
+}
+
+DEATH_TEST(OperationContextTest, SettingTransactionNumberWithoutSessionIdShouldCrash, "invariant") {
+    auto serviceCtx = ServiceContext::make();
+    auto client = serviceCtx->makeClient("OperationContextTest");
+    auto opCtx = client->makeOperationContext();
+
+    opCtx->setTxnNumber(5);
+}
+
 TEST(OperationContextTest, OpCtxGroup) {
     OperationContextGroup group1;
     ASSERT_TRUE(group1.isEmpty());
     {
-        auto serviceCtx1 = stdx::make_unique<ServiceContextNoop>();
+        auto serviceCtx1 = ServiceContext::make();
         auto client1 = serviceCtx1->makeClient("OperationContextTest1");
         auto opCtx1 = group1.makeOperationContext(*client1);
         ASSERT_FALSE(group1.isEmpty());
 
-        auto serviceCtx2 = stdx::make_unique<ServiceContextNoop>();
+        auto serviceCtx2 = ServiceContext::make();
         auto client2 = serviceCtx2->makeClient("OperationContextTest2");
         {
             auto opCtx2 = group1.makeOperationContext(*client2);
@@ -136,25 +166,12 @@ TEST(OperationContextTest, OpCtxGroup) {
         group1.interrupt(ErrorCodes::InternalError);
         ASSERT_FALSE(opCtx3->checkForInterruptNoAssert().isOK());
         ASSERT_FALSE((*opCtx4).checkForInterruptNoAssert().isOK());
-
-        auto serviceCtx3 = stdx::make_unique<ServiceContextNoop>();
-        auto client3 = serviceCtx3->makeClient("OperationContextTest3");
-        auto opCtx5 = group1.makeOperationContext(*client3);
-        ASSERT_FALSE(opCtx5->checkForInterruptNoAssert().isOK());  // interrupt is sticky
     }
     ASSERT_TRUE(group1.isEmpty());
 
-    {
-        group1.resetInterrupt();
-        auto serviceCtx1 = stdx::make_unique<ServiceContextNoop>();
-        auto client1 = serviceCtx1->makeClient("OperationContextTest3");
-        auto opCtx1 = group1.makeOperationContext(*client1);
-        ASSERT_TRUE(opCtx1->checkForInterruptNoAssert().isOK());  // interrupt unstuck
-    }
-
     OperationContextGroup group2;
     {
-        auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+        auto serviceCtx = ServiceContext::make();
         auto client = serviceCtx->makeClient("OperationContextTest1");
         auto opCtx2 = group2.adopt(client->makeOperationContext());
         ASSERT_FALSE(group2.isEmpty());
@@ -169,7 +186,7 @@ TEST(OperationContextTest, OpCtxGroup) {
     OperationContextGroup group3;
     OperationContextGroup group4;
     {
-        auto serviceCtx = stdx::make_unique<ServiceContextNoop>();
+        auto serviceCtx = ServiceContext::make();
         auto client3 = serviceCtx->makeClient("OperationContextTest3");
         auto opCtx3 = group3.makeOperationContext(*client3);
         auto p3 = opCtx3.opCtx();
@@ -185,24 +202,50 @@ TEST(OperationContextTest, OpCtxGroup) {
     }
 }
 
+TEST(OperationContextTest, IgnoreInterruptsWorks) {
+    auto serviceCtx = ServiceContext::make();
+    auto client = serviceCtx->makeClient("OperationContextTest");
+    auto opCtx = client->makeOperationContext();
+
+    opCtx->markKilled(ErrorCodes::BadValue);
+    ASSERT_THROWS_CODE(opCtx->checkForInterrupt(), DBException, ErrorCodes::BadValue);
+    ASSERT_EQUALS(opCtx->getKillStatus(), ErrorCodes::BadValue);
+
+    opCtx->runWithoutInterruption([&] {
+        ASSERT_OK(opCtx->checkForInterruptNoAssert());
+        ASSERT_OK(opCtx->getKillStatus());
+    });
+
+    ASSERT_THROWS_CODE(opCtx->checkForInterrupt(), DBException, ErrorCodes::BadValue);
+
+    ASSERT_EQUALS(opCtx->getKillStatus(), ErrorCodes::BadValue);
+}
+
 class OperationDeadlineTests : public unittest::Test {
 public:
     void setUp() {
-        service = stdx::make_unique<ServiceContextNoop>();
+        service = ServiceContext::make();
         service->setFastClockSource(stdx::make_unique<SharedClockSourceAdapter>(mockClock));
         service->setPreciseClockSource(stdx::make_unique<SharedClockSourceAdapter>(mockClock));
-        service->setTickSource(stdx::make_unique<TickSourceMock>());
+        service->setTickSource(stdx::make_unique<TickSourceMock<>>());
         client = service->makeClient("OperationDeadlineTest");
     }
 
+    void checkForInterruptForTimeout(OperationContext* opCtx) {
+        stdx::mutex m;
+        stdx::condition_variable cv;
+        stdx::unique_lock<stdx::mutex> lk(m);
+        opCtx->waitForConditionOrInterrupt(cv, lk);
+    }
+
     const std::shared_ptr<ClockSourceMock> mockClock = std::make_shared<ClockSourceMock>();
-    std::unique_ptr<ServiceContext> service;
+    ServiceContext::UniqueServiceContext service;
     ServiceContext::UniqueClient client;
 };
 
 TEST_F(OperationDeadlineTests, OperationDeadlineExpiration) {
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineAfterNowBy(Seconds{1});
+    opCtx->setDeadlineAfterNowBy(Seconds{1}, ErrorCodes::ExceededTimeLimit);
     mockClock->advance(Milliseconds{500});
     ASSERT_OK(opCtx->checkForInterruptNoAssert());
 
@@ -230,7 +273,7 @@ TEST_F(OperationDeadlineTests, OperationDeadlineExpiration) {
 template <typename D>
 void assertLargeRelativeDeadlineLikeInfinity(Client& client, D maxTime) {
     auto opCtx = client.makeOperationContext();
-    opCtx->setDeadlineAfterNowBy(maxTime);
+    opCtx->setDeadlineAfterNowBy(maxTime, ErrorCodes::ExceededTimeLimit);
     ASSERT_FALSE(opCtx->hasDeadline()) << "Tried to set maxTime to " << maxTime;
 }
 
@@ -259,7 +302,7 @@ TEST_F(OperationDeadlineTests, VeryLargeRelativeDeadlinesNanoseconds) {
     // Nanoseconds::max() is less than Microseconds::max(), so it is possible to set
     // a deadline of that duration.
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineAfterNowBy(Nanoseconds::max());
+    opCtx->setDeadlineAfterNowBy(Nanoseconds::max(), ErrorCodes::ExceededTimeLimit);
     ASSERT_TRUE(opCtx->hasDeadline());
     ASSERT_EQ(mockClock->now() + mockClock->getPrecision() +
                   duration_cast<Milliseconds>(Nanoseconds::max()),
@@ -268,7 +311,7 @@ TEST_F(OperationDeadlineTests, VeryLargeRelativeDeadlinesNanoseconds) {
 
 TEST_F(OperationDeadlineTests, WaitForMaxTimeExpiredCV) {
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineByDate(mockClock->now());
+    opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::ExceededTimeLimit);
     stdx::mutex m;
     stdx::condition_variable cv;
     stdx::unique_lock<stdx::mutex> lk(m);
@@ -277,7 +320,7 @@ TEST_F(OperationDeadlineTests, WaitForMaxTimeExpiredCV) {
 
 TEST_F(OperationDeadlineTests, WaitForMaxTimeExpiredCVWithWaitUntilSet) {
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineByDate(mockClock->now());
+    opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::ExceededTimeLimit);
     stdx::mutex m;
     stdx::condition_variable cv;
     stdx::unique_lock<stdx::mutex> lk(m);
@@ -285,6 +328,209 @@ TEST_F(OperationDeadlineTests, WaitForMaxTimeExpiredCVWithWaitUntilSet) {
         ErrorCodes::ExceededTimeLimit,
         opCtx->waitForConditionOrInterruptNoAssertUntil(cv, lk, mockClock->now() + Seconds{10})
             .getStatus());
+}
+
+TEST_F(OperationDeadlineTests, NestedTimeoutsTimeoutInOrder) {
+    auto opCtx = client->makeOperationContext();
+
+    opCtx->setDeadlineByDate(mockClock->now() + Milliseconds(500), ErrorCodes::MaxTimeMSExpired);
+
+    bool reachedA = false;
+    bool reachedB = false;
+    bool reachedC = false;
+
+    try {
+        opCtx->runWithDeadline(
+            mockClock->now() + Milliseconds(100), ErrorCodes::ExceededTimeLimit, [&] {
+                ASSERT_OK(opCtx->checkForInterruptNoAssert());
+
+                try {
+                    opCtx->runWithDeadline(
+                        mockClock->now() + Milliseconds(50), ErrorCodes::ExceededTimeLimit, [&] {
+                            ASSERT_OK(opCtx->checkForInterruptNoAssert());
+                            try {
+                                opCtx->runWithDeadline(mockClock->now() + Milliseconds(10),
+                                                       ErrorCodes::ExceededTimeLimit,
+                                                       [&] {
+                                                           ASSERT_OK(
+                                                               opCtx->checkForInterruptNoAssert());
+                                                           ASSERT_OK(opCtx->getKillStatus());
+                                                           mockClock->advance(Milliseconds(20));
+                                                           checkForInterruptForTimeout(opCtx.get());
+                                                           ASSERT(false);
+                                                       });
+                            } catch (const ExceptionFor<ErrorCodes::ExceededTimeLimit>&) {
+                                opCtx->checkForInterrupt();
+                                ASSERT_OK(opCtx->getKillStatus());
+                                mockClock->advance(Milliseconds(50));
+                                reachedA = true;
+                            }
+
+                            opCtx->checkForInterrupt();
+                        });
+                } catch (const ExceptionFor<ErrorCodes::ExceededTimeLimit>&) {
+                    opCtx->checkForInterrupt();
+                    ASSERT_OK(opCtx->getKillStatus());
+                    mockClock->advance(Milliseconds(50));
+                    reachedB = true;
+                }
+
+                opCtx->checkForInterrupt();
+            });
+    } catch (const ExceptionFor<ErrorCodes::ExceededTimeLimit>&) {
+        reachedC = true;
+        ASSERT_OK(opCtx->getKillStatus());
+        ASSERT_OK(opCtx->checkForInterruptNoAssert());
+    }
+
+    ASSERT(reachedA);
+    ASSERT(reachedB);
+    ASSERT(reachedC);
+
+    ASSERT_OK(opCtx->getKillStatus());
+
+    mockClock->advance(Seconds(1));
+
+    ASSERT_THROWS_CODE(opCtx->checkForInterrupt(), DBException, ErrorCodes::MaxTimeMSExpired);
+}
+
+TEST_F(OperationDeadlineTests, NestedTimeoutsThatViolateMaxTime) {
+    auto opCtx = client->makeOperationContext();
+
+    opCtx->setDeadlineByDate(mockClock->now() + Milliseconds(10), ErrorCodes::MaxTimeMSExpired);
+
+    bool reachedA = false;
+    bool reachedB = false;
+
+    try {
+        opCtx->runWithDeadline(
+            mockClock->now() + Milliseconds(100), ErrorCodes::ExceededTimeLimit, [&] {
+                ASSERT_OK(opCtx->checkForInterruptNoAssert());
+                try {
+                    opCtx->runWithDeadline(
+                        mockClock->now() + Milliseconds(100), ErrorCodes::ExceededTimeLimit, [&] {
+                            ASSERT_OK(opCtx->checkForInterruptNoAssert());
+                            ASSERT_OK(opCtx->getKillStatus());
+                            mockClock->advance(Milliseconds(50));
+                            opCtx->checkForInterrupt();
+                        });
+                } catch (const ExceptionFor<ErrorCodes::ExceededTimeLimit>&) {
+                    reachedA = true;
+                }
+
+                opCtx->checkForInterrupt();
+            });
+    } catch (const ExceptionFor<ErrorCodes::MaxTimeMSExpired>&) {
+        reachedB = true;
+    }
+
+    ASSERT(reachedA);
+    ASSERT(reachedB);
+}
+
+TEST_F(OperationDeadlineTests, NestedNonMaxTimeMSTimeoutsThatAreLargerAreIgnored) {
+    auto opCtx = client->makeOperationContext();
+
+    bool reachedA = false;
+    bool reachedB = false;
+
+    try {
+        opCtx->runWithDeadline(
+            mockClock->now() + Milliseconds(10), ErrorCodes::ExceededTimeLimit, [&] {
+                ASSERT_OK(opCtx->checkForInterruptNoAssert());
+                try {
+                    opCtx->runWithDeadline(
+                        mockClock->now() + Milliseconds(100), ErrorCodes::ExceededTimeLimit, [&] {
+                            ASSERT_OK(opCtx->checkForInterruptNoAssert());
+                            ASSERT_OK(opCtx->getKillStatus());
+                            mockClock->advance(Milliseconds(50));
+                            opCtx->checkForInterrupt();
+                        });
+                } catch (const ExceptionFor<ErrorCodes::ExceededTimeLimit>&) {
+                    reachedA = true;
+                }
+
+                opCtx->checkForInterrupt();
+            });
+    } catch (const ExceptionFor<ErrorCodes::ExceededTimeLimit>&) {
+        reachedB = true;
+    }
+
+    ASSERT(reachedA);
+    ASSERT(reachedB);
+}
+
+TEST_F(OperationDeadlineTests, DeadlineAfterIgnoreInterruptsReopens) {
+    auto opCtx = client->makeOperationContext();
+
+    bool reachedA = false;
+    bool reachedB = false;
+    bool reachedC = false;
+
+    try {
+        opCtx->runWithDeadline(
+            mockClock->now() + Milliseconds(500), ErrorCodes::ExceededTimeLimit, [&] {
+                ASSERT_OK(opCtx->checkForInterruptNoAssert());
+
+                opCtx->runWithoutInterruption([&] {
+                    try {
+                        opCtx->runWithDeadline(
+                            mockClock->now() + Seconds(1), ErrorCodes::ExceededTimeLimit, [&] {
+                                ASSERT_OK(opCtx->checkForInterruptNoAssert());
+                                ASSERT_OK(opCtx->getKillStatus());
+                                mockClock->advance(Milliseconds(750));
+                                ASSERT_OK(opCtx->checkForInterruptNoAssert());
+                                mockClock->advance(Milliseconds(500));
+                                reachedA = true;
+                                opCtx->checkForInterrupt();
+                            });
+                    } catch (const ExceptionFor<ErrorCodes::ExceededTimeLimit>&) {
+                        opCtx->checkForInterrupt();
+                        reachedB = true;
+                    }
+                });
+
+                opCtx->checkForInterrupt();
+            });
+    } catch (const ExceptionFor<ErrorCodes::ExceededTimeLimit>&) {
+        reachedC = true;
+    }
+
+    ASSERT(reachedA);
+    ASSERT(reachedB);
+    ASSERT(reachedC);
+}
+
+TEST_F(OperationDeadlineTests, DeadlineAfterRunWithoutInterruptSeesViolatedMaxMS) {
+    auto opCtx = client->makeOperationContext();
+
+    opCtx->setDeadlineByDate(mockClock->now() + Milliseconds(100), ErrorCodes::MaxTimeMSExpired);
+
+    ASSERT_THROWS_CODE(opCtx->runWithoutInterruption([&] {
+        opCtx->runWithDeadline(
+            mockClock->now() + Milliseconds(200), ErrorCodes::ExceededTimeLimit, [&] {
+                mockClock->advance(Milliseconds(300));
+                opCtx->checkForInterrupt();
+            });
+    }),
+                       DBException,
+                       ErrorCodes::MaxTimeMSExpired);
+}
+
+TEST_F(OperationDeadlineTests, DeadlineAfterRunWithoutInterruptDoesntSeeUnviolatedMaxMS) {
+    auto opCtx = client->makeOperationContext();
+
+    opCtx->setDeadlineByDate(mockClock->now() + Milliseconds(200), ErrorCodes::MaxTimeMSExpired);
+
+    ASSERT_THROWS_CODE(opCtx->runWithoutInterruption([&] {
+        opCtx->runWithDeadline(
+            mockClock->now() + Milliseconds(100), ErrorCodes::ExceededTimeLimit, [&] {
+                mockClock->advance(Milliseconds(150));
+                opCtx->checkForInterrupt();
+            });
+    }),
+                       DBException,
+                       ErrorCodes::ExceededTimeLimit);
 }
 
 TEST_F(OperationDeadlineTests, WaitForKilledOpCV) {
@@ -308,7 +554,7 @@ TEST_F(OperationDeadlineTests, WaitForUntilExpiredCV) {
 
 TEST_F(OperationDeadlineTests, WaitForUntilExpiredCVWithMaxTimeSet) {
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineByDate(mockClock->now() + Seconds{10});
+    opCtx->setDeadlineByDate(mockClock->now() + Seconds{10}, ErrorCodes::ExceededTimeLimit);
     stdx::mutex m;
     stdx::condition_variable cv;
     stdx::unique_lock<stdx::mutex> lk(m);
@@ -328,7 +574,7 @@ TEST_F(OperationDeadlineTests, WaitForDurationExpired) {
 
 TEST_F(OperationDeadlineTests, DuringWaitMaxTimeExpirationDominatesUntilExpiration) {
     auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineByDate(mockClock->now());
+    opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::ExceededTimeLimit);
     stdx::mutex m;
     stdx::condition_variable cv;
     stdx::unique_lock<stdx::mutex> lk(m);
@@ -363,7 +609,7 @@ public:
         auto barrier = std::make_shared<unittest::Barrier>(2);
         auto task = stdx::packaged_task<bool()>([=] {
             if (maxTime < Date_t::max()) {
-                opCtx->setDeadlineByDate(maxTime);
+                opCtx->setDeadlineByDate(maxTime, ErrorCodes::ExceededTimeLimit);
             }
             auto predicate = [state] { return state->isSignaled; };
             stdx::unique_lock<stdx::mutex> lk(state->mutex);

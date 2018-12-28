@@ -1,3 +1,11 @@
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_non_retryable_commands,
+//   requires_non_retryable_writes,
+//   requires_collstats,
+//   requires_capped,
+// ]
+
 // Test various user operations against "system.profile" collection.  SERVER-18111.
 
 var testDB = db.getSiblingDB("system_profile");
@@ -60,14 +68,3 @@ assert.commandWorked(testDB.dropDatabase());
 assert.commandWorked(testDB.createCollection("foo"));
 assert.commandFailed(testDB.adminCommand(
     {renameCollection: testDB.foo.getFullName(), to: testDB.system.profile.getFullName()}));
-
-// Copying a database containing "system.profile" should succeed.  The "system.profile" collection
-// should not be copied.
-assert.commandWorked(testDB.dropDatabase());
-assert.commandWorked(testDB.createCollection("foo"));
-assert.commandWorked(testDB.createCollection("system.profile"));
-assert.commandWorked(testDBCopy.dropDatabase());
-assert.commandWorked(
-    testDB.adminCommand({copydb: 1, fromdb: testDB.getName(), todb: testDBCopy.getName()}));
-assert.commandWorked(testDBCopy.foo.stats());
-assert.commandFailed(testDBCopy.system.profile.stats());

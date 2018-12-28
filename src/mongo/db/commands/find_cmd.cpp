@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,17 +32,12 @@
 
 #include "mongo/platform/basic.h"
 
-#include <memory>
-
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
-#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
@@ -54,37 +51,30 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
-
 namespace {
 
-const char kTermField[] = "term";
-
-}  // namespace
+const auto kTermField = "term"_sd;
 
 /**
  * A command for running .find() queries.
  */
-class FindCmd : public BasicCommand {
-    MONGO_DISALLOW_COPYING(FindCmd);
-
+class FindCmd final : public Command {
 public:
-    FindCmd() : BasicCommand("find") {}
+    FindCmd() : Command("find") {}
 
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
+    std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
+                                             const OpMsgRequest& opMsgRequest) override {
+        // TODO: Parse into a QueryRequest here.
+        return std::make_unique<Invocation>(this, opMsgRequest, opMsgRequest.getDatabase());
     }
 
-    bool slaveOk() const override {
-        return false;
-    }
-
-    bool slaveOverrideOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext* context) const override {
+        return AllowedOnSecondary::kOptIn;
     }
 
     bool maintenanceOk() const override {
@@ -95,19 +85,15 @@ public:
         return false;
     }
 
-    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
-        return true;
-    }
-
-    void help(std::stringstream& help) const override {
-        help << "query for documents";
+    std::string help() const override {
+        return "query for documents";
     }
 
     LogicalOp getLogicalOp() const override {
         return LogicalOp::opQuery;
     }
 
-    ReadWriteType getReadWriteType() const {
+    ReadWriteType getReadWriteType() const override {
         return ReadWriteType::kRead;
     }
 
@@ -123,299 +109,327 @@ public:
         return false;
     }
 
-    Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) override {
-        AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
+    class Invocation final : public CommandInvocation {
+    public:
+        Invocation(const FindCmd* definition, const OpMsgRequest& request, StringData dbName)
+            : CommandInvocation(definition), _request(request), _dbName(dbName) {}
 
-        if (!authSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        const NamespaceString nss(parseNsOrUUID(opCtx, dbname, cmdObj));
-        auto hasTerm = cmdObj.hasField(kTermField);
-        return authSession->checkAuthForFind(nss, hasTerm);
-    }
-
-    Status explain(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
-                   ExplainOptions::Verbosity verbosity,
-                   BSONObjBuilder* out) const override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
-        if (!nss.isValid()) {
-            return {ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid collection name: " << nss.ns()};
+    private:
+        bool supportsWriteConcern() const override {
+            return false;
         }
 
-        // Parse the command BSON to a QueryRequest.
-        const bool isExplain = true;
-        auto qrStatus = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
-        if (!qrStatus.isOK()) {
-            return qrStatus.getStatus();
-        }
-
-        // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
-
-        ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-        const boost::intrusive_ptr<ExpressionContext> expCtx;
-        auto statusWithCQ =
-            CanonicalQuery::canonicalize(opCtx,
-                                         std::move(qrStatus.getValue()),
-                                         expCtx,
-                                         extensionsCallback,
-                                         MatchExpressionParser::kAllowAllSpecialFeatures);
-        if (!statusWithCQ.isOK()) {
-            return statusWithCQ.getStatus();
-        }
-        std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-
-        // Acquire locks. If the namespace is a view, we release our locks and convert the query
-        // request into an aggregation command.
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
-        if (ctx.getView()) {
-            // Relinquish locks. The aggregation command will re-acquire them.
-            ctx.releaseLocksForView();
-
-            // Convert the find command into an aggregation using $match (and other stages, as
-            // necessary), if possible.
-            const auto& qr = cq->getQueryRequest();
-            auto viewAggregationCommand = qr.asAggregationCommand();
-            if (!viewAggregationCommand.isOK())
-                return viewAggregationCommand.getStatus();
-
-            // Create the agg request equivalent of the find operation, with the explain verbosity
-            // included.
-            auto aggRequest = AggregationRequest::parseFromBSON(
-                nss, viewAggregationCommand.getValue(), verbosity);
-            if (!aggRequest.isOK()) {
-                return aggRequest.getStatus();
-            }
-
-            try {
-                return runAggregate(
-                    opCtx, nss, aggRequest.getValue(), viewAggregationCommand.getValue(), *out);
-            } catch (DBException& error) {
-                if (error.code() == ErrorCodes::InvalidPipelineOperator) {
-                    return {ErrorCodes::InvalidPipelineOperator,
-                            str::stream() << "Unsupported in view pipeline: " << error.what()};
-                }
-                return error.toStatus();
-            }
-        }
-
-        // The collection may be NULL. If so, getExecutor() should handle it by returning an
-        // execution tree with an EOFStage.
-        Collection* collection = ctx.getCollection();
-
-        // We have a parsed query. Time to get the execution plan for it.
-        auto statusWithPlanExecutor =
-            getExecutorFind(opCtx, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO);
-        if (!statusWithPlanExecutor.isOK()) {
-            return statusWithPlanExecutor.getStatus();
-        }
-        auto exec = std::move(statusWithPlanExecutor.getValue());
-
-        // Got the execution tree. Explain it.
-        Explain::explainStages(exec.get(), collection, verbosity, out);
-        return Status::OK();
-    }
-
-    /**
-     * Runs a query using the following steps:
-     *   --Parsing.
-     *   --Acquire locks.
-     *   --Plan query, obtaining an executor that can run it.
-     *   --Generate the first batch.
-     *   --Save state for getMore, transferring ownership of the executor to a ClientCursor.
-     *   --Generate response to send to the client.
-     */
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        // Although it is a command, a find command gets counted as a query.
-        globalOpCounters.gotQuery();
-
-        // Parse the command BSON to a QueryRequest.
-        const bool isExplain = false;
-        // Pass parseNs to makeFromFindCommand in case cmdObj does not have a UUID.
-        auto qrStatus = QueryRequest::makeFromFindCommand(
-            NamespaceString(parseNs(dbname, cmdObj)), cmdObj, isExplain);
-        if (!qrStatus.isOK()) {
-            return appendCommandStatus(result, qrStatus.getStatus());
-        }
-
-        auto& qr = qrStatus.getValue();
-
-        // Validate term before acquiring locks, if provided.
-        if (auto term = qr->getReplicationTerm()) {
-            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-            Status status = replCoord->updateTerm(opCtx, *term);
-            // Note: updateTerm returns ok if term stayed the same.
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
-        }
-
-        // Acquire locks. If the query is on a view, we release our locks and convert the query
-        // request into an aggregation command.
-        Lock::DBLock dbSLock(opCtx, dbname, MODE_IS);
-        const NamespaceString nss(parseNsOrUUID(opCtx, dbname, cmdObj));
-        qr->refreshNSS(opCtx);
-
-        // Fill out curop information.
-        //
-        // We pass negative values for 'ntoreturn' and 'ntoskip' to indicate that these values
-        // should be omitted from the log line. Limit and skip information is already present in the
-        // find command parameters, so these fields are redundant.
-        const int ntoreturn = -1;
-        const int ntoskip = -1;
-        beginQueryOp(opCtx, nss, cmdObj, ntoreturn, ntoskip);
-
-        // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
-        ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
-        const boost::intrusive_ptr<ExpressionContext> expCtx;
-        auto statusWithCQ =
-            CanonicalQuery::canonicalize(opCtx,
-                                         std::move(qr),
-                                         expCtx,
-                                         extensionsCallback,
-                                         MatchExpressionParser::kAllowAllSpecialFeatures);
-        if (!statusWithCQ.isOK()) {
-            return appendCommandStatus(result, statusWithCQ.getStatus());
-        }
-        std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
-
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss, std::move(dbSLock));
-        Collection* collection = ctx.getCollection();
-        if (ctx.getView()) {
-            // Relinquish locks. The aggregation command will re-acquire them.
-            ctx.releaseLocksForView();
-
-            // Convert the find command into an aggregation using $match (and other stages, as
-            // necessary), if possible.
-            const auto& qr = cq->getQueryRequest();
-            auto viewAggregationCommand = qr.asAggregationCommand();
-            if (!viewAggregationCommand.isOK())
-                return appendCommandStatus(result, viewAggregationCommand.getStatus());
-
-            BSONObj aggResult = Command::runCommandDirectly(
-                opCtx,
-                OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregationCommand.getValue())));
-            auto status = getStatusFromCommandResult(aggResult);
-            if (status.code() == ErrorCodes::InvalidPipelineOperator) {
-                return appendCommandStatus(
-                    result,
-                    {ErrorCodes::InvalidPipelineOperator,
-                     str::stream() << "Unsupported in view pipeline: " << status.reason()});
-            }
-            result.resetToEmpty();
-            result.appendElements(aggResult);
-            return status.isOK();
-        }
-
-        // Get the execution plan for the query.
-        auto statusWithPlanExecutor =
-            getExecutorFind(opCtx, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO);
-        if (!statusWithPlanExecutor.isOK()) {
-            return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
-        }
-
-        auto exec = std::move(statusWithPlanExecutor.getValue());
-
-        {
-            stdx::lock_guard<Client> lk(*opCtx->getClient());
-            CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
-        }
-
-        if (!collection) {
-            // No collection. Just fill out curop indicating that there were zero results and
-            // there is no ClientCursor id, and then return.
-            const long long numResults = 0;
-            const CursorId cursorId = 0;
-            endQueryOp(opCtx, collection, *exec, numResults, cursorId);
-            appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &result);
+        bool supportsReadConcern(repl::ReadConcernLevel level) const final {
             return true;
         }
 
-        const QueryRequest& originalQR = exec->getCanonicalQuery()->getQueryRequest();
+        bool allowsSpeculativeMajorityReads() const override {
+            // Find queries are only allowed to use speculative behavior if the 'allowsSpeculative'
+            // flag is passed. The find command will check for this flag internally and fail if
+            // necessary.
+            return true;
+        }
 
-        // Stream query results, adding them to a BSONArray as we go.
-        CursorResponseBuilder firstBatch(/*isInitialResponse*/ true, &result);
-        BSONObj obj;
-        PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
-        long long numResults = 0;
-        while (!FindCommon::enoughForFirstBatch(originalQR, numResults) &&
-               PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
-            // If we can't fit this result inside the current batch, then we stash it for later.
-            if (!FindCommon::haveSpaceForNext(obj, numResults, firstBatch.bytesUsed())) {
-                exec->enqueue(obj);
-                break;
+        NamespaceString ns() const override {
+            // TODO get the ns from the parsed QueryRequest.
+            return NamespaceString(CommandHelpers::parseNsFromCommand(_dbName, _request.body));
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
+
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    authSession->isAuthorizedToParseNamespaceElement(_request.body.firstElement()));
+
+            const auto hasTerm = _request.body.hasField(kTermField);
+            uassertStatusOK(authSession->checkAuthForFind(
+                AutoGetCollection::resolveNamespaceStringOrUUID(
+                    opCtx, CommandHelpers::parseNsOrUUID(_dbName, _request.body)),
+                hasTerm));
+        }
+
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     rpc::ReplyBuilderInterface* result) override {
+            // Acquire locks and resolve possible UUID. The RAII object is optional, because in the
+            // case of a view, the locks need to be released.
+            boost::optional<AutoGetCollectionForReadCommand> ctx;
+            ctx.emplace(opCtx,
+                        CommandHelpers::parseNsOrUUID(_dbName, _request.body),
+                        AutoGetCollection::ViewMode::kViewsPermitted);
+            const auto nss = ctx->getNss();
+
+            // Parse the command BSON to a QueryRequest.
+            const bool isExplain = true;
+            auto qr =
+                uassertStatusOK(QueryRequest::makeFromFindCommand(nss, _request.body, isExplain));
+
+            // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
+            const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
+            const boost::intrusive_ptr<ExpressionContext> expCtx;
+            auto cq = uassertStatusOK(
+                CanonicalQuery::canonicalize(opCtx,
+                                             std::move(qr),
+                                             expCtx,
+                                             extensionsCallback,
+                                             MatchExpressionParser::kAllowAllSpecialFeatures));
+
+            if (ctx->getView()) {
+                // Relinquish locks. The aggregation command will re-acquire them.
+                ctx.reset();
+
+                // Convert the find command into an aggregation using $match (and other stages, as
+                // necessary), if possible.
+                const auto& qr = cq->getQueryRequest();
+                auto viewAggregationCommand = uassertStatusOK(qr.asAggregationCommand());
+
+                // Create the agg request equivalent of the find operation, with the explain
+                // verbosity included.
+                auto aggRequest = uassertStatusOK(
+                    AggregationRequest::parseFromBSON(nss, viewAggregationCommand, verbosity));
+
+                try {
+                    uassertStatusOK(
+                        runAggregate(opCtx, nss, aggRequest, viewAggregationCommand, result));
+                } catch (DBException& error) {
+                    if (error.code() == ErrorCodes::InvalidPipelineOperator) {
+                        uasserted(ErrorCodes::InvalidPipelineOperator,
+                                  str::stream() << "Unsupported in view pipeline: "
+                                                << error.what());
+                    }
+                    throw;
+                }
+                return;
             }
 
-            // Add result to output buffer.
-            firstBatch.append(obj);
-            numResults++;
+            // The collection may be NULL. If so, getExecutor() should handle it by returning an
+            // execution tree with an EOFStage.
+            Collection* const collection = ctx->getCollection();
+
+            // We have a parsed query. Time to get the execution plan for it.
+            auto exec = uassertStatusOK(getExecutorFind(opCtx, collection, nss, std::move(cq)));
+
+            auto bodyBuilder = result->getBodyBuilder();
+            // Got the execution tree. Explain it.
+            Explain::explainStages(exec.get(), collection, verbosity, &bodyBuilder);
         }
 
-        // Throw an assertion if query execution fails for any reason.
-        if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
-            firstBatch.abandon();
-            error() << "Plan executor error during find command: " << PlanExecutor::statestr(state)
-                    << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
+        /**
+         * Runs a query using the following steps:
+         *   --Parsing.
+         *   --Acquire locks.
+         *   --Plan query, obtaining an executor that can run it.
+         *   --Generate the first batch.
+         *   --Save state for getMore, transferring ownership of the executor to a ClientCursor.
+         *   --Generate response to send to the client.
+         */
+        void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) {
+            // Although it is a command, a find command gets counted as a query.
+            globalOpCounters.gotQuery();
 
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::OperationFailed,
-                                              str::stream()
-                                                  << "Executor error during find command: "
-                                                  << WorkingSetCommon::toStatusString(obj)));
-        }
+            // Parse the command BSON to a QueryRequest.
+            const bool isExplain = false;
+            // Pass parseNs to makeFromFindCommand in case _request.body does not have a UUID.
+            auto qr = uassertStatusOK(QueryRequest::makeFromFindCommand(
+                NamespaceString(CommandHelpers::parseNsFromCommand(_dbName, _request.body)),
+                _request.body,
+                isExplain));
 
-        // Before saving the cursor, ensure that whatever plan we established happened with the
-        // expected collection version
-        auto css = CollectionShardingState::get(opCtx, nss);
-        css->checkShardVersionOrThrow(opCtx);
+            // Only allow speculative majority for internal commands that specify the correct flag.
+            uassert(ErrorCodes::ReadConcernMajorityNotEnabled,
+                    "Majority read concern is not enabled.",
+                    !(repl::ReadConcernArgs::get(opCtx).isSpeculativeMajority() &&
+                      !qr->allowSpeculativeMajorityRead()));
 
-        // Set up the cursor for getMore.
-        CursorId cursorId = 0;
-        if (shouldSaveCursor(opCtx, collection, state, exec.get())) {
-            // Create a ClientCursor containing this plan executor and register it with the cursor
-            // manager.
-            ClientCursorPin pinnedCursor = collection->getCursorManager()->registerCursor(
-                opCtx,
-                {std::move(exec),
-                 nss,
-                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                 opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
-                 cmdObj});
-            cursorId = pinnedCursor.getCursor()->cursorid();
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            const auto txnParticipant = TransactionParticipant::get(opCtx);
+            uassert(ErrorCodes::InvalidOptions,
+                    "It is illegal to open a tailable cursor in a transaction",
+                    !txnParticipant ||
+                        !(txnParticipant->inMultiDocumentTransaction() && qr->isTailable()));
 
-            invariant(!exec);
-            PlanExecutor* cursorExec = pinnedCursor.getCursor()->getExecutor();
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                    "The 'readOnce' option is not supported within a transaction.",
+                    !txnParticipant ||
+                        !txnParticipant->inActiveOrKilledMultiDocumentTransaction() ||
+                        !qr->isReadOnce());
 
-            // State will be restored on getMore.
-            cursorExec->saveState();
-            cursorExec->detachFromOperationContext();
-
-            // We assume that cursors created through a DBDirectClient are always used from their
-            // original OperationContext, so we do not need to move time to and from the cursor.
-            if (!opCtx->getClient()->isInDirectClient()) {
-                pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(
-                    opCtx->getRemainingMaxTimeMicros());
+            // Validate term before acquiring locks, if provided.
+            if (auto term = qr->getReplicationTerm()) {
+                // Note: updateTerm returns ok if term stayed the same.
+                uassertStatusOK(replCoord->updateTerm(opCtx, *term));
             }
-            pinnedCursor.getCursor()->setPos(numResults);
 
-            // Fill out curop based on the results.
-            endQueryOp(opCtx, collection, *cursorExec, numResults, cursorId);
-        } else {
-            endQueryOp(opCtx, collection, *exec, numResults, cursorId);
+            // Acquire locks. If the query is on a view, we release our locks and convert the query
+            // request into an aggregation command.
+            boost::optional<AutoGetCollectionForReadCommand> ctx;
+            ctx.emplace(opCtx,
+                        CommandHelpers::parseNsOrUUID(_dbName, _request.body),
+                        AutoGetCollection::ViewMode::kViewsPermitted);
+            const auto& nss = ctx->getNss();
+
+            qr->refreshNSS(opCtx);
+
+            // Check whether we are allowed to read from this node after acquiring our locks.
+            uassertStatusOK(replCoord->checkCanServeReadsFor(
+                opCtx, nss, ReadPreferenceSetting::get(opCtx).canRunOnSecondary()));
+
+            // Fill out curop information.
+            //
+            // We pass negative values for 'ntoreturn' and 'ntoskip' to indicate that these values
+            // should be omitted from the log line. Limit and skip information is already present in
+            // the find command parameters, so these fields are redundant.
+            const int ntoreturn = -1;
+            const int ntoskip = -1;
+            beginQueryOp(opCtx, nss, _request.body, ntoreturn, ntoskip);
+
+            // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
+            const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
+            const boost::intrusive_ptr<ExpressionContext> expCtx;
+            auto cq = uassertStatusOK(
+                CanonicalQuery::canonicalize(opCtx,
+                                             std::move(qr),
+                                             expCtx,
+                                             extensionsCallback,
+                                             MatchExpressionParser::kAllowAllSpecialFeatures));
+
+            if (ctx->getView()) {
+                // Relinquish locks. The aggregation command will re-acquire them.
+                ctx.reset();
+
+                // Convert the find command into an aggregation using $match (and other stages, as
+                // necessary), if possible.
+                const auto& qr = cq->getQueryRequest();
+                auto viewAggregationCommand = uassertStatusOK(qr.asAggregationCommand());
+
+                BSONObj aggResult = CommandHelpers::runCommandDirectly(
+                    opCtx, OpMsgRequest::fromDBAndBody(_dbName, std::move(viewAggregationCommand)));
+                auto status = getStatusFromCommandResult(aggResult);
+                if (status.code() == ErrorCodes::InvalidPipelineOperator) {
+                    uasserted(ErrorCodes::InvalidPipelineOperator,
+                              str::stream() << "Unsupported in view pipeline: " << status.reason());
+                }
+                uassertStatusOK(status);
+                result->getBodyBuilder().appendElements(aggResult);
+                return;
+            }
+
+            Collection* const collection = ctx->getCollection();
+
+            if (cq->getQueryRequest().isReadOnce()) {
+                // The readOnce option causes any storage-layer cursors created during plan
+                // execution to assume read data will not be needed again and need not be cached.
+                opCtx->recoveryUnit()->setReadOnce(true);
+            }
+
+            // Get the execution plan for the query.
+            auto exec = uassertStatusOK(getExecutorFind(opCtx, collection, nss, std::move(cq)));
+
+            {
+                stdx::lock_guard<Client> lk(*opCtx->getClient());
+                CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+            }
+
+            if (!collection) {
+                // No collection. Just fill out curop indicating that there were zero results and
+                // there is no ClientCursor id, and then return.
+                const long long numResults = 0;
+                const CursorId cursorId = 0;
+                endQueryOp(opCtx, collection, *exec, numResults, cursorId);
+                auto bodyBuilder = result->getBodyBuilder();
+                appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &bodyBuilder);
+                return;
+            }
+
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &waitInFindBeforeMakingBatch, opCtx, "waitInFindBeforeMakingBatch");
+
+            const QueryRequest& originalQR = exec->getCanonicalQuery()->getQueryRequest();
+
+            // Stream query results, adding them to a BSONArray as we go.
+            CursorResponseBuilder::Options options;
+            options.isInitialResponse = true;
+            CursorResponseBuilder firstBatch(result, options);
+            BSONObj obj;
+            PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
+            std::uint64_t numResults = 0;
+            while (!FindCommon::enoughForFirstBatch(originalQR, numResults) &&
+                   PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
+                // If we can't fit this result inside the current batch, then we stash it for later.
+                if (!FindCommon::haveSpaceForNext(obj, numResults, firstBatch.bytesUsed())) {
+                    exec->enqueue(obj);
+                    break;
+                }
+
+                // Add result to output buffer.
+                firstBatch.append(obj);
+                numResults++;
+            }
+
+            // Throw an assertion if query execution fails for any reason.
+            if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
+                firstBatch.abandon();
+                LOG(1) << "Plan executor error during find command: "
+                       << PlanExecutor::statestr(state)
+                       << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
+
+                uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                    "Executor error during find command"));
+            }
+
+            // Before saving the cursor, ensure that whatever plan we established happened with the
+            // expected collection version
+            auto css = CollectionShardingState::get(opCtx, nss);
+            css->checkShardVersionOrThrow(opCtx);
+
+            // Set up the cursor for getMore.
+            CursorId cursorId = 0;
+            if (shouldSaveCursor(opCtx, collection, state, exec.get())) {
+                // Create a ClientCursor containing this plan executor and register it with the
+                // cursor manager.
+                ClientCursorPin pinnedCursor = collection->getCursorManager()->registerCursor(
+                    opCtx,
+                    {std::move(exec),
+                     nss,
+                     AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                     repl::ReadConcernArgs::get(opCtx),
+                     _request.body});
+                cursorId = pinnedCursor.getCursor()->cursorid();
+
+                invariant(!exec);
+                PlanExecutor* cursorExec = pinnedCursor.getCursor()->getExecutor();
+
+                // State will be restored on getMore.
+                cursorExec->saveState();
+                cursorExec->detachFromOperationContext();
+
+                // We assume that cursors created through a DBDirectClient are always used from
+                // their original OperationContext, so we do not need to move time to and from the
+                // cursor.
+                if (!opCtx->getClient()->isInDirectClient()) {
+                    pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(
+                        opCtx->getRemainingMaxTimeMicros());
+                }
+                pinnedCursor.getCursor()->setNReturnedSoFar(numResults);
+                pinnedCursor.getCursor()->incNBatches();
+
+                // Fill out curop based on the results.
+                endQueryOp(opCtx, collection, *cursorExec, numResults, cursorId);
+            } else {
+                endQueryOp(opCtx, collection, *exec, numResults, cursorId);
+            }
+
+            // Generate the response object to send to the client.
+            firstBatch.done(cursorId, nss.ns());
         }
 
-        // Generate the response object to send to the client.
-        firstBatch.done(cursorId, nss.ns());
-        return true;
-    }
+    private:
+        const OpMsgRequest& _request;
+        const StringData _dbName;
+    };
 
 } findCmd;
 
+}  // namespace
 }  // namespace mongo

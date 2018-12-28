@@ -1,3 +1,5 @@
+// @tags: [requires_non_retryable_writes, requires_fastcount]
+
 //
 // Test of sample big polygon functionality
 //

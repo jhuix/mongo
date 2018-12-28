@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2018 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -50,8 +50,8 @@ class test_timestamp07(wttest.WiredTigerTestCase, suite_subprocess):
     ]
 
     conncfg = [
-        ('nolog', dict(conn_config='create,cache_size=1M', using_log=False)),
-        ('log', dict(conn_config='create,log=(enabled),cache_size=1M', using_log=True)),
+        ('nolog', dict(conn_config='create,cache_size=2M', using_log=False)),
+        ('log', dict(conn_config='create,log=(file_max=1M,archive=false,enabled),cache_size=2M', using_log=True)),
     ]
 
     nkeys = [
@@ -173,9 +173,6 @@ class test_timestamp07(wttest.WiredTigerTestCase, suite_subprocess):
             check_value, valcnt, valcnt2, valcnt)
 
     def test_timestamp07(self):
-        if not wiredtiger.timestamp_build():
-            self.skipTest('requires a timestamp build')
-
         uri = self.uri + self.tablename
         uri2 = self.uri + self.tablename2
         uri3 = self.uri + self.tablename3
@@ -191,6 +188,7 @@ class test_timestamp07(wttest.WiredTigerTestCase, suite_subprocess):
         c2 = self.session.open_cursor(uri2)
         self.session.create(uri3, 'key_format=i,value_format=S')
         c3 = self.session.open_cursor(uri3)
+        # print "tables created"
 
         # Insert keys 1..nkeys each with timestamp=key, in some order.
         orig_keys = range(1, self.nkeys+1)
@@ -204,6 +202,8 @@ class test_timestamp07(wttest.WiredTigerTestCase, suite_subprocess):
             c3[k] = self.value
             self.session.commit_transaction('commit_timestamp=' + timestamp_str(k))
 
+        # print "value inserted in all tables, reading..."
+
         # Now check that we see the expected state when reading at each
         # timestamp.
         for k in orig_keys:
@@ -212,12 +212,16 @@ class test_timestamp07(wttest.WiredTigerTestCase, suite_subprocess):
             self.check(self.session, 'read_timestamp=' + timestamp_str(k),
                 k + 1, None)
 
+        # print "all values read, updating timestamps"
+
         # Bump the oldest timestamp, we're not going back...
         self.assertTimestampsEqual(self.conn.query_timestamp(), timestamp_str(self.nkeys))
         self.oldts = self.stablets = timestamp_str(self.nkeys)
         self.conn.set_timestamp('oldest_timestamp=' + self.oldts)
         self.conn.set_timestamp('stable_timestamp=' + self.stablets)
         # print "Oldest " + self.oldts
+
+        # print "inserting value2 in all tables"
 
         # Update them and retry.
         random.shuffle(keys)
@@ -241,6 +245,7 @@ class test_timestamp07(wttest.WiredTigerTestCase, suite_subprocess):
 
         # Take a checkpoint using the given configuration.  Then verify
         # whether value2 appears in a copy of that data or not.
+        # print "check_stable 1"
         self.check_stable(self.value2, 0, self.nkeys, self.nkeys if self.using_log else 0)
 
         # Update the stable timestamp to the latest, but not the oldest
@@ -248,6 +253,7 @@ class test_timestamp07(wttest.WiredTigerTestCase, suite_subprocess):
         # timestamp is moved we should see all keys with value2.
         self.stablets = timestamp_str(self.nkeys*2)
         self.conn.set_timestamp('stable_timestamp=' + self.stablets)
+        # print "check_stable 2"
         self.check_stable(self.value2, self.nkeys, self.nkeys, self.nkeys)
 
         # If we're not using the log we're done.
@@ -281,6 +287,7 @@ class test_timestamp07(wttest.WiredTigerTestCase, suite_subprocess):
         # of that data or not.  Both tables that are logged should see
         # all the data regardless of timestamps.  The table that is not
         # logged should not see any of it.
+        # print "check_stable 3"
         self.check_stable(self.value3, 0, self.nkeys, self.nkeys)
 
 if __name__ == '__main__':

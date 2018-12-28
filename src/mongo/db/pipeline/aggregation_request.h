@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,7 +36,9 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/exchange_spec_gen.h"
 #include "mongo/db/query/explain_options.h"
+#include "mongo/db/write_concern_options.h"
 
 namespace mongo {
 
@@ -52,13 +56,13 @@ public:
     static constexpr StringData kBatchSizeName = "batchSize"_sd;
     static constexpr StringData kFromMongosName = "fromMongos"_sd;
     static constexpr StringData kNeedsMergeName = "needsMerge"_sd;
-    static constexpr StringData kNeedsMerge34Name = "fromRouter"_sd;
     static constexpr StringData kPipelineName = "pipeline"_sd;
     static constexpr StringData kCollationName = "collation"_sd;
     static constexpr StringData kExplainName = "explain"_sd;
     static constexpr StringData kAllowDiskUseName = "allowDiskUse"_sd;
     static constexpr StringData kHintName = "hint"_sd;
     static constexpr StringData kCommentName = "comment"_sd;
+    static constexpr StringData kExchangeName = "exchange"_sd;
 
     static constexpr long long kDefaultBatchSize = 101;
 
@@ -141,13 +145,6 @@ public:
     }
 
     /**
-     * Returns true if this request originated from a 3.4 mongos.
-     */
-    bool isFrom34Mongos() const {
-        return _from34Mongos;
-    }
-
-    /**
      * Returns true if this request represents the shards part of a split pipeline, and should
      * produce mergeable output.
      */
@@ -194,6 +191,14 @@ public:
         return _unwrappedReadPref;
     }
 
+    const auto& getExchangeSpec() const {
+        return _exchangeSpec;
+    }
+
+    boost::optional<WriteConcernOptions> getWriteConcern() const {
+        return _writeConcern;
+    }
+
     //
     // Setters for optional fields.
     //
@@ -230,10 +235,6 @@ public:
         _fromMongos = isFromMongos;
     }
 
-    void setFrom34Mongos(bool isFrom34Mongos) {
-        _from34Mongos = isFrom34Mongos;
-    }
-
     void setNeedsMerge(bool needsMerge) {
         _needsMerge = needsMerge;
     }
@@ -252,6 +253,14 @@ public:
 
     void setUnwrappedReadPref(BSONObj unwrappedReadPref) {
         _unwrappedReadPref = unwrappedReadPref.getOwned();
+    }
+
+    void setExchangeSpec(ExchangeSpec spec) {
+        _exchangeSpec = std::move(spec);
+    }
+
+    void setWriteConcern(WriteConcernOptions writeConcern) {
+        _writeConcern = writeConcern;
     }
 
 private:
@@ -274,7 +283,7 @@ private:
     // {$hint: <String>}, where <String> is the index name hinted.
     BSONObj _hint;
 
-    // The comment parameter attached to this aggregation.
+    // The comment parameter attached to this aggregation, empty if not set.
     std::string _comment;
 
     BSONObj _readConcern;
@@ -292,13 +301,15 @@ private:
     bool _needsMerge = false;
     bool _bypassDocumentValidation = false;
 
-    // We track whether the aggregation request came from a 3.4 mongos. If so, the merge may occur
-    // on a 3.4 shard (which does not understand sort key metadata), and we should not serialize the
-    // sort key.
-    // TODO SERVER-30924: remove this.
-    bool _from34Mongos = false;
-
     // A user-specified maxTimeMS limit, or a value of '0' if not specified.
     unsigned int _maxTimeMS = 0;
+
+    // An optional exchange specification for this request. If set it means that the request
+    // represents a producer running as a part of the exchange machinery.
+    // This is an internal option; we do not expect it to be set on requests from users or drivers.
+    boost::optional<ExchangeSpec> _exchangeSpec;
+
+    // The explicit writeConcern for the operation or boost::none if the user did not specifiy one.
+    boost::optional<WriteConcernOptions> _writeConcern;
 };
 }  // namespace mongo

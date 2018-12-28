@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -189,8 +191,7 @@ UpdateNode::ApplyResult ModifierNode::applyToExistingElement(ApplyParams applyPa
 
     ApplyResult applyResult;
 
-    if (!applyParams.indexData ||
-        !applyParams.indexData->mightBeIndexed(applyParams.pathTaken->dottedField())) {
+    if (!applyParams.indexData || !applyParams.indexData->mightBeIndexed(*applyParams.pathTaken)) {
         applyResult.indexesAffected = false;
     }
 
@@ -270,23 +271,37 @@ UpdateNode::ApplyResult ModifierNode::applyToNonexistentElement(ApplyParams appl
         }
 
         invariant(!applyParams.pathToCreate->empty());
-        std::string fullPath;
+        FieldRef fullPath;
         if (applyParams.pathTaken->empty()) {
-            fullPath = applyParams.pathToCreate->dottedField().toString();
+            fullPath = *applyParams.pathToCreate;
         } else {
-            fullPath = str::stream() << applyParams.pathTaken->dottedField() << "."
-                                     << applyParams.pathToCreate->dottedField();
+            fullPath = FieldRef(str::stream() << applyParams.pathTaken->dottedField() << "."
+                                              << applyParams.pathToCreate->dottedField());
+
+            // If adding an element to an array, only mark the path to the array itself as modified.
+            if (applyParams.modifiedPaths && applyParams.element.getType() == BSONType::Array) {
+                applyParams.modifiedPaths->keepShortest(*applyParams.pathTaken);
+            }
         }
 
         ApplyResult applyResult;
 
-        // Determine if indexes are affected.
-        if (!applyParams.indexData || !applyParams.indexData->mightBeIndexed(fullPath)) {
+        // Determine if indexes are affected. If we did not create a new element in an array, check
+        // whether the full path affects indexes. If we did create a new element in an array, check
+        // whether the array itself might affect any indexes. This is necessary because if there is
+        // an index {"a.b": 1}, and we set "a.1.c" and implicitly create an array element in "a",
+        // then we may need to add a null key to the index, even though "a.1.c" does not appear to
+        // affect the index.
+        if (!applyParams.indexData ||
+            !applyParams.indexData->mightBeIndexed(applyParams.element.getType() != BSONType::Array
+                                                       ? fullPath
+                                                       : *applyParams.pathTaken)) {
             applyResult.indexesAffected = false;
         }
 
         if (applyParams.logBuilder) {
-            logUpdate(applyParams.logBuilder, fullPath, newElement, ModifyResult::kCreated);
+            logUpdate(
+                applyParams.logBuilder, fullPath.dottedField(), newElement, ModifyResult::kCreated);
         }
 
         return applyResult;
@@ -305,13 +320,20 @@ UpdateNode::ApplyResult ModifierNode::applyToNonexistentElement(ApplyParams appl
 }
 
 UpdateNode::ApplyResult ModifierNode::apply(ApplyParams applyParams) const {
+    ApplyResult result;
     if (context == Context::kInsertOnly && !applyParams.insert) {
-        return ApplyResult::noopResult();
+        result = ApplyResult::noopResult();
     } else if (!applyParams.pathToCreate->empty()) {
-        return applyToNonexistentElement(applyParams);
+        result = applyToNonexistentElement(applyParams);
     } else {
-        return applyToExistingElement(applyParams);
+        result = applyToExistingElement(applyParams);
     }
+
+    if (applyParams.modifiedPaths) {
+        applyParams.modifiedPaths->keepShortest(*applyParams.pathTaken + *applyParams.pathToCreate);
+    }
+
+    return result;
 }
 
 void ModifierNode::validateUpdate(mutablebson::ConstElement updatedElement,

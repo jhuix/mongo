@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +30,7 @@
 
 #pragma once
 
+#include <array>
 #include <vector>
 
 #include "mongo/db/service_context.h"
@@ -36,9 +39,9 @@
 #include "mongo/stdx/list.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/service_executor.h"
+#include "mongo/transport/service_executor_task_names.h"
+#include "mongo/transport/transport_layer.h"
 #include "mongo/util/tick_source.h"
-
-#include <asio.hpp>
 
 namespace mongo {
 namespace transport {
@@ -80,9 +83,9 @@ public:
         virtual int recursionLimit() const = 0;
     };
 
-    explicit ServiceExecutorAdaptive(ServiceContext* ctx, std::shared_ptr<asio::io_context> ioCtx);
+    explicit ServiceExecutorAdaptive(ServiceContext* ctx, ReactorHandle reactor);
     explicit ServiceExecutorAdaptive(ServiceContext* ctx,
-                                     std::shared_ptr<asio::io_context> ioCtx,
+                                     ReactorHandle reactor,
                                      std::unique_ptr<Options> config);
 
     ServiceExecutorAdaptive(ServiceExecutorAdaptive&&) = default;
@@ -91,7 +94,7 @@ public:
 
     Status start() final;
     Status shutdown(Milliseconds timeout) final;
-    Status schedule(Task task, ScheduleFlags flags) final;
+    Status schedule(Task task, ScheduleFlags flags, ServiceExecutorTaskName taskName) final;
 
     Mode transportMode() const final {
         return Mode::kAsynchronous;
@@ -165,32 +168,53 @@ private:
         bool _running = false;
     };
 
+    struct Metrics {
+        AtomicWord<int64_t> _totalQueued{0};
+        AtomicWord<int64_t> _totalExecuted{0};
+        AtomicWord<TickSource::Tick> _totalSpentQueued{0};
+        AtomicWord<TickSource::Tick> _totalSpentExecuting{0};
+    };
+
+    using MetricsArray =
+        std::array<Metrics, static_cast<size_t>(ServiceExecutorTaskName::kMaxTaskName)>;
+
+    enum class ThreadCreationReason { kStuckDetection, kStarvation, kReserveMinimum, kMax };
+    enum class ThreadTimer { kRunning, kExecuting };
+
     struct ThreadState {
         ThreadState(TickSource* ts) : running(ts), executing(ts) {}
 
         CumulativeTickTimer running;
         TickSource::Tick executingCurRun;
         CumulativeTickTimer executing;
+        MetricsArray threadMetrics;
+        std::int64_t markIdleCounter = 0;
         int recursionDepth = 0;
     };
 
     using ThreadList = stdx::list<ThreadState>;
 
-    void _startWorkerThread();
+    void _startWorkerThread(ThreadCreationReason reason);
+    static StringData _threadStartedByToString(ThreadCreationReason reason);
     void _workerThreadRoutine(int threadId, ThreadList::iterator it);
     void _controllerThreadRoutine();
     bool _isStarved() const;
     Milliseconds _getThreadJitter() const;
 
-    enum class ThreadTimer { Running, Executing };
-    TickSource::Tick _getThreadTimerTotal(ThreadTimer which) const;
+    void _accumulateTaskMetrics(MetricsArray* outArray, const MetricsArray& inputArray) const;
+    void _accumulateAllTaskMetrics(MetricsArray* outputMetricsArray,
+                                   const stdx::unique_lock<stdx::mutex>& lk) const;
+    TickSource::Tick _getThreadTimerTotal(ThreadTimer which,
+                                          const stdx::unique_lock<stdx::mutex>& lk) const;
 
-    std::shared_ptr<asio::io_context> _ioContext;
+    ReactorHandle _reactorHandle;
 
     std::unique_ptr<Options> _config;
 
     mutable stdx::mutex _threadsMutex;
     ThreadList _threads;
+    std::array<int64_t, static_cast<size_t>(ThreadCreationReason::kMax)> _threadStartCounters;
+
     stdx::thread _controllerThread;
 
     TickSource* const _tickSource;
@@ -199,7 +223,7 @@ private:
     // These counters are used to detect stuck threads and high task queuing.
     AtomicWord<int> _threadsRunning{0};
     AtomicWord<int> _threadsPending{0};
-    AtomicWord<int> _tasksExecuting{0};
+    AtomicWord<int> _threadsInUse{0};
     AtomicWord<int> _tasksQueued{0};
     AtomicWord<int> _deferredTasksQueued{0};
     TickTimer _lastScheduleTimer;
@@ -218,7 +242,10 @@ private:
 
     // Tasks should signal this condition variable if they want the thread controller to
     // track their progress and do fast stuck detection
+    AtomicWord<int> _starvationCheckRequests{0};
     stdx::condition_variable _scheduleCondition;
+
+    MetricsArray _accumulatedMetrics;
 };
 
 }  // namespace transport

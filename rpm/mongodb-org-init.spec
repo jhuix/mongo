@@ -231,7 +231,7 @@ fi
 %attr(0755,mongod,mongod) %dir /var/log/mongodb
 %attr(0755,mongod,mongod) %dir /var/run/mongodb
 %attr(0640,mongod,mongod) %config(noreplace) %verify(not md5 size mtime) /var/log/mongodb/mongod.log
-%doc GNU-AGPL-3.0
+%doc LICENSE-Community.txt
 %doc README
 %doc THIRD-PARTY-NOTICES
 %doc MPL-2
@@ -250,15 +250,14 @@ fi
 
 %files tools
 %defattr(-,root,root,-)
-#%doc README GNU-AGPL-3.0.txt
+#%doc README
 
 %{_bindir}/bsondump
+%{_bindir}/install_compass
 %{_bindir}/mongodump
 %{_bindir}/mongoexport
 %{_bindir}/mongofiles
 %{_bindir}/mongoimport
-%{_bindir}/mongooplog
-%{_bindir}/mongoperf
 %{_bindir}/mongorestore
 %{_bindir}/mongotop
 %{_bindir}/mongostat
@@ -268,8 +267,6 @@ fi
 %{_mandir}/man1/mongoexport.1*
 %{_mandir}/man1/mongofiles.1*
 %{_mandir}/man1/mongoimport.1*
-%{_mandir}/man1/mongooplog.1*
-%{_mandir}/man1/mongoperf.1*
 %{_mandir}/man1/mongorestore.1*
 %{_mandir}/man1/mongotop.1*
 %{_mandir}/man1/mongostat.1*

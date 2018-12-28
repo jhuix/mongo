@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -25,6 +27,8 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -36,6 +40,7 @@
 #include "mongo/db/repl/scatter_gather_algorithm.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -49,8 +54,10 @@ using RemoteCommandCallbackArgs = executor::TaskExecutor::RemoteCommandCallbackA
 using RemoteCommandCallbackFn = executor::TaskExecutor::RemoteCommandCallbackFn;
 
 ScatterGatherRunner::ScatterGatherRunner(std::shared_ptr<ScatterGatherAlgorithm> algorithm,
-                                         executor::TaskExecutor* executor)
-    : _executor(executor), _impl(std::make_shared<RunnerImpl>(std::move(algorithm), executor)) {}
+                                         executor::TaskExecutor* executor,
+                                         std::string logMessage)
+    : _executor(executor),
+      _impl(std::make_shared<RunnerImpl>(std::move(algorithm), executor, std::move(logMessage))) {}
 
 Status ScatterGatherRunner::run() {
     auto finishEvh = start();
@@ -80,8 +87,9 @@ void ScatterGatherRunner::cancel() {
  * Scatter gather runner implementation.
  */
 ScatterGatherRunner::RunnerImpl::RunnerImpl(std::shared_ptr<ScatterGatherAlgorithm> algorithm,
-                                            executor::TaskExecutor* executor)
-    : _executor(executor), _algorithm(std::move(algorithm)) {}
+                                            executor::TaskExecutor* executor,
+                                            std::string logMessage)
+    : _executor(executor), _algorithm(std::move(algorithm)), _logMessage(std::move(logMessage)) {}
 
 StatusWith<EventHandle> ScatterGatherRunner::RunnerImpl::start(
     const RemoteCommandCallbackFn processResponseCB) {
@@ -98,6 +106,8 @@ StatusWith<EventHandle> ScatterGatherRunner::RunnerImpl::start(
 
     std::vector<RemoteCommandRequest> requests = _algorithm->getRequests();
     for (size_t i = 0; i < requests.size(); ++i) {
+        log() << "Scheduling remote command request for " << _logMessage << ": "
+              << requests[i].toString();
         const StatusWith<CallbackHandle> cbh =
             _executor->scheduleRemoteCommand(requests[i], processResponseCB);
         if (cbh.getStatus() == ErrorCodes::ShutdownInProgress) {
@@ -138,10 +148,6 @@ void ScatterGatherRunner::RunnerImpl::processResponse(
     std::swap(*iter, _callbacks.back());
     _callbacks.pop_back();
 
-    if (cbData.response.status == ErrorCodes::CallbackCanceled) {
-        return;
-    }
-
     _algorithm->processResponse(cbData.request, cbData.response);
     if (_algorithm->hasReceivedSufficientResponses()) {
         _signalSufficientResponsesReceived();
@@ -152,10 +158,9 @@ void ScatterGatherRunner::RunnerImpl::processResponse(
 
 void ScatterGatherRunner::RunnerImpl::_signalSufficientResponsesReceived() {
     if (_sufficientResponsesReceived.isValid()) {
-        std::for_each(
-            _callbacks.begin(),
-            _callbacks.end(),
-            stdx::bind(&executor::TaskExecutor::cancel, _executor, stdx::placeholders::_1));
+        for (const CallbackHandle& cbh : _callbacks) {
+            _executor->cancel(cbh);
+        };
         // Clear _callbacks to break the cycle of shared_ptr.
         _callbacks.clear();
         _executor->signalEvent(_sufficientResponsesReceived);

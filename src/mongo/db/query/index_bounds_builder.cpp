@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,11 +41,14 @@
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/index/s2_common.h"
 #include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/matcher/expression_internal_expr_eq.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/expression_index.h"
 #include "mongo/db/query/expression_index_knobs.h"
 #include "mongo/db/query/indexability.h"
+#include "mongo/db/query/planner_ixselect.h"
+#include "mongo/db/query/planner_wildcard_helpers.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -54,6 +59,25 @@ namespace mongo {
 
 namespace {
 
+namespace wcp = ::mongo::wildcard_planning;
+
+// Helper for checking that an OIL "appears" to be ascending given one interval.
+void assertOILIsAscendingLocally(const vector<Interval>& intervals, size_t idx) {
+    // Each individual interval being examined should be ascending or none.
+    const auto dir = intervals[idx].getDirection();
+
+    // Should be either ascending, or have no direction (be a point/null/empty interval).
+    invariant(dir == Interval::Direction::kDirectionAscending ||
+              dir == Interval::Direction::kDirectionNone);
+
+    // The previous OIL's end value should be <= the next OIL's start value.
+    if (idx > 0) {
+        // Pass 'false' to avoid comparing the field names.
+        const int res = intervals[idx - 1].end.woCompare(intervals[idx].start, false);
+        invariant(res <= 0);
+    }
+}
+
 // Tightness rules are shared for $lt, $lte, $gt, $gte.
 IndexBoundsBuilder::BoundsTightness getInequalityPredicateTightness(const BSONElement& dataElt,
                                                                     const IndexEntry& index) {
@@ -61,6 +85,59 @@ IndexBoundsBuilder::BoundsTightness getInequalityPredicateTightness(const BSONEl
                                                           : IndexBoundsBuilder::INEXACT_FETCH;
 }
 
+/**
+ * Returns true if 'str' contains a non-escaped pipe character '|' on a best-effort basis. This
+ * function reports no false negatives, but will return false positives. For example, a pipe
+ * character inside of a character class or the \Q...\E escape sequence has no special meaning but
+ * may still be reported by this function as being non-escaped.
+ */
+bool stringMayHaveUnescapedPipe(StringData str) {
+    if (str.size() > 0 && str[0] == '|') {
+        return true;
+    }
+    if (str.size() > 1 && str[1] == '|' && str[0] != '\\') {
+        return true;
+    }
+
+    for (size_t i = 2U; i < str.size(); ++i) {
+        auto probe = str[i];
+        auto prev = str[i - 1];
+        auto tail = str[i - 2];
+
+        // We consider the pipe to have a special meaning if it is not preceded by a backslash, or
+        // preceded by a backslash that is itself escaped.
+        if (probe == '|' && (prev != '\\' || (prev == '\\' && tail == '\\'))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const BSONObj kUndefinedElementObj = BSON("" << BSONUndefined);
+const BSONObj kNullElementObj = BSON("" << BSONNULL);
+
+const Interval kHashedUndefinedInterval = IndexBoundsBuilder::makePointInterval(
+    ExpressionMapping::hash(kUndefinedElementObj.firstElement()));
+const Interval kHashedNullInterval =
+    IndexBoundsBuilder::makePointInterval(ExpressionMapping::hash(kNullElementObj.firstElement()));
+
+void makeNullEqualityBounds(const IndexEntry& index,
+                            bool isHashed,
+                            OrderedIntervalList* oil,
+                            IndexBoundsBuilder::BoundsTightness* tightnessOut) {
+    // An equality to null predicate cannot be covered because the index does not distinguish
+    // between the lack of a value and the literal value null.
+    *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
+
+    // There are two values that could possibly be equal to null in an index: undefined and null.
+    oil->intervals.push_back(isHashed
+                                 ? kHashedUndefinedInterval
+                                 : IndexBoundsBuilder::makePointInterval(kUndefinedElementObj));
+    oil->intervals.push_back(isHashed ? kHashedNullInterval
+                                      : IndexBoundsBuilder::makePointInterval(kNullElementObj));
+    // Just to be sure, make sure the bounds are in the right order if the hash values are opposite.
+    IndexBoundsBuilder::unionize(oil);
+}
 }  // namespace
 
 string IndexBoundsBuilder::simpleRegex(const char* regex,
@@ -77,7 +154,6 @@ string IndexBoundsBuilder::simpleRegex(const char* regex,
         return "";
     }
 
-    string r = "";
     *tightnessOut = IndexBoundsBuilder::INEXACT_COVERED;
 
     bool multilineOK;
@@ -88,41 +164,42 @@ string IndexBoundsBuilder::simpleRegex(const char* regex,
         multilineOK = false;
         regex += 1;
     } else {
-        return r;
+        return "";
     }
 
-    // A regex with the "|" character is never considered a simple regular expression.
-    if (StringData(regex).find('|') != std::string::npos) {
+    // A regex with an unescaped pipe character is not considered a simple regex.
+    if (stringMayHaveUnescapedPipe(StringData(regex))) {
         return "";
     }
 
     bool extended = false;
     while (*flags) {
         switch (*(flags++)) {
-            case 'm':  // multiline
+            case 'm':
+                // Multiline mode.
                 if (multilineOK)
                     continue;
                 else
-                    return r;
+                    return "";
             case 's':
                 // Single-line mode specified. This just changes the behavior of the '.'
                 // character to match every character instead of every character except '\n'.
                 continue;
-            case 'x':  // extended
+            case 'x':
+                // Extended free-spacing mode.
                 extended = true;
                 break;
             default:
-                return r;  // cant use index
+                // Cannot use the index.
+                return "";
         }
     }
 
     mongoutils::str::stream ss;
 
+    string r = "";
     while (*regex) {
         char c = *(regex++);
-
-        // We should have bailed out early above if '|' is in the regex.
-        invariant(c != '|');
 
         if (c == '*' || c == '?') {
             // These are the only two symbols that make the last char optional
@@ -249,12 +326,36 @@ bool typeMatch(const BSONObj& obj) {
     return first.canonicalType() == second.canonicalType();
 }
 
+bool IndexBoundsBuilder::canUseCoveredMatching(const MatchExpression* expr,
+                                               const IndexEntry& index) {
+    IndexBoundsBuilder::BoundsTightness tightness;
+    OrderedIntervalList oil;
+    translate(expr, BSONElement{}, index, &oil, &tightness);
+    return tightness >= IndexBoundsBuilder::INEXACT_COVERED;
+}
+
 // static
 void IndexBoundsBuilder::translate(const MatchExpression* expr,
                                    const BSONElement& elt,
                                    const IndexEntry& index,
                                    OrderedIntervalList* oilOut,
                                    BoundsTightness* tightnessOut) {
+    // Fill out the bounds and tightness appropriate for the given predicate.
+    _translatePredicate(expr, elt, index, oilOut, tightnessOut);
+
+    // Under certain circumstances, queries on a $** index require that the bounds' tightness be
+    // adjusted regardless of the predicate. Having filled out the initial bounds, we apply any
+    // necessary changes to the tightness here.
+    if (index.type == IndexType::INDEX_WILDCARD) {
+        *tightnessOut = wcp::translateWildcardIndexBoundsAndTightness(index, *tightnessOut, oilOut);
+    }
+}
+
+void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
+                                             const BSONElement& elt,
+                                             const IndexEntry& index,
+                                             OrderedIntervalList* oilOut,
+                                             BoundsTightness* tightnessOut) {
     // We expect that the OIL we are constructing starts out empty.
     invariant(oilOut->intervals.empty());
 
@@ -266,18 +367,18 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
     }
 
     if (isHashed) {
-        verify(MatchExpression::EQ == expr->matchType() ||
-               MatchExpression::MATCH_IN == expr->matchType());
+        invariant(MatchExpression::MATCH_IN == expr->matchType() ||
+                  ComparisonMatchExpressionBase::isEquality(expr->matchType()));
     }
 
     if (MatchExpression::ELEM_MATCH_VALUE == expr->matchType()) {
         OrderedIntervalList acc;
-        translate(expr->getChild(0), elt, index, &acc, tightnessOut);
+        _translatePredicate(expr->getChild(0), elt, index, &acc, tightnessOut);
 
         for (size_t i = 1; i < expr->numChildren(); ++i) {
             OrderedIntervalList next;
             BoundsTightness tightness;
-            translate(expr->getChild(i), elt, index, &next, &tightness);
+            _translatePredicate(expr->getChild(i), elt, index, &next, &tightness);
             intersectize(next, &acc);
         }
 
@@ -315,15 +416,23 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
             return;
         }
 
-        translate(child, elt, index, oilOut, tightnessOut);
+        _translatePredicate(child, elt, index, oilOut, tightnessOut);
         oilOut->complement();
 
-        // If the index is multikey, it doesn't matter what the tightness of the child is, we must
-        // return INEXACT_FETCH. Consider a multikey index on 'a' with document {a: [1, 2, 3]} and
-        // query {a: {$ne: 3}}.  If we treated the bounds [MinKey, 3), (3, MaxKey] as exact, then we
-        // would erroneously return the document!
-        if (index.multikey) {
-            *tightnessOut = INEXACT_FETCH;
+        // Until the index distinguishes between missing values and literal null values, we cannot
+        // build exact bounds for equality predicates on the literal value null. However, we _can_
+        // build exact bounds for the inverse, for example the query {a: {$ne: null}}.
+        if (MatchExpression::EQ == child->matchType() &&
+            static_cast<ComparisonMatchExpression*>(child)->getData().type() == BSONType::jstNULL) {
+            *tightnessOut = IndexBoundsBuilder::EXACT;
+        }
+
+        // If the index is multikey on this path, it doesn't matter what the tightness of the child
+        // is, we must return INEXACT_FETCH. Consider a multikey index on 'a' with document
+        // {a: [1, 2, 3]} and query {a: {$ne: 3}}. If we treated the bounds [MinKey, 3), (3, MaxKey]
+        // as exact, then we would erroneously return the document!
+        if (index.pathHasMultikeyComponent(elt.fieldNameStringData())) {
+            *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         }
     } else if (MatchExpression::EXISTS == expr->matchType()) {
         oilOut->intervals.push_back(allValues());
@@ -359,8 +468,10 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
         } else {
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         }
-    } else if (MatchExpression::EQ == expr->matchType()) {
-        const EqualityMatchExpression* node = static_cast<const EqualityMatchExpression*>(expr);
+    } else if (ComparisonMatchExpressionBase::isEquality(expr->matchType())) {
+        const auto* node = static_cast<const ComparisonMatchExpressionBase*>(expr);
+        // There is no need to sort intervals or merge overlapping intervals here since the output
+        // is from one element.
         translateEquality(node->getData(), index, isHashed, oilOut, tightnessOut);
     } else if (MatchExpression::LTE == expr->matchType()) {
         const LTEMatchExpression* node = static_cast<const LTEMatchExpression*>(expr);
@@ -563,8 +674,12 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
         // Create our various intervals.
 
         IndexBoundsBuilder::BoundsTightness tightness;
+        bool arrayOrNullPresent = false;
         for (auto&& equality : ime->getEqualities()) {
             translateEquality(equality, index, isHashed, oilOut, &tightness);
+            // The ordering invariant of oil has been violated by the call to translateEquality.
+            arrayOrNullPresent = arrayOrNullPresent || equality.type() == BSONType::jstNULL ||
+                equality.type() == BSONType::Array;
             if (tightness != IndexBoundsBuilder::EXACT) {
                 *tightnessOut = tightness;
             }
@@ -592,7 +707,12 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         }
 
-        unionize(oilOut);
+        // Equalities are already sorted and deduped so unionize is unneccesary if no regexes
+        // are present. Hashed indexes may also cause the bounds to be out-of-order.
+        // Arrays and nulls introduce multiple elements that neccesitate a sort and deduping.
+        if (!ime->getRegexes().empty() || index.type == IndexType::INDEX_HASHED ||
+            arrayOrNullPresent)
+            unionize(oilOut);
     } else if (MatchExpression::GEO == expr->matchType()) {
         const GeoMatchExpression* gme = static_cast<const GeoMatchExpression*>(expr);
 
@@ -638,52 +758,57 @@ Interval IndexBoundsBuilder::makeRangeInterval(const BSONObj& obj, BoundInclusio
 }
 
 // static
-void IndexBoundsBuilder::intersectize(const OrderedIntervalList& arg, OrderedIntervalList* oilOut) {
-    verify(arg.name == oilOut->name);
+void IndexBoundsBuilder::intersectize(const OrderedIntervalList& oilA, OrderedIntervalList* oilB) {
+    invariant(oilB);
+    invariant(oilA.name == oilB->name);
 
-    size_t argidx = 0;
-    const vector<Interval>& argiv = arg.intervals;
+    size_t oilAIdx = 0;
+    const vector<Interval>& oilAIntervals = oilA.intervals;
 
-    size_t ividx = 0;
-    vector<Interval>& iv = oilOut->intervals;
+    size_t oilBIdx = 0;
+    vector<Interval>& oilBIntervals = oilB->intervals;
 
     vector<Interval> result;
 
-    while (argidx < argiv.size() && ividx < iv.size()) {
-        Interval::IntervalComparison cmp = argiv[argidx].compare(iv[ividx]);
+    while (oilAIdx < oilAIntervals.size() && oilBIdx < oilBIntervals.size()) {
+        if (kDebugBuild) {
+            // Ensure that both OILs are ascending.
+            assertOILIsAscendingLocally(oilAIntervals, oilAIdx);
+            assertOILIsAscendingLocally(oilBIntervals, oilBIdx);
+        }
 
+        Interval::IntervalComparison cmp = oilAIntervals[oilAIdx].compare(oilBIntervals[oilBIdx]);
         verify(Interval::INTERVAL_UNKNOWN != cmp);
 
         if (cmp == Interval::INTERVAL_PRECEDES || cmp == Interval::INTERVAL_PRECEDES_COULD_UNION) {
-            // argiv is before iv.  move argiv forward.
-            ++argidx;
+            // oilAIntervals is before oilBIntervals. move oilAIntervals forward.
+            ++oilAIdx;
         } else if (cmp == Interval::INTERVAL_SUCCEEDS) {
-            // iv is before argiv.  move iv forward.
-            ++ividx;
+            // oilBIntervals is before oilAIntervals. move oilBIntervals forward.
+            ++oilBIdx;
         } else {
-            // argiv[argidx] (cmpresults) iv[ividx]
-            Interval newInt = argiv[argidx];
-            newInt.intersect(iv[ividx], cmp);
+            Interval newInt = oilAIntervals[oilAIdx];
+            newInt.intersect(oilBIntervals[oilBIdx], cmp);
             result.push_back(newInt);
 
             if (Interval::INTERVAL_EQUALS == cmp) {
-                ++argidx;
-                ++ividx;
+                ++oilAIdx;
+                ++oilBIdx;
             } else if (Interval::INTERVAL_WITHIN == cmp) {
-                ++argidx;
+                ++oilAIdx;
             } else if (Interval::INTERVAL_CONTAINS == cmp) {
-                ++ividx;
+                ++oilBIdx;
             } else if (Interval::INTERVAL_OVERLAPS_BEFORE == cmp) {
-                ++argidx;
+                ++oilAIdx;
             } else if (Interval::INTERVAL_OVERLAPS_AFTER == cmp) {
-                ++ividx;
+                ++oilBIdx;
             } else {
-                verify(0);
+                MONGO_UNREACHABLE;
             }
         }
     }
 
-    oilOut->intervals.swap(result);
+    oilB->intervals.swap(result);
 }
 
 // static
@@ -757,7 +882,7 @@ Interval IndexBoundsBuilder::makePointInterval(const BSONObj& obj) {
 }
 
 // static
-Interval IndexBoundsBuilder::makePointInterval(const string& str) {
+Interval IndexBoundsBuilder::makePointInterval(StringData str) {
     BSONObjBuilder bob;
     bob.append("", str);
     return makePointInterval(bob.obj());
@@ -825,9 +950,15 @@ void IndexBoundsBuilder::translateEquality(const BSONElement& data,
                                            bool isHashed,
                                            OrderedIntervalList* oil,
                                            BoundsTightness* tightnessOut) {
+    if (BSONType::jstNULL == data.type()) {
+        // An equality to null query is special. It should return both undefined and null values, so
+        // is not a point query.
+        return makeNullEqualityBounds(index, isHashed, oil, tightnessOut);
+    }
+
     // We have to copy the data out of the parse tree and stuff it into the index
     // bounds.  BSONValue will be useful here.
-    if (Array != data.type()) {
+    if (BSONType::Array != data.type()) {
         BSONObj dataObj = objFromElement(data, index.collator);
         if (isHashed) {
             dataObj = ExpressionMapping::hash(dataObj.firstElement());
@@ -836,7 +967,7 @@ void IndexBoundsBuilder::translateEquality(const BSONElement& data,
         verify(dataObj.isOwned());
         oil->intervals.push_back(makePointInterval(dataObj));
 
-        if (dataObj.firstElement().isNull() || isHashed) {
+        if (isHashed) {
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         } else {
             *tightnessOut = IndexBoundsBuilder::EXACT;
@@ -906,13 +1037,7 @@ void IndexBoundsBuilder::alignBounds(IndexBounds* bounds, const BSONObj& kp, int
         int direction = (elt.number() >= 0) ? 1 : -1;
         direction *= scanDir;
         if (-1 == direction) {
-            vector<Interval>& iv = bounds->fields[oilIdx].intervals;
-            // Step 1: reverse the list.
-            std::reverse(iv.begin(), iv.end());
-            // Step 2: reverse each interval.
-            for (size_t i = 0; i < iv.size(); ++i) {
-                iv[i].reverse();
-            }
+            bounds->fields[oilIdx].reverse();
         }
         ++oilIdx;
     }
@@ -921,7 +1046,7 @@ void IndexBoundsBuilder::alignBounds(IndexBounds* bounds, const BSONObj& kp, int
         log() << "INVALID BOUNDS: " << redact(bounds->toString()) << endl
               << "kp = " << redact(kp) << endl
               << "scanDir = " << scanDir;
-        invariant(0);
+        MONGO_UNREACHABLE;
     }
 }
 

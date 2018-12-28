@@ -17,7 +17,7 @@ function fileSize() {
 
 resetDbpath(externalPath);
 
-var m = MongoRunner.runMongod({dbpath: dbPath, noprealloc: "", bind_ip: "127.0.0.1"});
+var m = MongoRunner.runMongod({dbpath: dbPath, bind_ip: "127.0.0.1"});
 c = m.getDB(baseName).getCollection(baseName);
 c.save({a: 1});
 assert(c.findOne());
@@ -68,3 +68,4 @@ assert.eq(
 
 assert.soon("c.findOne()", "mongo import json A");
 assert(c.findOne() && 1 == c.findOne().a, "mongo import json B");
+MongoRunner.stopMongod(m);

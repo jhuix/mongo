@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2018 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -30,7 +30,6 @@
 #   Timestamps: make sure they don't end up in metadata
 #
 
-from helper import copy_wiredtiger_home
 import random
 from suite_subprocess import suite_subprocess
 import wiredtiger, wttest
@@ -43,9 +42,6 @@ class test_timestamp05(wttest.WiredTigerTestCase, suite_subprocess):
     uri = 'table:ts05'
 
     def test_create(self):
-        if not wiredtiger.timestamp_build():
-            self.skipTest('requires a timestamp build')
-
         s = self.session
         conn = self.conn
 
@@ -65,9 +61,6 @@ class test_timestamp05(wttest.WiredTigerTestCase, suite_subprocess):
         s.checkpoint('use_timestamp=true')
 
     def test_bulk(self):
-        if not wiredtiger.timestamp_build():
-            self.skipTest('requires a timestamp build')
-
         s = self.session
         conn = self.conn
 

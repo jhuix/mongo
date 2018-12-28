@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -113,11 +115,11 @@ TEST(WiredTigerRecordStoreTest, Isolation1) {
         {
             WriteUnitOfWork uow(opCtx.get());
 
-            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false);
+            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
             ASSERT_OK(res.getStatus());
             id1 = res.getValue();
 
-            res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false);
+            res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
             ASSERT_OK(res.getStatus());
             id2 = res.getValue();
 
@@ -136,14 +138,14 @@ TEST(WiredTigerRecordStoreTest, Isolation1) {
         rs->dataFor(t1.get(), id1);
         rs->dataFor(t2.get(), id1);
 
-        ASSERT_OK(rs->updateRecord(t1.get(), id1, "b", 2, false, NULL));
-        ASSERT_OK(rs->updateRecord(t1.get(), id2, "B", 2, false, NULL));
+        ASSERT_OK(rs->updateRecord(t1.get(), id1, "b", 2));
+        ASSERT_OK(rs->updateRecord(t1.get(), id2, "B", 2));
 
         try {
             // this should fail
-            rs->updateRecord(t2.get(), id1, "c", 2, false, NULL).transitional_ignore();
+            rs->updateRecord(t2.get(), id1, "c", 2).transitional_ignore();
             ASSERT(0);
-        } catch (WriteConflictException& dle) {
+        } catch (WriteConflictException&) {
             w2.reset(NULL);
             t2.reset(NULL);
         }
@@ -164,11 +166,11 @@ TEST(WiredTigerRecordStoreTest, Isolation2) {
         {
             WriteUnitOfWork uow(opCtx.get());
 
-            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false);
+            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
             ASSERT_OK(res.getStatus());
             id1 = res.getValue();
 
-            res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false);
+            res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
             ASSERT_OK(res.getStatus());
             id2 = res.getValue();
 
@@ -187,7 +189,7 @@ TEST(WiredTigerRecordStoreTest, Isolation2) {
 
         {
             WriteUnitOfWork w(t1.get());
-            ASSERT_OK(rs->updateRecord(t1.get(), id1, "b", 2, false, NULL));
+            ASSERT_OK(rs->updateRecord(t1.get(), id1, "b", 2));
             w.commit();
         }
 
@@ -196,9 +198,9 @@ TEST(WiredTigerRecordStoreTest, Isolation2) {
             ASSERT_EQUALS(string("a"), rs->dataFor(t2.get(), id1).data());
             try {
                 // this should fail as our version of id1 is too old
-                rs->updateRecord(t2.get(), id1, "c", 2, false, NULL).transitional_ignore();
+                rs->updateRecord(t2.get(), id1, "c", 2).transitional_ignore();
                 ASSERT(0);
-            } catch (WriteConflictException& dle) {
+            } catch (WriteConflictException&) {
             }
         }
     }
@@ -212,11 +214,10 @@ StatusWith<RecordId> insertBSON(ServiceContext::UniqueOperationContext& opCtx,
     WriteUnitOfWork wuow(opCtx.get());
     WiredTigerRecordStore* wrs = checked_cast<WiredTigerRecordStore*>(rs.get());
     invariant(wrs);
-    Status status = wrs->oplogDiskLocRegister(opCtx.get(), opTime);
+    Status status = wrs->oplogDiskLocRegister(opCtx.get(), opTime, false);
     if (!status.isOK())
         return StatusWith<RecordId>(status);
-    StatusWith<RecordId> res =
-        rs->insertRecord(opCtx.get(), obj.objdata(), obj.objsize(), opTime, false);
+    StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), obj.objdata(), obj.objsize(), opTime);
     if (res.isOK())
         wuow.commit();
     return res;
@@ -230,7 +231,7 @@ TEST(WiredTigerRecordStoreTest, CappedCursorRollover) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         for (int i = 0; i < 3; ++i) {
             WriteUnitOfWork uow(opCtx.get());
-            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false);
+            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
             ASSERT_OK(res.getStatus());
             uow.commit();
         }
@@ -250,7 +251,7 @@ TEST(WiredTigerRecordStoreTest, CappedCursorRollover) {
         auto opCtx = harnessHelper->newOperationContext(client3.get());
         for (int i = 0; i < 100; i++) {
             WriteUnitOfWork uow(opCtx.get());
-            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false);
+            StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
             ASSERT_OK(res.getStatus());
             uow.commit();
         }
@@ -265,10 +266,10 @@ RecordId _oplogOrderInsertOplog(OperationContext* opCtx,
                                 const unique_ptr<RecordStore>& rs,
                                 int inc) {
     Timestamp opTime = Timestamp(5, inc);
-    Status status = rs->oplogDiskLocRegister(opCtx, opTime);
+    Status status = rs->oplogDiskLocRegister(opCtx, opTime, false);
     ASSERT_OK(status);
     BSONObj obj = BSON("ts" << opTime);
-    StatusWith<RecordId> res = rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), opTime, false);
+    StatusWith<RecordId> res = rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), opTime);
     ASSERT_OK(res.getStatus());
     return res.getValue();
 }
@@ -384,7 +385,7 @@ TEST(WiredTigerRecordStoreTest, CappedCursorYieldFirst) {
     {  // first insert a document
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         WriteUnitOfWork uow(opCtx.get());
-        StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp(), false);
+        StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
         ASSERT_OK(res.getStatus());
         id1 = res.getValue();
         uow.commit();
@@ -424,11 +425,11 @@ StatusWith<RecordId> insertBSONWithSize(OperationContext* opCtx,
     WriteUnitOfWork wuow(opCtx);
     WiredTigerRecordStore* wtrs = checked_cast<WiredTigerRecordStore*>(rs);
     invariant(wtrs);
-    Status status = wtrs->oplogDiskLocRegister(opCtx, opTime);
+    Status status = wtrs->oplogDiskLocRegister(opCtx, opTime, false);
     if (!status.isOK()) {
         return StatusWith<RecordId>(status);
     }
-    StatusWith<RecordId> res = rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), opTime, false);
+    StatusWith<RecordId> res = rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), opTime);
     if (res.isOK()) {
         wuow.commit();
     }
@@ -525,10 +526,10 @@ TEST(WiredTigerRecordStoreTest, OplogStones_UpdateRecord) {
         BSONObj changed2 = makeBSONObjWithSize(Timestamp(1, 2), 51);
 
         WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_NOT_OK(rs->updateRecord(
-            opCtx.get(), RecordId(1, 1), changed1.objdata(), changed1.objsize(), false, nullptr));
-        ASSERT_NOT_OK(rs->updateRecord(
-            opCtx.get(), RecordId(1, 2), changed2.objdata(), changed2.objsize(), false, nullptr));
+        ASSERT_NOT_OK(
+            rs->updateRecord(opCtx.get(), RecordId(1, 1), changed1.objdata(), changed1.objsize()));
+        ASSERT_NOT_OK(
+            rs->updateRecord(opCtx.get(), RecordId(1, 2), changed2.objdata(), changed2.objsize()));
     }
 
     // Attempts to shrink the records should also fail.
@@ -539,10 +540,10 @@ TEST(WiredTigerRecordStoreTest, OplogStones_UpdateRecord) {
         BSONObj changed2 = makeBSONObjWithSize(Timestamp(1, 2), 49);
 
         WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_NOT_OK(rs->updateRecord(
-            opCtx.get(), RecordId(1, 1), changed1.objdata(), changed1.objsize(), false, nullptr));
-        ASSERT_NOT_OK(rs->updateRecord(
-            opCtx.get(), RecordId(1, 2), changed2.objdata(), changed2.objsize(), false, nullptr));
+        ASSERT_NOT_OK(
+            rs->updateRecord(opCtx.get(), RecordId(1, 1), changed1.objdata(), changed1.objsize()));
+        ASSERT_NOT_OK(
+            rs->updateRecord(opCtx.get(), RecordId(1, 2), changed2.objdata(), changed2.objsize()));
     }
 
     // Changing the contents of the records without changing their size should succeed.
@@ -553,10 +554,10 @@ TEST(WiredTigerRecordStoreTest, OplogStones_UpdateRecord) {
         BSONObj changed2 = makeBSONObjWithSize(Timestamp(1, 2), 50, 'z');
 
         WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_OK(rs->updateRecord(
-            opCtx.get(), RecordId(1, 1), changed1.objdata(), changed1.objsize(), false, nullptr));
-        ASSERT_OK(rs->updateRecord(
-            opCtx.get(), RecordId(1, 2), changed2.objdata(), changed2.objsize(), false, nullptr));
+        ASSERT_OK(
+            rs->updateRecord(opCtx.get(), RecordId(1, 1), changed1.objdata(), changed1.objsize()));
+        ASSERT_OK(
+            rs->updateRecord(opCtx.get(), RecordId(1, 2), changed2.objdata(), changed2.objsize()));
         wuow.commit();
 
         ASSERT_EQ(1U, oplogStones->numStones());
@@ -752,11 +753,25 @@ TEST(WiredTigerRecordStoreTest, OplogStones_ReclaimStones) {
         ASSERT_EQ(0, oplogStones->currentBytes());
     }
 
+    // Fail to truncate stone when cappedMaxSize is exceeded, but the persisted timestamp is
+    // before the truncation point (i.e: leaves a gap that replication recovery would rely on).
+    {
+        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+
+        wtrs->reclaimOplog(opCtx.get(), Timestamp(1, 0));
+
+        ASSERT_EQ(3, rs->numRecords(opCtx.get()));
+        ASSERT_EQ(330, rs->dataSize(opCtx.get()));
+        ASSERT_EQ(3U, oplogStones->numStones());
+        ASSERT_EQ(0, oplogStones->currentRecords());
+        ASSERT_EQ(0, oplogStones->currentBytes());
+    }
+
     // Truncate a stone when cappedMaxSize is exceeded.
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
 
-        wtrs->reclaimOplog(opCtx.get());
+        wtrs->reclaimOplog(opCtx.get(), Timestamp(1, 3));
 
         ASSERT_EQ(2, rs->numRecords(opCtx.get()));
         ASSERT_EQ(230, rs->dataSize(opCtx.get()));
@@ -783,7 +798,7 @@ TEST(WiredTigerRecordStoreTest, OplogStones_ReclaimStones) {
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
 
-        wtrs->reclaimOplog(opCtx.get());
+        wtrs->reclaimOplog(opCtx.get(), Timestamp(1, 6));
 
         ASSERT_EQ(2, rs->numRecords(opCtx.get()));
         ASSERT_EQ(190, rs->dataSize(opCtx.get()));
@@ -796,7 +811,7 @@ TEST(WiredTigerRecordStoreTest, OplogStones_ReclaimStones) {
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
 
-        wtrs->reclaimOplog(opCtx.get());
+        wtrs->reclaimOplog(opCtx.get(), Timestamp(1, 6));
 
         ASSERT_EQ(2, rs->numRecords(opCtx.get()));
         ASSERT_EQ(190, rs->dataSize(opCtx.get()));

@@ -9,7 +9,6 @@
 /perf.data
 /perf.data.old
 /massif.out.*
-/smoke-last.json
 
 *~
 *.swp
@@ -61,7 +60,6 @@ settings.py
 log_config.py
 /tags
 TAGS
-failfile.smoke
 
 # temp dirs
 dump
@@ -79,11 +77,13 @@ scratch
 /mongo
 /mongobridge
 /mongod
+/mongoed
 /mongogrid
 /mongoperf
 /mongos
 /mongoshim
 /mongosniff
+/wt
 
 *.tgz
 *.zip
@@ -94,6 +94,7 @@ scratch
 /libmongotestfiles.*
 /libmongoshellfiles.*
 /sharedclient
+/genny
 
 /emr.jar
 *.class
@@ -112,6 +113,13 @@ scratch
 /perftest
 /clientTest
 /httpClientTest
+/genny_results
+
+# benchrun files
+/benchrun_embedded
+
+# Linters
+.mypy_cache
 
 #debian
 build-stamp
@@ -143,8 +151,9 @@ CMakeLists.txt
 # XCode projects
 .xcworkspace
 
-# VSCode projects
+# Visual Studio and VSCode projects
 .vscode/
+.vs/
 
 # Windows MSI builder artifacts
 *.msi
@@ -152,4 +161,12 @@ CMakeLists.txt
 *.wixpdb
 DriverInclude.wxs
 
+# Gradle
+.gradle
+src/mongo/embedded/java/build/
+src/mongo/embedded/java/aar/build/
+src/mongo/embedded/java/jar/build/
+local.properties
+
 compile_commands.json
+generated_resmoke_config

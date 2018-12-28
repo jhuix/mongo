@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -40,11 +42,25 @@
 namespace mongo {
 
 struct ResumeTokenData {
+    /**
+     * Flag to indicate if the resume token is from an invalidate notification.
+     */
+    enum FromInvalidate : bool {
+        kFromInvalidate = true,
+        kNotFromInvalidate = false,
+    };
+
     ResumeTokenData(){};
     ResumeTokenData(Timestamp clusterTimeIn,
+                    int versionIn,
+                    size_t applyOpsIndexIn,
                     Value documentKeyIn,
                     const boost::optional<UUID>& uuidIn)
-        : clusterTime(clusterTimeIn), documentKey(std::move(documentKeyIn)), uuid(uuidIn){};
+        : clusterTime(clusterTimeIn),
+          version(versionIn),
+          applyOpsIndex(applyOpsIndexIn),
+          documentKey(std::move(documentKeyIn)),
+          uuid(uuidIn){};
 
     bool operator==(const ResumeTokenData& other) const;
     bool operator!=(const ResumeTokenData& other) const {
@@ -52,53 +68,36 @@ struct ResumeTokenData {
     };
 
     Timestamp clusterTime;
+    int version = 1;
+    size_t applyOpsIndex = 0;
     Value documentKey;
     boost::optional<UUID> uuid;
+    // Flag to indicate that this resume token is from an "invalidate" entry. This will not be set
+    // on a token from a command that *would* invalidate a change stream, but rather the invalidate
+    // notification itself.
+    FromInvalidate fromInvalidate = FromInvalidate::kNotFromInvalidate;
 };
 
 std::ostream& operator<<(std::ostream& out, const ResumeTokenData& tokenData);
 
 /**
- * A token passed in by the user to indicate where in the oplog we should start for
- * $changeStream.  This token has the following format:
- * {
- *   _data: <binary data>,
- *   _typeBits: <binary data>
- * }
- * The _data field data is encoded such that byte by byte comparisons provide the correct
- * ordering of tokens.  The _typeBits field may be missing and should not affect token
- * comparison.
+ * A token passed in by the user to indicate where in the oplog we should start for $changeStream.
+ * This token has the following format:
+ *   {
+ *     _data: String, A hex encoding of the binary generated by keystring encoding the clusterTime,
+ *            version, applyOpsIndex, UUID, then documentKey in that order.
+ *     _typeBits: BinData - The keystring type bits used for deserialization.
+ *   }
+ *   The _data field data is encoded such that string comparisons provide the correct ordering of
+ *   tokens. Unlike the BinData, this can be sorted correctly using a MongoDB sort. BinData
+ *   unfortunately orders by the length of the data first, then by the contents.
+ *
+ *   As an optimization, the _typeBits field may be missing and should not affect token comparison.
  */
-
 class ResumeToken {
 public:
-    /**
-     * The default no-argument constructor is required by the IDL for types used as non-optional
-     * fields.
-     */
-    ResumeToken() = default;
-
-    explicit ResumeToken(const ResumeTokenData& resumeValue);
-
-    bool operator==(const ResumeToken&) const;
-    bool operator!=(const ResumeToken&) const;
-    bool operator<(const ResumeToken&) const;
-    bool operator<=(const ResumeToken&) const;
-    bool operator>(const ResumeToken&) const;
-    bool operator>=(const ResumeToken&) const;
-
-    /** Three way comparison, returns 0 if *this is equal to other, < 0 if *this is less than
-     * other, and > 0 if *this is greater than other.
-     */
-    int compare(const ResumeToken& other) const;
-
-    Document toDocument() const;
-
-    BSONObj toBSON() const {
-        return toDocument().toBson();
-    }
-
-    ResumeTokenData getData() const;
+    constexpr static StringData kDataFieldName = "_data"_sd;
+    constexpr static StringData kTypeBitsFieldName = "_typeBits"_sd;
 
     /**
      * Parse a resume token from a BSON object; used as an interface to the IDL parser.
@@ -109,17 +108,65 @@ public:
 
     static ResumeToken parse(const Document& document);
 
+    /**
+     * Generate a high-water-mark pseudo-token for 'clusterTime', with no UUID or documentKey.
+     */
+    static ResumeToken makeHighWaterMarkResumeToken(Timestamp clusterTime);
+
+    /**
+     * Returns true if the given token data represents a valid high-water-mark resume token; that
+     * is, it does not refer to a specific operation, but instead specifies a clusterTime after
+     * which the stream should resume.
+     */
+    static bool isHighWaterMarkResumeToken(const ResumeTokenData& tokenData);
+
+    /**
+     * The default no-argument constructor is required by the IDL for types used as non-optional
+     * fields.
+     */
+    ResumeToken() = default;
+
+    /**
+     * Parses 'resumeValue' into a ResumeToken using the hex-encoded string format.
+     */
+    explicit ResumeToken(const ResumeTokenData& resumeValue);
+
+    Document toDocument() const;
+
+    /**
+     * Because we use the IDL we require a serializer. However, the serialization format depends on
+     * the feature compatibility version, so a serializer without an argument doesn't make sense.
+     * This should never be used.
+     */
+    BSONObj toBSON_do_not_use() const {
+        MONGO_UNREACHABLE;
+    }
+
+    ResumeTokenData getData() const;
+
+    Timestamp getClusterTime() const {
+        return getData().clusterTime;
+    }
+
+    bool operator==(const ResumeToken&) const;
+    bool operator!=(const ResumeToken& other) const {
+        return !(*this == other);
+    }
+
     friend std::ostream& operator<<(std::ostream& out, const ResumeToken& token) {
         return out << token.getData();
     }
 
-    constexpr static StringData kDataFieldName = "_data"_sd;
-    constexpr static StringData kTypeBitsFieldName = "_typeBits"_sd;
-
 private:
     explicit ResumeToken(const Document& resumeData);
 
-    Value _keyStringData;
+    // This is the hex-encoded string encoding all the pieces of the resume token.
+    std::string _hexKeyString;
+
+    // Since we are using a KeyString encoding, we might lose some information about what the
+    // original types of the serialized values were. For example, the integer 2 and the double 2.0
+    // will generate the same KeyString. We keep the type bits around so we can deserialize without
+    // losing information.
     Value _typeBits;
 };
 }  // namespace mongo

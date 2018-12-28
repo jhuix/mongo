@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2017 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
@@ -59,8 +61,6 @@ class StorageInterface;
  *                  ts: <Timestamp>,
  *                  t: <long long>
  *             },                           // field for 'appliedThrough'
- *      oplogDeleteFromPoint: <Timestamp>,  // only exists on unclean upgrade
- *                                          // TODO (SERVER-30556): Remove after 3.6
  * }
  *
  * The oplogTruncateAfterPoint document, in 'local.replset.oplogTruncateAfterPoint', is used to
@@ -161,25 +161,20 @@ public:
                                             const Timestamp& timestamp) = 0;
     virtual Timestamp getOplogTruncateAfterPoint(OperationContext* opCtx) const = 0;
 
-    /**
-     * The oplog delete from point may still exist on upgrade from an unclean shutdown. This
-     * function removes the field so it's gone after 3.6.
-     *
-     * TODO (SERVER-30556): Delete this function in 3.8 because the old oplog delete from point
-     * cannot exist.
-     */
-    virtual void removeOldOplogDeleteFromPointField(OperationContext* opCtx) = 0;
-
     // -------- Applied Through ----------
 
     /**
      * The applied through point is a persistent record of which oplog entries we've applied.
      * If we crash while applying a batch of oplog entries, this OpTime tells us where to start
      * applying operations on startup.
-     *
-     * If null, the applied through point is the top of the oplog.
      */
     virtual void setAppliedThrough(OperationContext* opCtx, const OpTime& optime) = 0;
+
+    /**
+     * Unsets the applied through OpTime at the given 'writeTimestamp'.
+     * Once cleared, the applied through point is the top of the oplog.
+     */
+    virtual void clearAppliedThrough(OperationContext* opCtx, const Timestamp& writeTimestamp) = 0;
 
     /**
      * You should probably be calling ReplicationCoordinator::getLastAppliedOpTime() instead.
@@ -190,15 +185,11 @@ public:
      */
     virtual OpTime getAppliedThrough(OperationContext* opCtx) const = 0;
 
-    // -------- Checkpoint Timestamp ----------
-
     /**
-     * The checkpoint timestamp is the latest timestamp that the database can recover to. It is the
-     * job of a storage engine to call this function with the timestamp of the checkpoint it is
-     * about to take.
+     * Create the set of collections required for steady-state replication to work. E.g: `minvalid`
+     * or `oplogTruncateAfterPoint`.
      */
-    virtual void writeCheckpointTimestamp(OperationContext* opCtx, const Timestamp& timestamp) = 0;
-    virtual Timestamp getCheckpointTimestamp(OperationContext* opCtx) = 0;
+    virtual Status createInternalCollections(OperationContext* opCtx) = 0;
 };
 
 }  // namespace repl

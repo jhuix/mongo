@@ -1,35 +1,42 @@
-/* Copyright 2013 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
+#include <array>
+#include <boost/filesystem.hpp>
+#include <fstream>
 #include <map>
 #include <ostream>
 #include <sstream>
 
 #include "mongo/bson/util/builder.h"
+#include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/options_parser/constraints.h"
 #include "mongo/util/options_parser/environment.h"
@@ -112,6 +119,26 @@ TEST(Registration, DuplicateSingleName) {
         FAIL("Was able to register duplicate single name");
     } catch (::mongo::DBException&) {
     }
+}
+
+TEST(Registration, DuplicateSeingleNameAcrossSections) {
+    moe::OptionSection group1;
+    group1.addOptionChaining("one", "", moe::Switch, "Uno");
+
+    moe::OptionSection group2;
+    group2.addOptionChaining("one", "", moe::Switch, "Dos");
+
+    moe::OptionSection root;
+    ASSERT_OK(root.addSection(group1));
+    ASSERT_NOT_OK(root.addSection(group2));
+
+    ASSERT_THROWS(root.addOptionChaining("one", "", moe::Switch, "Tres"),
+                  mongo::AssertionException);
+    root.addOptionChaining("two", "", moe::Switch, "Quatro");
+
+    moe::OptionSection group3;
+    group3.addOptionChaining("two", "", moe::Switch, "Cinco");
+    ASSERT_NOT_OK(root.addSection(group3));
 }
 
 TEST(Registration, DuplicateDottedName) {
@@ -270,6 +297,40 @@ TEST(Registration, StringFormatConstraint) {
     }
 }
 
+TEST(Registration, NestedSubSections) {
+    moe::OptionSection root;
+    moe::OptionSection childSection;
+    moe::OptionSection grandchildSection;
+
+    ASSERT_OK(childSection.addSection(grandchildSection));
+    ASSERT_NOT_OK(root.addSection(childSection));
+}
+
+TEST(Registration, MergeSubSections) {
+    moe::OptionSection root;
+    ASSERT_EQ(root.countSubSections(), 0UL);
+
+    {
+        moe::OptionSection opts("Options");
+        opts.addOptionChaining("option1", "option1", moe::String, "A string option");
+        ASSERT_OK(root.addSection(opts));
+        ASSERT_EQ(root.countSubSections(), 1UL);
+    }
+
+    {
+        moe::OptionSection moreOpts("Options");
+        moreOpts.addOptionChaining("option2", "option2", moe::Int, "An integer option");
+        ASSERT_OK(root.addSection(moreOpts));
+        ASSERT_EQ(root.countSubSections(), 1UL);
+    }
+
+    std::vector<moe::OptionDescription> options;
+    ASSERT_OK(root.getAllOptions(&options));
+    ASSERT_EQ(options.size(), 2UL);
+    ASSERT_EQ(options[0]._dottedName, "option1");
+    ASSERT_EQ(options[1]._dottedName, "option2");
+}
+
 TEST(Parsing, Good) {
     moe::OptionsParser parser;
     moe::Environment environment;
@@ -302,7 +363,7 @@ TEST(Parsing, SubSection) {
     moe::OptionSection subSection("Section Name");
 
     subSection.addOptionChaining("port", "port", moe::Int, "Port");
-    testOpts.addSection(subSection).transitional_ignore();
+    ASSERT_OK(testOpts.addSection(subSection));
 
     std::vector<std::string> argv;
     argv.push_back("binaryname");
@@ -1971,6 +2032,23 @@ TEST(ConfigFromFilesystem, Empty) {
     ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
 }
 
+TEST(ConfigFromFilesystem, Directory) {
+    moe::OptionsParser parser;
+    moe::Environment environment;
+
+    moe::OptionSection testOpts;
+    testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back(TEST_CONFIG_PATH(""));
+    std::map<std::string, std::string> env_map;
+
+    moe::Value value;
+    ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
+}
+
 TEST(ConfigFromFilesystem, NullByte) {
 
     moe::OptionsParser parser;
@@ -2323,7 +2401,7 @@ TEST(LegacyInterface, BadType) {
     try {
         port = environment["port"].as<std::string>();
         FAIL("Expected exception trying to convert int to type string");
-    } catch (std::exception& e) {
+    } catch (std::exception&) {
     }
 }
 
@@ -2781,9 +2859,6 @@ TEST(ChainingInterface, PositionalHoleInRange) {
     argv.push_back("binaryname");
     std::map<std::string, std::string> env_map;
 
-    moe::Value value;
-    std::vector<std::string>::iterator positionalit;
-
     ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
 }
 
@@ -2801,9 +2876,6 @@ TEST(ChainingInterface, PositionalOverlappingRange) {
     std::vector<std::string> argv;
     argv.push_back("binaryname");
     std::map<std::string, std::string> env_map;
-
-    moe::Value value;
-    std::vector<std::string>::iterator positionalit;
 
     ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
 }
@@ -2823,9 +2895,6 @@ TEST(ChainingInterface, PositionalOverlappingRangeInfinite) {
     argv.push_back("binaryname");
     std::map<std::string, std::string> env_map;
 
-    moe::Value value;
-    std::vector<std::string>::iterator positionalit;
-
     ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
 }
 
@@ -2843,9 +2912,6 @@ TEST(ChainingInterface, PositionalMultipleInfinite) {
     std::vector<std::string> argv;
     argv.push_back("binaryname");
     std::map<std::string, std::string> env_map;
-
-    moe::Value value;
-    std::vector<std::string>::iterator positionalit;
 
     ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
 }
@@ -3797,7 +3863,7 @@ TEST(YAMLConfigFile, DeprecatedDottedNameDeprecatedOnly) {
 
     moe::OptionSection testOpts;
     testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
-    testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", "dotted.deprecated");
+    testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", {"dotted.deprecated"});
 
     std::vector<std::string> argv;
     argv.push_back("binaryname");
@@ -3820,14 +3886,14 @@ TEST(YAMLConfigFile, DeprecatedDottedNameDeprecatedOnly) {
 TEST(YAMLConfigFile, DeprecatedDottedNameSameAsCanonicalDottedName) {
     moe::OptionSection testOpts;
     ASSERT_THROWS(testOpts.addOptionChaining(
-                      "dotted.canonical", "var1", moe::Int, "Var1", "dotted.canonical"),
+                      "dotted.canonical", "var1", moe::Int, "Var1", {"dotted.canonical"}),
                   ::mongo::DBException);
 }
 
 // Deprecated dotted name cannot be the empty string.
 TEST(YAMLConfigFile, DeprecatedDottedNameEmptyString) {
     moe::OptionSection testOpts;
-    ASSERT_THROWS(testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", ""),
+    ASSERT_THROWS(testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", {""}),
                   ::mongo::DBException);
 }
 
@@ -3836,16 +3902,17 @@ TEST(YAMLConfigFile, DeprecatedDottedNameSameAsOtherOptionsDottedName) {
     moe::OptionSection testOpts;
     testOpts.addOptionChaining("dotted.canonical1", "var1", moe::Int, "Var1");
     ASSERT_THROWS(testOpts.addOptionChaining(
-                      "dotted.canonical2", "var2", moe::Int, "Var2", "dotted.canonical1"),
+                      "dotted.canonical2", "var2", moe::Int, "Var2", {"dotted.canonical1"}),
                   ::mongo::DBException);
 }
 
 // Deprecated dotted name cannot be the same as another option's deprecated dotted name.
 TEST(YAMLConfigFile, DeprecatedDottedNameSameAsOtherOptionsDeprecatedDottedName) {
     moe::OptionSection testOpts;
-    testOpts.addOptionChaining("dotted.canonical1", "var1", moe::Int, "Var1", "dotted.deprecated1");
+    testOpts.addOptionChaining(
+        "dotted.canonical1", "var1", moe::Int, "Var1", {"dotted.deprecated"});
     ASSERT_THROWS(testOpts.addOptionChaining(
-                      "dotted.canonical2", "var2", moe::Int, "Var2", "dotted.deprecated1"),
+                      "dotted.canonical2", "var2", moe::Int, "Var2", {"dotted.deprecated"}),
                   ::mongo::DBException);
 }
 
@@ -3857,7 +3924,7 @@ TEST(YAMLConfigFile, DeprecatedDottedNameCanonicalAndDeprecated) {
 
     moe::OptionSection testOpts;
     testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
-    testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", "dotted.deprecated");
+    testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", {"dotted.deprecated"});
 
     std::vector<std::string> argv;
     argv.push_back("binaryname");
@@ -4154,7 +4221,7 @@ TEST(OptionCount, Basic) {
     moe::OptionSection subSection("Section Name");
     subSection.addOptionChaining("port", "port", moe::Int, "Port")
         .setSources(moe::SourceYAMLConfig);
-    testOpts.addSection(subSection).transitional_ignore();
+    ASSERT_OK(testOpts.addSection(subSection));
 
     int numOptions;
     ASSERT_OK(testOpts.countOptions(&numOptions, true /*visibleOnly*/, moe::SourceCommandLine));
@@ -4630,5 +4697,162 @@ TEST(NumericalBaseParsing, YAMLConfigFile) {
     ASSERT_OK(value.get(&unsignedVal));
     ASSERT_EQUALS(unsignedVal, 0x10U);
 }
+
+TEST(YAMLConfigFile, OutputConfig) {
+    moe::OptionSection options;
+    options.addOptionChaining("cacheSize", "cacheSize", moe::Long, "");
+    options.addOptionChaining("command", "command", moe::StringVector, "");
+    options.addOptionChaining("config", "config", moe::String, "");
+    options.addOptionChaining("math.pi", "pi", moe::Double, "");
+    options.addOptionChaining("net.port", "port", moe::Int, "");
+    options.addOptionChaining("net.bindIp", "bind_ip", moe::String, "");
+    options.addOptionChaining("net.bindIpAll", "bind_ip_all", moe::Switch, "");
+    options.addOptionChaining("security.javascriptEnabled", "javascriptEnabled", moe::Bool, "");
+    options.addOptionChaining("setParameter", "setParameter", moe::StringMap, "");
+    options.addOptionChaining("systemLog.path", "logPath", moe::String, "");
+
+    OptionsParserTester parser;
+    parser.setConfig("config.yaml",
+                     "systemLog: { path: /tmp/mongod.log }\n"
+                     "command: [ mongo, mongod, mongos ]");
+
+    const std::vector<std::string> argv = {
+        "binaryname",
+        "--port",
+        "31337",
+        "--bind_ip",
+        "127.0.0.1,::1",
+        "--bind_ip_all",
+        "--setParameter",
+        "scramSHAIterationCount=12345",
+        "--javascriptEnabled",
+        "false",
+        "--cacheSize",
+        "12345",
+        "--pi",
+        "3.14159265",
+        "--config",
+        "config.yaml",
+    };
+
+    std::map<std::string, std::string> env_map;
+    moe::Environment env;
+    ASSERT_OK(parser.run(options, argv, env_map, &env));
+    ASSERT_EQ(env.toYAML(),
+              "cacheSize: 12345\n"
+              "command:\n"
+              "  - mongo\n"
+              "  - mongod\n"
+              "  - mongos\n"
+              "config: config.yaml\n"
+              "math:\n"
+              "  pi: 3.14159265\n"
+              "net:\n"
+              "  bindIp: 127.0.0.1,::1\n"
+              "  bindIpAll: true\n"
+              "  port: 31337\n"
+              "security:\n"
+              "  javascriptEnabled: false\n"
+              "setParameter:\n"
+              "  scramSHAIterationCount: 12345\n"
+              "systemLog:\n"
+              "  path: /tmp/mongod.log");
+}
+
+void TestFile(std::vector<unsigned char> contents, bool valid) {
+    mongo::unittest::TempDir tempdir("options_testpath");
+    boost::filesystem::path p(tempdir.path());
+    p /= "config.yaml";
+
+    {
+        std::ofstream ofs(p.generic_string(), std::ios::binary);
+        ofs.write(reinterpret_cast<char*>(contents.data()), contents.size());
+    }
+
+    moe::OptionsParser parser;
+    moe::Environment environment;
+
+    moe::OptionSection testOpts;
+    testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
+    testOpts.addOptionChaining("port", "port", moe::Int, "Port");
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back(p.generic_string());
+    std::map<std::string, std::string> env_map;
+
+    if (valid) {
+        ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
+
+        moe::Value value;
+        ASSERT_OK(environment.get(moe::Key("port"), &value));
+        int port;
+        ASSERT_OK(value.get(&port));
+        ASSERT_EQUALS(port, 1234);
+    } else {
+        ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
+    }
+}
+
+TEST(YAMLConfigFile, canonicalize) {
+    moe::OptionSection opts;
+    opts.addOptionChaining("net.bindIpAll", "bind_ip_all", moe::Switch, "Bind all addresses")
+        .incompatibleWith("net.bindIp")
+        .canonicalize([](moe::Environment* env) {
+            auto status = env->remove("net.bindIpAll");
+            if (!status.isOK()) {
+                return status;
+            }
+            return env->set("net.bindIp", moe::Value("0.0.0.0"));
+        });
+    opts.addOptionChaining("net.bindIp", "bind_ip", moe::String, "Bind specific addresses")
+        .incompatibleWith("net.bindIpAll");
+
+    moe::OptionsParser parser;
+    moe::Environment env;
+    std::vector<std::string> argv = {
+        "binary", "--bind_ip_all",
+    };
+    std::map<std::string, std::string> env_map;
+    ASSERT_OK(parser.run(opts, argv, env_map, &env));
+    ASSERT_TRUE(env.count("net.bindIp"));
+    ASSERT_FALSE(env.count("net.bindIpAll"));
+    ASSERT_EQ(env["net.bindIp"].as<std::string>(), "0.0.0.0");
+}
+
+#if defined(_WIN32)
+// Positive: Validate a UTF-16 file with a BOM can be parsed
+TEST(YAMLConfigFile, UTF16WithBOMFile) {
+    // This array represents a file with a UTF-16 LE BOM and the contents:
+    // port: 1234
+    // <blank line>
+    std::vector<unsigned char> data{0xff, 0xfe, 0x70, 0x00, 0x6f, 0x00, 0x72, 0x00, 0x74,
+                                    0x00, 0x3a, 0x00, 0x20, 0x00, 0x31, 0x00, 0x32, 0x00,
+                                    0x33, 0x00, 0x34, 0x00, 0x0d, 0x00, 0x0a, 0x00};
+    TestFile(data, true);
+}
+
+// Negative: Validate a UTF-16 file without a BOM cannot be parsed
+TEST(YAMLConfigFile, UTF16WithoutBOMFile) {
+    // This array represents a file with a UTF-16 with a BOM and the contents:
+    // port: 1234
+    // <blank line>
+    std::vector<unsigned char> data{0x70, 0x00, 0x6f, 0x00, 0x72, 0x00, 0x74, 0x00,
+                                    0x3a, 0x00, 0x20, 0x00, 0x31, 0x00, 0x32, 0x00,
+                                    0x33, 0x00, 0x34, 0x00, 0x0d, 0x00, 0x0a, 0x00};
+    TestFile(data, false);
+}
+
+// Positive: Validate a UTF-8 file with a BOM can be parsed
+TEST(YAMLConfigFile, UTF8WithBOMFile) {
+    // This array represents a file with a UTF-8 BOM and the contents:
+    // port: 1234
+    // <blank line>
+    std::vector<unsigned char> data{
+        0xef, 0xbb, 0xbf, 0x70, 0x6f, 0x72, 0x74, 0x3a, 0x20, 0x31, 0x32, 0x33, 0x34, 0x0d, 0x0a};
+    TestFile(data, true);
+}
+#endif
 
 }  // unnamed namespace

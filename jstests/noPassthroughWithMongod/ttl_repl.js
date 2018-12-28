@@ -3,6 +3,7 @@
  *          Check that the correct # of docs age out.
  *  Part 2: Add a new member to the set. Check that it also gets the correct # of docs.
  *  Part 3: Change the TTL expireAfterSeconds field and check successful propogation to secondary.
+ *  @tags: [requires_replication]
  */
 
 load("jstests/replsets/rslib.js");
@@ -16,7 +17,7 @@ var nodes = rt.startSet();
 rt.initiate();
 var master = rt.getPrimary();
 rt.awaitSecondaryNodes();
-var slave1 = rt.liveNodes.slaves[0];
+var slave1 = rt._slaves[0];
 
 // shortcuts
 var masterdb = master.getDB('d');

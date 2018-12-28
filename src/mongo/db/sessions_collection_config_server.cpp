@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,12 +35,13 @@
 #include "mongo/db/sessions_collection_config_server.h"
 
 #include "mongo/client/query.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/util/log.h"
@@ -62,13 +65,13 @@ Status SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext
 
     // First, shard the sessions collection to create it.
     ConfigsvrShardCollectionRequest shardCollection;
-    shardCollection.set_configsvrShardCollection(
-        NamespaceString(SessionsCollection::kSessionsFullNS.toString()));
+    shardCollection.set_configsvrShardCollection(NamespaceString::kLogicalSessionsNamespace);
     shardCollection.setKey(BSON("_id" << 1));
 
     DBDirectClient client(opCtx);
     BSONObj info;
-    if (!client.runCommand("admin", shardCollection.toBSON(), info)) {
+    if (!client.runCommand(
+            "admin", CommandHelpers::appendMajorityWriteConcern(shardCollection.toBSON()), info)) {
         return getStatusFromCommandResult(info);
     }
 
@@ -76,17 +79,24 @@ Status SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext
 }
 
 Status SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* opCtx) {
-    auto res =
+    try {
         scatterGatherOnlyVersionIfUnsharded(opCtx,
-                                            SessionsCollection::kSessionsDb.toString(),
-                                            NamespaceString(SessionsCollection::kSessionsFullNS),
+                                            NamespaceString::kLogicalSessionsNamespace,
                                             SessionsCollection::generateCreateIndexesCmd(),
                                             ReadPreferenceSetting::get(opCtx),
                                             Shard::RetryPolicy::kNoRetry);
-    return res.getStatus();
+        return Status::OK();
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
 }
 
 Status SessionsCollectionConfigServer::setupSessionsCollection(OperationContext* opCtx) {
+    // If the sharding state is not yet initialized, fail.
+    if (!Grid::get(opCtx)->isShardingInitialized()) {
+        return {ErrorCodes::ShardingStateNotInitialized, "sharding state is not yet initialized"};
+    }
+
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     {
         // Only try to set up this collection until we have done so successfully once.
@@ -112,6 +122,10 @@ Status SessionsCollectionConfigServer::setupSessionsCollection(OperationContext*
         _collectionSetUp = true;
         return res;
     }
+}
+
+Status SessionsCollectionConfigServer::checkSessionsCollectionExists(OperationContext* opCtx) {
+    return _checkCacheForSessionsCollection(opCtx);
 }
 
 }  // namespace mongo

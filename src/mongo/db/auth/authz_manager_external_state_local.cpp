@@ -1,32 +1,36 @@
+
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authz_manager_external_state_local.h"
 
@@ -35,13 +39,13 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege_parser.h"
 #include "mongo/db/auth/user_document_parser.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 
@@ -203,7 +207,7 @@ Status AuthzManagerExternalStateLocal::getUserDescription(OperationContext* opCt
 
 void AuthzManagerExternalStateLocal::resolveUserRoles(mutablebson::Document* userDoc,
                                                       const std::vector<RoleName>& directRoles) {
-    unordered_set<RoleName> indirectRoles;
+    stdx::unordered_set<RoleName> indirectRoles;
     PrivilegeVector allPrivileges;
     std::vector<SharedRestrictionDocument> allAuthenticationRestrictions;
     bool isRoleGraphConsistent = false;
@@ -289,9 +293,11 @@ Status AuthzManagerExternalStateLocal::_getUserDocument(OperationContext* opCtx,
                             userDoc);
 
     if (status == ErrorCodes::NoMatchingDocument) {
-        status =
-            Status(ErrorCodes::UserNotFound,
-                   mongoutils::str::stream() << "Could not find user " << userName.getFullName());
+        status = Status(ErrorCodes::UserNotFound,
+                        mongoutils::str::stream() << "Could not find user \"" << userName.getUser()
+                                                  << "\" for db \""
+                                                  << userName.getDB()
+                                                  << "\"");
     }
     return status;
 }
@@ -437,7 +443,7 @@ Status AuthzManagerExternalStateLocal::_getRoleDescription_inlock(
 
 Status AuthzManagerExternalStateLocal::getRoleDescriptionsForDB(
     OperationContext* opCtx,
-    const std::string& dbname,
+    StringData dbname,
     PrivilegeFormat showPrivileges,
     AuthenticationRestrictionsFormat showRestrictions,
     bool showBuiltinRoles,
@@ -488,12 +494,12 @@ Status AuthzManagerExternalStateLocal::_initializeRoleGraph(OperationContext* op
     _roleGraph = RoleGraph();
 
     RoleGraph newRoleGraph;
-    Status status =
-        query(opCtx,
-              AuthorizationManager::rolesCollectionNamespace,
-              BSONObj(),
-              BSONObj(),
-              stdx::bind(addRoleFromDocumentOrWarn, &newRoleGraph, stdx::placeholders::_1));
+    Status status = query(
+        opCtx,
+        AuthorizationManager::rolesCollectionNamespace,
+        BSONObj(),
+        BSONObj(),
+        [p = &newRoleGraph](const BSONObj& doc) { return addRoleFromDocumentOrWarn(p, doc); });
     if (!status.isOK())
         return status;
 
@@ -538,7 +544,7 @@ public:
           _isO2Set(o2 ? true : false),
           _o2(_isO2Set ? o2->getOwned() : BSONObj()) {}
 
-    virtual void commit() {
+    virtual void commit(boost::optional<Timestamp>) {
         stdx::lock_guard<stdx::mutex> lk(_externalState->_roleGraphMutex);
         Status status = _externalState->_roleGraph.handleLogOp(
             _opCtx, _op.c_str(), _nss, _o, _isO2Set ? &_o2 : NULL);

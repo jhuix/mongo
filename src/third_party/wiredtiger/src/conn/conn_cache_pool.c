@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -135,7 +135,7 @@ __wt_cache_pool_config(WT_SESSION_IMPL *session, const char **cfg)
 		if (__wt_config_gets(session, &cfg[1],
 		    "shared_cache.size", &cval) == 0 && cval.val != 0)
 			size = (uint64_t)cval.val;
-		 else
+		else
 			size = cp->size;
 		if (__wt_config_gets(session, &cfg[1],
 		    "shared_cache.chunk", &cval) == 0 && cval.val != 0)
@@ -303,7 +303,8 @@ __wt_conn_cache_pool_destroy(WT_SESSION_IMPL *session)
 
 	conn = S2C(session);
 	cache = conn->cache;
-	cp_locked = found = false;
+	WT_NOT_READ(cp_locked, false);
+	found = false;
 	cp = __wt_process.cache_pool;
 
 	if (!F_ISSET(conn, WT_CONN_CACHE_POOL))
@@ -337,11 +338,11 @@ __wt_conn_cache_pool_destroy(WT_SESSION_IMPL *session)
 		 * operation.
 		 */
 		__wt_spin_unlock(session, &cp->cache_pool_lock);
-		cp_locked = false;
+		WT_NOT_READ(cp_locked, false);
 
 		FLD_CLR(cache->pool_flags, WT_CACHE_POOL_RUN);
 		__wt_cond_signal(session, cp->cache_pool_cond);
-		WT_TRET(__wt_thread_join(session, cache->cp_tid));
+		WT_TRET(__wt_thread_join(session, &cache->cp_tid));
 
 		wt_session = &cache->cp_session->iface;
 		WT_TRET(wt_session->close(wt_session, NULL));
@@ -570,15 +571,16 @@ __cache_pool_adjust(WT_SESSION_IMPL *session,
 	WT_CACHE *cache;
 	WT_CACHE_POOL *cp;
 	WT_CONNECTION_IMPL *entry;
+	double pct_full;
 	uint64_t adjustment, highest_percentile, pressure, reserved, smallest;
-	u_int pct_full;
 	bool busy, decrease_ok, grow, pool_full;
 
 	*adjustedp = false;
+
 	cp = __wt_process.cache_pool;
 	grow = false;
 	pool_full = cp->currently_used >= cp->size;
-	pct_full = 0;
+	pct_full = 0.0;
 	/* Highest as a percentage, avoid 0 */
 	highest_percentile = (highest / 100) + 1;
 
@@ -607,10 +609,10 @@ __cache_pool_adjust(WT_SESSION_IMPL *session,
 		 */
 		pressure = cache->cp_pass_pressure / highest_percentile;
 		busy = __wt_eviction_needed(
-		    entry->default_session, false, &pct_full);
+		    entry->default_session, false, true, &pct_full);
 
 		__wt_verbose(session, WT_VERB_SHARED_CACHE,
-		    "\t%5" PRIu64 ", %3" PRIu64 ", %2" PRIu32 ", %d, %2u",
+		    "\t%5" PRIu64 ", %3" PRIu64 ", %2" PRIu32 ", %d, %2.3f",
 		    entry->cache_size >> 20, pressure, cache->cp_skip_count,
 		    busy, pct_full);
 
@@ -673,8 +675,9 @@ __cache_pool_adjust(WT_SESSION_IMPL *session,
 			 * potentially a negative feedback loop in the
 			 * balance algorithm.
 			 */
-			smallest = (100 * __wt_cache_bytes_inuse(cache)) /
-			    cache->eviction_trigger;
+			smallest =
+			    (uint64_t)((100 * __wt_cache_bytes_inuse(cache)) /
+			    cache->eviction_trigger);
 			if (entry->cache_size > smallest)
 				adjustment = WT_MIN(cp->chunk,
 				    (entry->cache_size - smallest) / 2);

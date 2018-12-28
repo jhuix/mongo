@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -96,19 +98,24 @@ public:
     /**
      * Returns a Date_t populated with the argument values for the current timezone.
      */
-    Date_t createFromDateParts(
-        int year, int month, int day, int hour, int minute, int second, int millisecond) const;
+    Date_t createFromDateParts(long long year,
+                               long long month,
+                               long long day,
+                               long long hour,
+                               long long minute,
+                               long long second,
+                               long long millisecond) const;
 
     /**
      * Returns a Date_t populated with the argument values for the current timezone.
      */
-    Date_t createFromIso8601DateParts(int isoYear,
-                                      int isoWeekYear,
-                                      int isoDayOfWeek,
-                                      int hour,
-                                      int minute,
-                                      int second,
-                                      int millisecond) const;
+    Date_t createFromIso8601DateParts(long long isoYear,
+                                      long long isoWeekYear,
+                                      long long isoDayOfWeek,
+                                      long long hour,
+                                      long long minute,
+                                      long long second,
+                                      long long millisecond) const;
     /**
      * Returns a struct with members for each piece of the date.
      */
@@ -264,16 +271,17 @@ public:
                     break;
                 default:
                     // Should never happen as format is pre-validated
-                    invariant(false);
+                    MONGO_UNREACHABLE;
             }
         }
     }
 
     /**
      * Verifies that any '%' is followed by a valid format character, and that 'format' string
-     * ends with an even number of '%' symbols
+     * ends with an even number of '%' symbols.
      */
-    static void validateFormat(StringData format);
+    static void validateToStringFormat(StringData format);
+    static void validateFromStringFormat(StringData format);
 
 private:
     std::unique_ptr<_timelib_time, TimelibTimeDeleter> getTimelibTime(Date_t) const;
@@ -346,7 +354,8 @@ public:
     };
 
     /**
-     * Returns the TimeZoneDatabase object associated with the specified service context.
+     * Returns the TimeZoneDatabase object associated with the specified service context or nullptr
+     * if none exists.
      */
     static const TimeZoneDatabase* get(ServiceContext* serviceContext);
 
@@ -357,10 +366,14 @@ public:
                     std::unique_ptr<TimeZoneDatabase> timeZoneDatabase);
 
     /**
-     * Constructs a Date_t from a string description of a date.
+     * Constructs a Date_t from a string description of a date, with an optional format specifier
+     * string.
      *
      * 'dateString' may contain time zone information if the information is simply an offset from
      * UTC, in which case the returned Date_t will be adjusted accordingly.
+     *
+     * The supported format specifiers for the 'format' string are listed in
+     * kDateFromStringFormatMap.
      *
      * Throws a AssertionException if any of the following occur:
      *  * The string cannot be parsed into a date.
@@ -370,8 +383,11 @@ public:
      *    string '2017-07-04T00:00:00Z'.
      *  * 'tz' is provided, but 'dateString' specifies an offset from UTC, like '-0400'
      *    in the string '2017-07-04 -0400'.
+     *  * The string does not match the 'format' specifier.
      */
-    Date_t fromString(StringData dateString, boost::optional<TimeZone> tz) const;
+    Date_t fromString(StringData dateString,
+                      const TimeZone& tz,
+                      boost::optional<StringData> format = boost::none) const;
 
     /**
      * Returns a TimeZone object representing the UTC time zone.

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -34,8 +34,21 @@ static int __verify_dsk_row(
 #define	WT_RET_VRFY(session, ...) do {					\
 	if (!(F_ISSET(session, WT_SESSION_QUIET_CORRUPT_FILE)))		\
 		__wt_errx(session, __VA_ARGS__);			\
+	F_SET(S2C(session), WT_CONN_DATA_CORRUPTION);			\
 	return (WT_ERROR);						\
 } while (0)
+
+/*
+ * WT_CELL_FOREACH_VRFY --
+ *	Iterate through each cell on a page. Verify-specific version of the
+ * WT_CELL_FOREACH macro, created because the loop can't simply unpack cells,
+ * verify has to do additional work to ensure that unpack is safe.
+ */
+#define	WT_CELL_FOREACH_VRFY(btree, dsk, cell, unpack, i)		\
+	for ((cell) =							\
+	    WT_PAGE_HEADER_BYTE(btree, dsk), (i) = (dsk)->u.entries;	\
+	    (i) > 0;							\
+	    (cell) = (WT_CELL *)((uint8_t *)(cell) + (unpack)->__len), --(i))
 
 /*
  * __wt_verify_dsk_image --
@@ -47,7 +60,6 @@ __wt_verify_dsk_image(WT_SESSION_IMPL *session,
 {
 	uint8_t flags;
 	const uint8_t *p, *end;
-	u_int i;
 
 	/* Check the page type. */
 	switch (dsk->type) {
@@ -113,12 +125,22 @@ __wt_verify_dsk_image(WT_SESSION_IMPL *session,
 		    "page at %s has invalid flags set: 0x%" PRIx8,
 		    tag, flags);
 
-	/* Unused bytes */
-	for (p = dsk->unused, i = sizeof(dsk->unused); i > 0; --i)
-		if (*p != '\0')
-			WT_RET_VRFY(session,
-			    "page at %s has non-zero unused page header bytes",
-			    tag);
+	/* Check the unused byte. */
+	if (dsk->unused != 0)
+		WT_RET_VRFY(session,
+		    "page at %s has non-zero unused page header bytes",
+		    tag);
+
+	/* Check the page version. */
+	switch (dsk->version) {
+	case WT_PAGE_VERSION_ORIG:
+	case WT_PAGE_VERSION_TS:
+		break;
+	default:
+		WT_RET_VRFY(session,
+		    "page at %s has an invalid version of %" PRIu8,
+		    tag, dsk->version);
+	}
 
 	/*
 	 * Any bytes after the data chunk should be nul bytes; ignore if the
@@ -166,7 +188,7 @@ __wt_verify_dsk_image(WT_SESSION_IMPL *session,
 	case WT_PAGE_BLOCK_MANAGER:
 	case WT_PAGE_OVFL:
 		return (__verify_dsk_chunk(session, tag, dsk, dsk->u.datalen));
-	WT_ILLEGAL_VALUE(session);
+	WT_ILLEGAL_VALUE(session, dsk->type);
 	}
 	/* NOTREACHED */
 }
@@ -225,11 +247,11 @@ __verify_dsk_row(
 	last_cell_type = FIRST;
 	cell_num = 0;
 	key_cnt = 0;
-	WT_CELL_FOREACH(btree, dsk, cell, unpack, i) {
+	WT_CELL_FOREACH_VRFY(btree, dsk, cell, unpack, i) {
 		++cell_num;
 
 		/* Carefully unpack the cell. */
-		if (__wt_cell_unpack_safe(cell, unpack, dsk, end) != 0) {
+		if (__wt_cell_unpack_safe(dsk, cell, unpack, end) != 0) {
 			ret = __err_cell_corrupt(session, cell_num, tag);
 			goto err;
 		}
@@ -498,11 +520,11 @@ __verify_dsk_col_int(
 	end = (uint8_t *)dsk + dsk->mem_size;
 
 	cell_num = 0;
-	WT_CELL_FOREACH(btree, dsk, cell, unpack, i) {
+	WT_CELL_FOREACH_VRFY(btree, dsk, cell, unpack, i) {
 		++cell_num;
 
 		/* Carefully unpack the cell. */
-		if (__wt_cell_unpack_safe(cell, unpack, dsk, end) != 0)
+		if (__wt_cell_unpack_safe(dsk, cell, unpack, end) != 0)
 			return (__err_cell_corrupt(session, cell_num, tag));
 
 		/* Check the raw and collapsed cell types. */
@@ -569,11 +591,11 @@ __verify_dsk_col_var(
 	last_deleted = false;
 
 	cell_num = 0;
-	WT_CELL_FOREACH(btree, dsk, cell, unpack, i) {
+	WT_CELL_FOREACH_VRFY(btree, dsk, cell, unpack, i) {
 		++cell_num;
 
 		/* Carefully unpack the cell. */
-		if (__wt_cell_unpack_safe(cell, unpack, dsk, end) != 0)
+		if (__wt_cell_unpack_safe(dsk, cell, unpack, end) != 0)
 			return (__err_cell_corrupt(session, cell_num, tag));
 
 		/* Check the raw and collapsed cell types. */
@@ -699,6 +721,7 @@ static int
 __err_cell_corrupt(
     WT_SESSION_IMPL *session, uint32_t entry_num, const char *tag)
 {
+	F_SET(S2C(session), WT_CONN_DATA_CORRUPTION);
 	WT_RET_VRFY(session,
 	    "item %" PRIu32 " on page at %s is a corrupted cell",
 	    entry_num, tag);

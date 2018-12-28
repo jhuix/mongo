@@ -11,10 +11,10 @@ selector:
   exclude_files:
   # Skip any tests that run with auth explicitly.
   - jstests/sharding/*[aA]uth*.js
+  - jstests/sharding/advance_cluster_time_action_type.js
   - jstests/sharding/aggregation_currentop.js # SERVER-19318
   - jstests/sharding/kill_sessions.js
   # Skip these additional tests when running with auth enabled.
-  - jstests/sharding/copydb_from_mongos.js  # SERVER-13080
   - jstests/sharding/parallel.js
   # Skip these tests that run with enableTestCommands off.
   - jstests/sharding/shard_config_db_collections.js
@@ -32,6 +32,8 @@ selector:
   - jstests/sharding/migration_server_status.js                       # SERVER-21713
   - jstests/sharding/migration_move_chunk_after_receive.js            # SERVER-21713
   - jstests/sharding/migration_critical_section_concurrency.js        # SERVER-21713
+  # Runs with auth enabled.
+  - jstests/sharding/mongod_returns_no_cluster_time_without_keys.js
 
 executor:
   config:

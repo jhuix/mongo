@@ -1,25 +1,25 @@
-// kv_engine_test_harness.cpp
 
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,6 +37,7 @@
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source_mock.h"
@@ -77,7 +78,7 @@ TEST(KVEngineTestHarness, SimpleRS1) {
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        StatusWith<RecordId> res = rs->insertRecord(&opCtx, "abc", 4, Timestamp(), false);
+        StatusWith<RecordId> res = rs->insertRecord(&opCtx, "abc", 4, Timestamp());
         ASSERT_OK(res.getStatus());
         loc = res.getValue();
         uow.commit();
@@ -117,7 +118,7 @@ TEST(KVEngineTestHarness, Restart1) {
         {
             MyOperationContext opCtx(engine);
             WriteUnitOfWork uow(&opCtx);
-            StatusWith<RecordId> res = rs->insertRecord(&opCtx, "abc", 4, Timestamp(), false);
+            StatusWith<RecordId> res = rs->insertRecord(&opCtx, "abc", 4, Timestamp());
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
             uow.commit();
@@ -146,7 +147,10 @@ TEST(KVEngineTestHarness, SimpleSorted1) {
     ASSERT(engine);
 
     string ident = "abc";
-    IndexDescriptor desc(NULL, "", BSON("key" << BSON("a" << 1)));
+    IndexDescriptor desc(nullptr,
+                         "",
+                         BSON("v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion) << "key"
+                                  << BSON("a" << 1)));
     unique_ptr<SortedDataInterface> sorted;
     {
         MyOperationContext opCtx(engine);
@@ -165,6 +169,43 @@ TEST(KVEngineTestHarness, SimpleSorted1) {
     {
         MyOperationContext opCtx(engine);
         ASSERT_EQUALS(1, sorted->numEntries(&opCtx));
+    }
+}
+
+TEST(KVEngineTestHarness, TemporaryRecordStoreSimple) {
+    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    KVEngine* engine = helper->getEngine();
+    ASSERT(engine);
+
+    string ident = "temptemp";
+    unique_ptr<RecordStore> rs;
+    {
+        MyOperationContext opCtx(engine);
+        rs = engine->makeTemporaryRecordStore(&opCtx, ident);
+        ASSERT(rs);
+    }
+
+    RecordId loc;
+    {
+        MyOperationContext opCtx(engine);
+        WriteUnitOfWork uow(&opCtx);
+        StatusWith<RecordId> res = rs->insertRecord(&opCtx, "abc", 4, Timestamp());
+        ASSERT_OK(res.getStatus());
+        loc = res.getValue();
+        uow.commit();
+    }
+
+    {
+        MyOperationContext opCtx(engine);
+        ASSERT_EQUALS(string("abc"), rs->dataFor(&opCtx, loc).data());
+
+        std::vector<std::string> all = engine->getAllIdents(&opCtx);
+        ASSERT_EQUALS(1U, all.size());
+        ASSERT_EQUALS(ident, all[0]);
+
+        WriteUnitOfWork wuow(&opCtx);
+        ASSERT_OK(engine->dropIdent(&opCtx, ident));
+        wuow.commit();
     }
 }
 
@@ -213,7 +254,6 @@ TEST(KVCatalogTest, Coll1) {
     ASSERT_NOT_EQUALS(ident, catalog->getCollectionIdent("a.b"));
 }
 
-
 TEST(KVCatalogTest, Idx1) {
     unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
@@ -250,7 +290,8 @@ TEST(KVCatalogTest, Idx1) {
                                                                        false,
                                                                        RecordId(),
                                                                        false,
-                                                                       KVPrefix::kNotPrefixed));
+                                                                       KVPrefix::kNotPrefixed,
+                                                                       false));
         catalog->putMetaData(&opCtx, "a.b", md);
         uow.commit();
     }
@@ -279,7 +320,8 @@ TEST(KVCatalogTest, Idx1) {
                                                                        false,
                                                                        RecordId(),
                                                                        false,
-                                                                       KVPrefix::kNotPrefixed));
+                                                                       KVPrefix::kNotPrefixed,
+                                                                       false));
         catalog->putMetaData(&opCtx, "a.b", md);
         uow.commit();
     }
@@ -326,7 +368,8 @@ TEST(KVCatalogTest, DirectoryPerDb1) {
                                                                        false,
                                                                        RecordId(),
                                                                        false,
-                                                                       KVPrefix::kNotPrefixed));
+                                                                       KVPrefix::kNotPrefixed,
+                                                                       false));
         catalog->putMetaData(&opCtx, "a.b", md);
         ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "a/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
@@ -370,7 +413,8 @@ TEST(KVCatalogTest, Split1) {
                                                                        false,
                                                                        RecordId(),
                                                                        false,
-                                                                       KVPrefix::kNotPrefixed));
+                                                                       KVPrefix::kNotPrefixed,
+                                                                       false));
         catalog->putMetaData(&opCtx, "a.b", md);
         ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "index/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
@@ -414,7 +458,8 @@ TEST(KVCatalogTest, DirectoryPerAndSplit1) {
                                                                        false,
                                                                        RecordId(),
                                                                        false,
-                                                                       KVPrefix::kNotPrefixed));
+                                                                       KVPrefix::kNotPrefixed,
+                                                                       false));
         catalog->putMetaData(&opCtx, "a.b", md);
         ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "a/index/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
@@ -463,7 +508,8 @@ TEST(KVCatalogTest, RestartForPrefixes) {
                                                                            false,
                                                                            RecordId(),
                                                                            false,
-                                                                           fooIndexPrefix));
+                                                                           fooIndexPrefix,
+                                                                           false));
             md.prefix = abCollPrefix;
             catalog->putMetaData(&opCtx, "a.b", md);
             uow.commit();
@@ -483,6 +529,39 @@ TEST(KVCatalogTest, RestartForPrefixes) {
         ASSERT_EQ("a.b", md.ns);
         ASSERT_EQ(abCollPrefix, md.prefix);
         ASSERT_EQ(fooIndexPrefix, md.indexes[md.findIndexOffset("foo")].prefix);
+    }
+}
+
+TEST(KVCatalogTest, BackupImplemented) {
+    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    KVEngine* engine = helper->getEngine();
+    ASSERT(engine);
+
+    {
+        MyOperationContext opCtx(engine);
+        ASSERT_OK(engine->beginBackup(&opCtx));
+        engine->endBackup(&opCtx);
+    }
+}
+
+DEATH_TEST(KVCatalogTest, TerminateOnNonNumericIndexVersion, "Fatal Assertion 50942") {
+    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    KVEngine* engine = helper->getEngine();
+    ASSERT(engine);
+
+    string ident = "abc";
+    IndexDescriptor desc(nullptr,
+                         "",
+                         BSON("v"
+                              << "1"
+                              << "key"
+                              << BSON("a" << 1)));
+    unique_ptr<SortedDataInterface> sorted;
+    {
+        MyOperationContext opCtx(engine);
+        ASSERT_OK(engine->createSortedDataInterface(&opCtx, ident, &desc));
+        sorted.reset(engine->getSortedDataInterface(&opCtx, ident, &desc));
+        ASSERT(sorted);
     }
 }
 

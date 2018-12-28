@@ -1,28 +1,31 @@
-/*    Copyright 2012 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 /**
@@ -31,11 +34,9 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/timer.h"
 
@@ -47,6 +48,7 @@ using mongo::BSONObj;
 using mongo::ConnectionString;
 using mongo::MockDBClientConnection;
 using mongo::MockRemoteDBServer;
+using mongo::NamespaceString;
 using mongo::Query;
 
 using std::string;
@@ -69,14 +71,14 @@ TEST(MockDBClientConnTest, QueryCount) {
         MockDBClientConnection conn(&server);
 
         ASSERT_EQUALS(0U, server.getQueryCount());
-        conn.query("foo.bar");
+        conn.query(NamespaceString("foo.bar"));
     }
 
     ASSERT_EQUALS(1U, server.getQueryCount());
 
     {
         MockDBClientConnection conn(&server);
-        conn.query("foo.bar");
+        conn.query(NamespaceString("foo.bar"));
         ASSERT_EQUALS(2U, server.getQueryCount());
     }
 }
@@ -87,7 +89,7 @@ TEST(MockDBClientConnTest, InsertAndQuery) {
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns));
         ASSERT(!cursor->more());
 
         server.insert(ns, BSON("x" << 1));
@@ -96,7 +98,7 @@ TEST(MockDBClientConnTest, InsertAndQuery) {
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns));
 
         ASSERT(cursor->more());
         BSONObj firstDoc = cursor->next();
@@ -112,7 +114,7 @@ TEST(MockDBClientConnTest, InsertAndQuery) {
     // Make sure that repeated calls will still give you the same result
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns));
 
         ASSERT(cursor->more());
         BSONObj firstDoc = cursor->next();
@@ -134,7 +136,7 @@ TEST(MockDBClientConnTest, InsertAndQueryTwice) {
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns));
 
         ASSERT(cursor->more());
         BSONObj firstDoc = cursor->next();
@@ -145,7 +147,7 @@ TEST(MockDBClientConnTest, InsertAndQueryTwice) {
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns));
 
         ASSERT(cursor->more());
         BSONObj firstDoc = cursor->next();
@@ -165,7 +167,7 @@ TEST(MockDBClientConnTest, QueryWithNoResults) {
 
     server.insert(ns, BSON("x" << 1));
     MockDBClientConnection conn(&server);
-    std::unique_ptr<mongo::DBClientCursor> cursor = conn.query("other.ns");
+    std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString("other.ns"));
 
     ASSERT(!cursor->more());
 }
@@ -196,7 +198,7 @@ TEST(MockDBClientConnTest, MultiNSInsertAndQuery) {
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns1);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns1));
 
         ASSERT(cursor->more());
         BSONObj firstDoc = cursor->next();
@@ -211,7 +213,7 @@ TEST(MockDBClientConnTest, MultiNSInsertAndQuery) {
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns2);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns2));
 
         ASSERT(cursor->more());
         BSONObj firstDoc = cursor->next();
@@ -230,7 +232,7 @@ TEST(MockDBClientConnTest, MultiNSInsertAndQuery) {
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns3);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns3));
 
         ASSERT(cursor->more());
         BSONObj firstDoc = cursor->next();
@@ -246,7 +248,7 @@ TEST(MockDBClientConnTest, SimpleRemove) {
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns));
         ASSERT(!cursor->more());
 
         conn.insert(ns, BSON("x" << 1));
@@ -260,7 +262,7 @@ TEST(MockDBClientConnTest, SimpleRemove) {
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns));
 
         ASSERT(!cursor->more());
     }
@@ -268,7 +270,7 @@ TEST(MockDBClientConnTest, SimpleRemove) {
     // Make sure that repeated calls will still give you the same result
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns));
 
         ASSERT(!cursor->more());
     }
@@ -302,13 +304,13 @@ TEST(MockDBClientConnTest, MultiNSRemove) {
         MockDBClientConnection conn(&server);
         conn.remove(ns2, Query(), false);
 
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns2);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns2));
         ASSERT(!cursor->more());
     }
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns1);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns1));
 
         ASSERT(cursor->more());
         BSONObj firstDoc = cursor->next();
@@ -323,7 +325,7 @@ TEST(MockDBClientConnTest, MultiNSRemove) {
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns3);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns3));
 
         ASSERT(cursor->more());
         BSONObj firstDoc = cursor->next();
@@ -358,7 +360,7 @@ TEST(MockDBClientConnTest, InsertAfterRemove) {
 
     {
         MockDBClientConnection conn(&server);
-        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(ns);
+        std::unique_ptr<mongo::DBClientCursor> cursor = conn.query(NamespaceString(ns));
 
         ASSERT(cursor->more());
         BSONObj firstDoc = cursor->next();
@@ -535,14 +537,14 @@ TEST(MockDBClientConnTest, Shutdown) {
         server.shutdown();
         ASSERT(!server.isRunning());
 
-        ASSERT_THROWS(conn.query("test.user"), mongo::SocketException);
+        ASSERT_THROWS(conn.query(NamespaceString("test.user")), mongo::NetworkException);
     }
 
     {
         MockDBClientConnection conn(&server);
         BSONObj response;
         ASSERT_THROWS(conn.runCommand("test.user", BSON("serverStatus" << 1), response),
-                      mongo::SocketException);
+                      mongo::NetworkException);
     }
 
     ASSERT_EQUALS(0U, server.getQueryCount());
@@ -557,16 +559,16 @@ TEST(MockDBClientConnTest, Restart) {
 
     // Do some queries and commands then check the counters later that
     // new instance still has it
-    conn1.query("test.user");
+    conn1.query(NamespaceString("test.user"));
     BSONObj response;
     conn1.runCommand("test.user", BSON("serverStatus" << 1), response);
 
     server.shutdown();
-    ASSERT_THROWS(conn1.query("test.user"), mongo::SocketException);
+    ASSERT_THROWS(conn1.query(NamespaceString("test.user")), mongo::NetworkException);
 
     // New connections shouldn't work either
     MockDBClientConnection conn2(&server);
-    ASSERT_THROWS(conn2.query("test.user"), mongo::SocketException);
+    ASSERT_THROWS(conn2.query(NamespaceString("test.user")), mongo::NetworkException);
 
     ASSERT_EQUALS(1U, server.getQueryCount());
     ASSERT_EQUALS(1U, server.getCmdCount());
@@ -576,12 +578,12 @@ TEST(MockDBClientConnTest, Restart) {
 
     {
         MockDBClientConnection conn(&server);
-        conn.query("test.user");
+        conn.query(NamespaceString("test.user"));
     }
 
     // Old connections still shouldn't work
-    ASSERT_THROWS(conn1.query("test.user"), mongo::SocketException);
-    ASSERT_THROWS(conn2.query("test.user"), mongo::SocketException);
+    ASSERT_THROWS(conn1.query(NamespaceString("test.user")), mongo::NetworkException);
+    ASSERT_THROWS(conn2.query(NamespaceString("test.user")), mongo::NetworkException);
 
     ASSERT_EQUALS(2U, server.getQueryCount());
     ASSERT_EQUALS(1U, server.getCmdCount());
@@ -592,7 +594,7 @@ TEST(MockDBClientConnTest, ClearCounter) {
     server.setCommandReply("serverStatus", BSON("ok" << 1));
 
     MockDBClientConnection conn(&server);
-    conn.query("test.user");
+    conn.query(NamespaceString("test.user"));
     BSONObj response;
     conn.runCommand("test.user", BSON("serverStatus" << 1), response);
 
@@ -610,7 +612,7 @@ TEST(MockDBClientConnTest, Delay) {
 
     {
         mongo::Timer timer;
-        conn.query("x.x");
+        conn.query(NamespaceString("x.x"));
         const int nowInMilliSec = timer.millis();
         // Use a more lenient lower bound since some platforms like Windows
         // don't guarantee that sleeps will not wake up earlier (unlike

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,6 +34,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/commands/end_sessions_gen.h"
+#include "mongo/db/logical_session_cache_stats_gen.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/refresh_sessions_gen.h"
 
@@ -68,7 +71,7 @@ public:
      * should only be used when starting new sessions and should not be used to
      * insert records for existing sessions.
      */
-    virtual void startSession(OperationContext* opCtx, LogicalSessionRecord record) = 0;
+    virtual Status startSession(OperationContext* opCtx, LogicalSessionRecord record) = 0;
 
     /**
      * Refresh the given sessions. Updates the timestamps of these records in
@@ -83,18 +86,12 @@ public:
      * Vivifies the session in the cache. I.e. creates it if it isn't there, updates last use if it
      * is.
      */
-    virtual void vivify(OperationContext* opCtx, const LogicalSessionId& lsid) = 0;
+    virtual Status vivify(OperationContext* opCtx, const LogicalSessionId& lsid) = 0;
 
     /**
      * enqueues LogicalSessionIds for removal during the next _refresh()
      */
     virtual void endSessions(const LogicalSessionIdSet& lsids) = 0;
-
-    /**
-     * Removes all local records in this cache. Does not remove the corresponding
-     * authoritative session records from the sessions collection.
-     */
-    virtual void clear() = 0;
 
     /**
      * Refreshes the cache synchronously. This flushes all pending refreshes and
@@ -132,6 +129,11 @@ public:
      * Retrieve a LogicalSessionRecord by LogicalSessionId, if it exists in the cache.
      */
     virtual boost::optional<LogicalSessionRecord> peekCached(const LogicalSessionId& id) const = 0;
+
+    /**
+     * Returns stats about the logical session cache and its recent operations.
+     */
+    virtual LogicalSessionCacheStats getStats() = 0;
 };
 
 }  // namespace mongo

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,9 +32,11 @@
 
 #include <boost/optional.hpp>
 
+#include "mongo/client/read_preference.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/s/query/cluster_query_result.h"
 #include "mongo/s/query/router_exec_stage.h"
 #include "mongo/util/time_support.h"
@@ -89,6 +93,11 @@ public:
     virtual void detachFromOperationContext() = 0;
 
     /**
+     * Return the current context the cursor is attached to, if any.
+     */
+    virtual OperationContext* getCurrentOperationContext() const = 0;
+
+    /**
      * Returns whether or not this cursor is tailable.
      */
     virtual bool isTailable() const = 0;
@@ -99,9 +108,14 @@ public:
     virtual bool isTailableAndAwaitData() const = 0;
 
     /**
-     * Returns the set of authenticated users when this cursor was created.
+     * Returns the original command object which created this cursor.
      */
-    virtual UserNameIterator getAuthenticatedUsers() const = 0;
+    virtual BSONObj getOriginatingCommand() const = 0;
+
+    /**
+     * Returns a reference to the vector of remote hosts involved in this operation.
+     */
+    virtual std::size_t getNumRemotes() const = 0;
 
     /**
      * Returns the number of result documents returned so far by this cursor via the next() method.
@@ -137,6 +151,69 @@ public:
      * Returns the logical session id for this cursor.
      */
     virtual boost::optional<LogicalSessionId> getLsid() const = 0;
+
+    /**
+     * Returns the transaction number for this cursor.
+     */
+    virtual boost::optional<TxnNumber> getTxnNumber() const = 0;
+
+    /**
+     * Returns the readPreference for this cursor.
+     */
+    virtual boost::optional<ReadPreferenceSetting> getReadPreference() const = 0;
+
+    /**
+     * Returns the creation date of the cursor.
+     */
+    virtual Date_t getCreatedDate() const = 0;
+
+    /**
+     * Returns the date the cursor was last used.
+     */
+    virtual Date_t getLastUseDate() const = 0;
+
+    /**
+     * Set the last use date to the provided time.
+     */
+    virtual void setLastUseDate(Date_t now) = 0;
+
+    /**
+     * Returns the number of batches returned by this cursor.
+     */
+    virtual std::uint64_t getNBatches() const = 0;
+
+    /**
+     * Increment the number of batches returned so far by one.
+     */
+    virtual void incNBatches() = 0;
+
+    //
+    // maxTimeMS support.
+    //
+
+    /**
+     * Returns the amount of time execution time available to this cursor. Only valid at the
+     * beginning of a getMore request, and only really for use by the maxTime tracking code.
+     *
+     * Microseconds::max() == infinity, values less than 1 mean no time left.
+     */
+    Microseconds getLeftoverMaxTimeMicros() const {
+        return _leftoverMaxTimeMicros;
+    }
+
+    /**
+     * Sets the amount of execution time available to this cursor. This is only called when an
+     * operation that uses a cursor is finishing, to update its remaining time.
+     *
+     * Microseconds::max() == infinity, values less than 1 mean no time left.
+     */
+    void setLeftoverMaxTimeMicros(Microseconds leftoverMaxTimeMicros) {
+        _leftoverMaxTimeMicros = leftoverMaxTimeMicros;
+    }
+
+private:
+    // Unused maxTime budget for this cursor.
+    Microseconds _leftoverMaxTimeMicros = Microseconds::max();
 };
 
 }  // namespace mongo

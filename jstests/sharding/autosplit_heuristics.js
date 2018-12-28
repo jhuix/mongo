@@ -1,9 +1,14 @@
-//
-// Tests autosplitting heuristics, and that the heuristic counting of chunk sizes
-// works as expected even after splitting.
-//
+/**
+ * Tests autosplitting heuristics, and that the heuristic counting of chunk sizes
+ * works as expected even after splitting.
+ *
+ * This test is labeled resource intensive because its total io_write is 53MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger.
+ * @tags: [resource_intensive]
+ */
 (function() {
     'use strict';
+    load('jstests/sharding/autosplit_include.js');
 
     var st = new ShardingTest({shards: 1, mongos: 1, other: {chunkSize: 1, enableAutoSplit: true}});
 
@@ -37,8 +42,8 @@
 
         jsTest.log("Setup collection...");
         st.printShardingStatus(true);
-
-        var approxSize = Object.bsonsize({_id: 0.0});
+        var pad = (new Array(1024)).join(' ');
+        var approxSize = Object.bsonsize({_id: 0.0, pad: pad});
 
         jsTest.log("Starting inserts of approx size: " + approxSize + "...");
 
@@ -60,11 +65,12 @@
         });
 
         // Insert enough docs to trigger splits into all chunks
-        var bulk = coll.initializeUnorderedBulkOp();
         for (var i = 0; i < totalInserts; i++) {
-            bulk.insert({_id: i % numChunks + (i / totalInserts)});
+            assert.writeOK(coll.insert({_id: i % numChunks + (i / totalInserts), pad: pad}));
+            // Splitting is asynchronous so we should wait after each insert
+            // for autosplitting to happen
+            waitForOngoingChunkSplits(st);
         }
-        assert.writeOK(bulk.execute());
 
         jsTest.log("Inserts completed...");
 

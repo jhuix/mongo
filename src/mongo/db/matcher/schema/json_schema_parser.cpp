@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
@@ -160,11 +162,9 @@ std::unique_ptr<MatchExpression> makeRestriction(const MatcherTypeSet& restricti
     //
     // We need to do this because restriction keywords do not apply when a field is either not
     // present or of a different type.
-    auto typeExpr = stdx::make_unique<InternalSchemaTypeExpression>();
-    invariantOK(typeExpr->init(path, restrictionType));
+    auto typeExpr = stdx::make_unique<InternalSchemaTypeExpression>(path, restrictionType);
 
-    auto notExpr = stdx::make_unique<NotMatchExpression>();
-    invariantOK(notExpr->init(typeExpr.release()));
+    auto notExpr = stdx::make_unique<NotMatchExpression>(typeExpr.release());
 
     auto orExpr = stdx::make_unique<OrMatchExpression>();
     orExpr->add(notExpr.release());
@@ -228,11 +228,8 @@ StatusWith<std::unique_ptr<InternalSchemaTypeExpression>> parseType(
                                      << "' must name at least one type")};
     }
 
-    auto typeExpr = stdx::make_unique<InternalSchemaTypeExpression>();
-    auto initStatus = typeExpr->init(path, std::move(typeSet.getValue()));
-    if (!initStatus.isOK()) {
-        return initStatus;
-    }
+    auto typeExpr =
+        stdx::make_unique<InternalSchemaTypeExpression>(path, std::move(typeSet.getValue()));
 
     return {std::move(typeExpr)};
 }
@@ -254,13 +251,9 @@ StatusWithMatchExpression parseMaximum(StringData path,
 
     std::unique_ptr<ComparisonMatchExpression> expr;
     if (isExclusiveMaximum) {
-        expr = stdx::make_unique<LTMatchExpression>();
+        expr = stdx::make_unique<LTMatchExpression>(path, maximum);
     } else {
-        expr = stdx::make_unique<LTEMatchExpression>();
-    }
-    auto status = expr->init(path, maximum);
-    if (!status.isOK()) {
-        return status;
+        expr = stdx::make_unique<LTEMatchExpression>(path, maximum);
     }
 
     MatcherTypeSet restrictionType;
@@ -285,13 +278,9 @@ StatusWithMatchExpression parseMinimum(StringData path,
 
     std::unique_ptr<ComparisonMatchExpression> expr;
     if (isExclusiveMinimum) {
-        expr = stdx::make_unique<GTMatchExpression>();
+        expr = stdx::make_unique<GTMatchExpression>(path, minimum);
     } else {
-        expr = stdx::make_unique<GTEMatchExpression>();
-    }
-    auto status = expr->init(path, minimum);
-    if (!status.isOK()) {
-        return status;
+        expr = stdx::make_unique<GTEMatchExpression>(path, minimum);
     }
 
     MatcherTypeSet restrictionType;
@@ -316,11 +305,7 @@ StatusWithMatchExpression parseLength(StringData path,
         return {stdx::make_unique<AlwaysTrueMatchExpression>()};
     }
 
-    auto expr = stdx::make_unique<T>();
-    auto status = expr->init(path, parsedLength.getValue());
-    if (!status.isOK()) {
-        return status;
-    }
+    auto expr = stdx::make_unique<T>(path, parsedLength.getValue());
     return makeRestriction(restrictionType, path, std::move(expr), typeExpr);
 }
 
@@ -337,14 +322,11 @@ StatusWithMatchExpression parsePattern(StringData path,
         return {stdx::make_unique<AlwaysTrueMatchExpression>()};
     }
 
-    auto expr = stdx::make_unique<RegexMatchExpression>();
-
     // JSON Schema does not allow regex flags to be specified.
     constexpr auto emptyFlags = "";
-    auto status = expr->init(path, pattern.valueStringData(), emptyFlags);
-    if (!status.isOK()) {
-        return status;
-    }
+    auto expr =
+        stdx::make_unique<RegexMatchExpression>(path, pattern.valueStringData(), emptyFlags);
+
     return makeRestriction(BSONType::String, path, std::move(expr), typeExpr);
 }
 
@@ -366,11 +348,8 @@ StatusWithMatchExpression parseMultipleOf(StringData path,
         return {stdx::make_unique<AlwaysTrueMatchExpression>()};
     }
 
-    auto expr = stdx::make_unique<InternalSchemaFmodMatchExpression>();
-    auto status = expr->init(path, multipleOf.numberDecimal(), Decimal128(0));
-    if (!status.isOK()) {
-        return status;
-    }
+    auto expr = stdx::make_unique<InternalSchemaFmodMatchExpression>(
+        path, multipleOf.numberDecimal(), Decimal128(0));
 
     MatcherTypeSet restrictionType;
     restrictionType.allNumbers = true;
@@ -445,16 +424,12 @@ StatusWithMatchExpression parseEnum(StringData path, BSONElement enumElement) {
             // Top-level non-object enum values can be safely ignored, since MongoDB only stores
             // objects, not scalars or arrays.
             if (arrayElem.type() == BSONType::Object) {
-                auto rootDocEq = stdx::make_unique<InternalSchemaRootDocEqMatchExpression>();
-                rootDocEq->init(arrayElem.embeddedObject());
+                auto rootDocEq = stdx::make_unique<InternalSchemaRootDocEqMatchExpression>(
+                    arrayElem.embeddedObject());
                 orExpr->add(rootDocEq.release());
             }
         } else {
-            auto eqExpr = stdx::make_unique<InternalSchemaEqMatchExpression>();
-            auto initStatus = eqExpr->init(path, arrayElem);
-            if (!initStatus.isOK()) {
-                return initStatus;
-            }
+            auto eqExpr = stdx::make_unique<InternalSchemaEqMatchExpression>(path, arrayElem);
 
             orExpr->add(eqExpr.release());
         }
@@ -520,20 +495,7 @@ StatusWithMatchExpression translateRequired(
     auto andExpr = stdx::make_unique<AndMatchExpression>();
 
     for (auto&& propertyName : requiredProperties) {
-        auto existsExpr = stdx::make_unique<ExistsMatchExpression>();
-        invariantOK(existsExpr->init(propertyName));
-
-        if (path.empty()) {
-            andExpr->add(existsExpr.release());
-        } else {
-            auto objectMatch = stdx::make_unique<InternalSchemaObjectMatchExpression>();
-            auto objectMatchStatus = objectMatch->init(std::move(existsExpr), path);
-            if (!objectMatchStatus.isOK()) {
-                return objectMatchStatus;
-            }
-
-            andExpr->add(objectMatch.release());
-        }
+        andExpr->add(new ExistsMatchExpression(propertyName));
     }
 
     // If this is a top-level schema, then we know that we are matching against objects, and there
@@ -542,7 +504,10 @@ StatusWithMatchExpression translateRequired(
         return {std::move(andExpr)};
     }
 
-    return makeRestriction(BSONType::Object, path, std::move(andExpr), typeExpr);
+    auto objectMatch =
+        stdx::make_unique<InternalSchemaObjectMatchExpression>(path, std::move(andExpr));
+
+    return makeRestriction(BSONType::Object, path, std::move(objectMatch), typeExpr);
 }
 
 StatusWithMatchExpression parseProperties(
@@ -580,11 +545,10 @@ StatusWithMatchExpression parseProperties(
         } else {
             // This property either must not exist or must match the nested schema. Therefore, we
             // generate the match expression (OR (NOT (EXISTS)) <nestedSchemaMatch>).
-            auto existsExpr = stdx::make_unique<ExistsMatchExpression>();
-            invariantOK(existsExpr->init(property.fieldNameStringData()));
+            auto existsExpr =
+                stdx::make_unique<ExistsMatchExpression>(property.fieldNameStringData());
 
-            auto notExpr = stdx::make_unique<NotMatchExpression>();
-            invariantOK(notExpr->init(existsExpr.release()));
+            auto notExpr = stdx::make_unique<NotMatchExpression>(existsExpr.release());
 
             auto orExpr = stdx::make_unique<OrMatchExpression>();
             orExpr->add(notExpr.release());
@@ -600,11 +564,8 @@ StatusWithMatchExpression parseProperties(
         return {std::move(andExpr)};
     }
 
-    auto objectMatch = stdx::make_unique<InternalSchemaObjectMatchExpression>();
-    auto objectMatchStatus = objectMatch->init(std::move(andExpr), path);
-    if (!objectMatchStatus.isOK()) {
-        return objectMatchStatus;
-    }
+    auto objectMatch =
+        stdx::make_unique<InternalSchemaObjectMatchExpression>(path, std::move(andExpr));
 
     return makeRestriction(BSONType::Object, path, std::move(objectMatch), typeExpr);
 }
@@ -717,15 +678,11 @@ StatusWithMatchExpression parseAllowedProperties(StringData path,
     auto otherwiseWithPlaceholder = stdx::make_unique<ExpressionWithPlaceholder>(
         kNamePlaceholder.toString(), std::move(otherwiseExpr.getValue()));
 
-    auto allowedPropertiesExpr =
-        stdx::make_unique<InternalSchemaAllowedPropertiesMatchExpression>();
-    auto status = allowedPropertiesExpr->init(std::move(propertyNames),
-                                              kNamePlaceholder,
-                                              std::move(patternProperties.getValue()),
-                                              std::move(otherwiseWithPlaceholder));
-    if (!status.isOK()) {
-        return status;
-    }
+    auto allowedPropertiesExpr = stdx::make_unique<InternalSchemaAllowedPropertiesMatchExpression>(
+        std::move(propertyNames),
+        kNamePlaceholder,
+        std::move(patternProperties.getValue()),
+        std::move(otherwiseWithPlaceholder));
 
     // If this is a top-level schema, then we have no path and there is no need for an explicit
     // object match node.
@@ -733,11 +690,8 @@ StatusWithMatchExpression parseAllowedProperties(StringData path,
         return {std::move(allowedPropertiesExpr)};
     }
 
-    auto objectMatch = stdx::make_unique<InternalSchemaObjectMatchExpression>();
-    auto objectMatchStatus = objectMatch->init(std::move(allowedPropertiesExpr), path);
-    if (!objectMatchStatus.isOK()) {
-        return objectMatchStatus;
-    }
+    auto objectMatch = stdx::make_unique<InternalSchemaObjectMatchExpression>(
+        path, std::move(allowedPropertiesExpr));
 
     return makeRestriction(BSONType::Object, path, std::move(objectMatch), typeExpr);
 }
@@ -755,39 +709,28 @@ StatusWithMatchExpression parseNumProperties(StringData path,
         return parsedNumProps.getStatus();
     }
 
-    auto expr = stdx::make_unique<T>();
-    auto status = expr->init(parsedNumProps.getValue());
-    if (!status.isOK()) {
-        return status;
-    }
+    auto expr = stdx::make_unique<T>(parsedNumProps.getValue());
 
     if (path.empty()) {
         // This is a top-level schema.
         return {std::move(expr)};
     }
 
-    auto objectMatch = stdx::make_unique<InternalSchemaObjectMatchExpression>();
-    auto objectMatchStatus = objectMatch->init(std::move(expr), path);
-    if (!objectMatchStatus.isOK()) {
-        return objectMatchStatus;
-    }
+    auto objectMatch =
+        stdx::make_unique<InternalSchemaObjectMatchExpression>(path, std::move(expr));
 
     return makeRestriction(BSONType::Object, path, std::move(objectMatch), typeExpr);
 }
 
 StatusWithMatchExpression makeDependencyExistsClause(StringData path, StringData dependencyName) {
-    auto existsExpr = stdx::make_unique<ExistsMatchExpression>();
-    invariantOK(existsExpr->init(dependencyName));
+    auto existsExpr = stdx::make_unique<ExistsMatchExpression>(dependencyName);
 
     if (path.empty()) {
         return {std::move(existsExpr)};
     }
 
-    auto objectMatch = stdx::make_unique<InternalSchemaObjectMatchExpression>();
-    auto status = objectMatch->init(std::move(existsExpr), path);
-    if (!status.isOK()) {
-        return status;
-    }
+    auto objectMatch =
+        stdx::make_unique<InternalSchemaObjectMatchExpression>(path, std::move(existsExpr));
 
     return {std::move(objectMatch)};
 }
@@ -807,10 +750,12 @@ StatusWithMatchExpression translateSchemaDependency(StringData path,
         return ifClause.getStatus();
     }
 
-    auto condExpr = stdx::make_unique<InternalSchemaCondMatchExpression>();
-    condExpr->init({std::move(ifClause.getValue()),
-                    std::move(nestedSchemaMatch.getValue()),
-                    stdx::make_unique<AlwaysTrueMatchExpression>()});
+    std::array<std::unique_ptr<MatchExpression>, 3> expressions = {
+        std::move(ifClause.getValue()),
+        std::move(nestedSchemaMatch.getValue()),
+        stdx::make_unique<AlwaysTrueMatchExpression>()};
+
+    auto condExpr = stdx::make_unique<InternalSchemaCondMatchExpression>(std::move(expressions));
     return {std::move(condExpr)};
 }
 
@@ -861,10 +806,12 @@ StatusWithMatchExpression translatePropertyDependency(StringData path, BSONEleme
         return ifClause.getStatus();
     }
 
-    auto condExpr = stdx::make_unique<InternalSchemaCondMatchExpression>();
-    condExpr->init({std::move(ifClause.getValue()),
-                    std::move(propertyDependencyExpr),
-                    stdx::make_unique<AlwaysTrueMatchExpression>()});
+    std::array<std::unique_ptr<MatchExpression>, 3> expressions = {
+        {std::move(ifClause.getValue()),
+         std::move(propertyDependencyExpr),
+         stdx::make_unique<AlwaysTrueMatchExpression>()}};
+
+    auto condExpr = stdx::make_unique<InternalSchemaCondMatchExpression>(std::move(expressions));
     return {std::move(condExpr)};
 }
 
@@ -910,11 +857,7 @@ StatusWithMatchExpression parseUniqueItems(BSONElement uniqueItemsElt,
     } else if (path.empty()) {
         return {stdx::make_unique<AlwaysTrueMatchExpression>()};
     } else if (uniqueItemsElt.boolean()) {
-        auto uniqueItemsExpr = stdx::make_unique<InternalSchemaUniqueItemsMatchExpression>();
-        auto status = uniqueItemsExpr->init(path);
-        if (!status.isOK()) {
-            return status;
-        }
+        auto uniqueItemsExpr = stdx::make_unique<InternalSchemaUniqueItemsMatchExpression>(path);
         return makeRestriction(BSONType::Array, path, std::move(uniqueItemsExpr), typeExpr);
     }
 
@@ -954,9 +897,8 @@ StatusWith<boost::optional<long long>> parseItems(StringData path,
             }
             auto exprWithPlaceholder = stdx::make_unique<ExpressionWithPlaceholder>(
                 kNamePlaceholder.toString(), std::move(parsedSubschema.getValue()));
-            auto matchArrayIndex =
-                stdx::make_unique<InternalSchemaMatchArrayIndexMatchExpression>();
-            invariantOK(matchArrayIndex->init(path, index, std::move(exprWithPlaceholder)));
+            auto matchArrayIndex = stdx::make_unique<InternalSchemaMatchArrayIndexMatchExpression>(
+                path, index, std::move(exprWithPlaceholder));
             andExprForSubschemas->add(matchArrayIndex.release());
             ++index;
         }
@@ -984,11 +926,10 @@ StatusWith<boost::optional<long long>> parseItems(StringData path,
         if (path.empty()) {
             andExpr->add(stdx::make_unique<AlwaysTrueMatchExpression>().release());
         } else {
-            auto allElemMatch =
-                stdx::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>();
             constexpr auto startIndexForItems = 0LL;
-            invariantOK(
-                allElemMatch->init(path, startIndexForItems, std::move(exprWithPlaceholder)));
+            auto allElemMatch =
+                stdx::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>(
+                    path, startIndexForItems, std::move(exprWithPlaceholder));
             andExpr->add(makeRestriction(BSONType::Array, path, std::move(allElemMatch), typeExpr)
                              .release());
         }
@@ -1039,9 +980,8 @@ Status parseAdditionalItems(StringData path,
             andExpr->add(stdx::make_unique<AlwaysTrueMatchExpression>().release());
         } else {
             auto allElemMatch =
-                stdx::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>();
-            invariantOK(
-                allElemMatch->init(path, *startIndexForAdditionalItems, std::move(otherwiseExpr)));
+                stdx::make_unique<InternalSchemaAllElemMatchFromIndexMatchExpression>(
+                    path, *startIndexForAdditionalItems, std::move(otherwiseExpr));
             andExpr->add(makeRestriction(BSONType::Array, path, std::move(allElemMatch), typeExpr)
                              .release());
         }
@@ -1049,13 +989,13 @@ Status parseAdditionalItems(StringData path,
     return Status::OK();
 }
 
-Status parseItemsAndAdditionalItems(StringMap<BSONElement>* keywordMap,
+Status parseItemsAndAdditionalItems(StringMap<BSONElement>& keywordMap,
                                     StringData path,
                                     bool ignoreUnknownKeywords,
                                     InternalSchemaTypeExpression* typeExpr,
                                     AndMatchExpression* andExpr) {
     boost::optional<long long> startIndexForAdditionalItems;
-    if (auto itemsElt = keywordMap->get(kSchemaItemsKeyword)) {
+    if (auto itemsElt = keywordMap[kSchemaItemsKeyword]) {
         auto index = parseItems(path, itemsElt, ignoreUnknownKeywords, typeExpr, andExpr);
         if (!index.isOK()) {
             return index.getStatus();
@@ -1063,7 +1003,7 @@ Status parseItemsAndAdditionalItems(StringMap<BSONElement>* keywordMap,
         startIndexForAdditionalItems = index.getValue();
     }
 
-    if (auto additionalItemsElt = keywordMap->get(kSchemaAdditionalItemsKeyword)) {
+    if (auto additionalItemsElt = keywordMap[kSchemaAdditionalItemsKeyword]) {
         return parseAdditionalItems(path,
                                     additionalItemsElt,
                                     startIndexForAdditionalItems,
@@ -1085,11 +1025,11 @@ Status parseItemsAndAdditionalItems(StringMap<BSONElement>* keywordMap,
  *  - not
  *  - enum
  */
-Status translateLogicalKeywords(StringMap<BSONElement>* keywordMap,
+Status translateLogicalKeywords(StringMap<BSONElement>& keywordMap,
                                 StringData path,
                                 AndMatchExpression* andExpr,
                                 bool ignoreUnknownKeywords) {
-    if (auto allOfElt = keywordMap->get(kSchemaAllOfKeyword)) {
+    if (auto allOfElt = keywordMap[kSchemaAllOfKeyword]) {
         auto allOfExpr =
             parseLogicalKeyword<AndMatchExpression>(path, allOfElt, ignoreUnknownKeywords);
         if (!allOfExpr.isOK()) {
@@ -1098,7 +1038,7 @@ Status translateLogicalKeywords(StringMap<BSONElement>* keywordMap,
         andExpr->add(allOfExpr.getValue().release());
     }
 
-    if (auto anyOfElt = keywordMap->get(kSchemaAnyOfKeyword)) {
+    if (auto anyOfElt = keywordMap[kSchemaAnyOfKeyword]) {
         auto anyOfExpr =
             parseLogicalKeyword<OrMatchExpression>(path, anyOfElt, ignoreUnknownKeywords);
         if (!anyOfExpr.isOK()) {
@@ -1107,7 +1047,7 @@ Status translateLogicalKeywords(StringMap<BSONElement>* keywordMap,
         andExpr->add(anyOfExpr.getValue().release());
     }
 
-    if (auto oneOfElt = keywordMap->get(kSchemaOneOfKeyword)) {
+    if (auto oneOfElt = keywordMap[kSchemaOneOfKeyword]) {
         auto oneOfExpr = parseLogicalKeyword<InternalSchemaXorMatchExpression>(
             path, oneOfElt, ignoreUnknownKeywords);
         if (!oneOfExpr.isOK()) {
@@ -1116,7 +1056,7 @@ Status translateLogicalKeywords(StringMap<BSONElement>* keywordMap,
         andExpr->add(oneOfExpr.getValue().release());
     }
 
-    if (auto notElt = keywordMap->get(kSchemaNotKeyword)) {
+    if (auto notElt = keywordMap[kSchemaNotKeyword]) {
         if (notElt.type() != BSONType::Object) {
             return {ErrorCodes::TypeMismatch,
                     str::stream() << "$jsonSchema keyword '" << kSchemaNotKeyword
@@ -1129,15 +1069,11 @@ Status translateLogicalKeywords(StringMap<BSONElement>* keywordMap,
             return parsedExpr.getStatus();
         }
 
-        auto notMatchExpr = stdx::make_unique<NotMatchExpression>();
-        auto initStatus = notMatchExpr->init(parsedExpr.getValue().release());
-        if (!initStatus.isOK()) {
-            return initStatus;
-        }
+        auto notMatchExpr = stdx::make_unique<NotMatchExpression>(parsedExpr.getValue().release());
         andExpr->add(notMatchExpr.release());
     }
 
-    if (auto enumElt = keywordMap->get(kSchemaEnumKeyword)) {
+    if (auto enumElt = keywordMap[kSchemaEnumKeyword]) {
         auto enumExpr = parseEnum(path, enumElt);
         if (!enumExpr.isOK()) {
             return enumExpr.getStatus();
@@ -1159,12 +1095,12 @@ Status translateLogicalKeywords(StringMap<BSONElement>* keywordMap,
  *  - items
  *  - additionalItems
  */
-Status translateArrayKeywords(StringMap<BSONElement>* keywordMap,
+Status translateArrayKeywords(StringMap<BSONElement>& keywordMap,
                               StringData path,
                               bool ignoreUnknownKeywords,
                               InternalSchemaTypeExpression* typeExpr,
                               AndMatchExpression* andExpr) {
-    if (auto minItemsElt = keywordMap->get(kSchemaMinItemsKeyword)) {
+    if (auto minItemsElt = keywordMap[kSchemaMinItemsKeyword]) {
         auto minItemsExpr = parseLength<InternalSchemaMinItemsMatchExpression>(
             path, minItemsElt, typeExpr, BSONType::Array);
         if (!minItemsExpr.isOK()) {
@@ -1173,7 +1109,7 @@ Status translateArrayKeywords(StringMap<BSONElement>* keywordMap,
         andExpr->add(minItemsExpr.getValue().release());
     }
 
-    if (auto maxItemsElt = keywordMap->get(kSchemaMaxItemsKeyword)) {
+    if (auto maxItemsElt = keywordMap[kSchemaMaxItemsKeyword]) {
         auto maxItemsExpr = parseLength<InternalSchemaMaxItemsMatchExpression>(
             path, maxItemsElt, typeExpr, BSONType::Array);
         if (!maxItemsExpr.isOK()) {
@@ -1182,7 +1118,7 @@ Status translateArrayKeywords(StringMap<BSONElement>* keywordMap,
         andExpr->add(maxItemsExpr.getValue().release());
     }
 
-    if (auto uniqueItemsElt = keywordMap->get(kSchemaUniqueItemsKeyword)) {
+    if (auto uniqueItemsElt = keywordMap[kSchemaUniqueItemsKeyword]) {
         auto uniqueItemsExpr = parseUniqueItems(uniqueItemsElt, path, typeExpr);
         if (!uniqueItemsExpr.isOK()) {
             return uniqueItemsExpr.getStatus();
@@ -1206,13 +1142,13 @@ Status translateArrayKeywords(StringMap<BSONElement>* keywordMap,
  *  - properties
  *  - required
  */
-Status translateObjectKeywords(StringMap<BSONElement>* keywordMap,
+Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
                                StringData path,
                                InternalSchemaTypeExpression* typeExpr,
                                AndMatchExpression* andExpr,
                                bool ignoreUnknownKeywords) {
     boost::container::flat_set<StringData> requiredProperties;
-    if (auto requiredElt = keywordMap->get(kSchemaRequiredKeyword)) {
+    if (auto requiredElt = keywordMap[kSchemaRequiredKeyword]) {
         auto requiredStatus = parseRequired(requiredElt);
         if (!requiredStatus.isOK()) {
             return requiredStatus.getStatus();
@@ -1220,7 +1156,7 @@ Status translateObjectKeywords(StringMap<BSONElement>* keywordMap,
         requiredProperties = std::move(requiredStatus.getValue());
     }
 
-    if (auto propertiesElt = keywordMap->get(kSchemaPropertiesKeyword)) {
+    if (auto propertiesElt = keywordMap[kSchemaPropertiesKeyword]) {
         auto propertiesExpr = parseProperties(
             path, propertiesElt, typeExpr, requiredProperties, ignoreUnknownKeywords);
         if (!propertiesExpr.isOK()) {
@@ -1230,9 +1166,9 @@ Status translateObjectKeywords(StringMap<BSONElement>* keywordMap,
     }
 
     {
-        auto propertiesElt = keywordMap->get(kSchemaPropertiesKeyword);
-        auto patternPropertiesElt = keywordMap->get(kSchemaPatternPropertiesKeyword);
-        auto additionalPropertiesElt = keywordMap->get(kSchemaAdditionalPropertiesKeyword);
+        auto propertiesElt = keywordMap[kSchemaPropertiesKeyword];
+        auto patternPropertiesElt = keywordMap[kSchemaPatternPropertiesKeyword];
+        auto additionalPropertiesElt = keywordMap[kSchemaAdditionalPropertiesKeyword];
 
         if (patternPropertiesElt || additionalPropertiesElt) {
             auto allowedPropertiesExpr = parseAllowedProperties(path,
@@ -1256,7 +1192,7 @@ Status translateObjectKeywords(StringMap<BSONElement>* keywordMap,
         andExpr->add(requiredExpr.getValue().release());
     }
 
-    if (auto minPropertiesElt = keywordMap->get(kSchemaMinPropertiesKeyword)) {
+    if (auto minPropertiesElt = keywordMap[kSchemaMinPropertiesKeyword]) {
         auto minPropExpr = parseNumProperties<InternalSchemaMinPropertiesMatchExpression>(
             path, minPropertiesElt, typeExpr);
         if (!minPropExpr.isOK()) {
@@ -1265,7 +1201,7 @@ Status translateObjectKeywords(StringMap<BSONElement>* keywordMap,
         andExpr->add(minPropExpr.getValue().release());
     }
 
-    if (auto maxPropertiesElt = keywordMap->get(kSchemaMaxPropertiesKeyword)) {
+    if (auto maxPropertiesElt = keywordMap[kSchemaMaxPropertiesKeyword]) {
         auto maxPropExpr = parseNumProperties<InternalSchemaMaxPropertiesMatchExpression>(
             path, maxPropertiesElt, typeExpr);
         if (!maxPropExpr.isOK()) {
@@ -1274,7 +1210,7 @@ Status translateObjectKeywords(StringMap<BSONElement>* keywordMap,
         andExpr->add(maxPropExpr.getValue().release());
     }
 
-    if (auto dependenciesElt = keywordMap->get(kSchemaDependenciesKeyword)) {
+    if (auto dependenciesElt = keywordMap[kSchemaDependenciesKeyword]) {
         auto dependenciesExpr = parseDependencies(path, dependenciesElt, ignoreUnknownKeywords);
         if (!dependenciesExpr.isOK()) {
             return dependenciesExpr.getStatus();
@@ -1298,12 +1234,12 @@ Status translateObjectKeywords(StringMap<BSONElement>* keywordMap,
  *  - maxLength
  *  - pattern
  */
-Status translateScalarKeywords(StringMap<BSONElement>* keywordMap,
+Status translateScalarKeywords(StringMap<BSONElement>& keywordMap,
                                StringData path,
                                InternalSchemaTypeExpression* typeExpr,
                                AndMatchExpression* andExpr) {
     // String keywords.
-    if (auto patternElt = keywordMap->get(kSchemaPatternKeyword)) {
+    if (auto patternElt = keywordMap[kSchemaPatternKeyword]) {
         auto patternExpr = parsePattern(path, patternElt, typeExpr);
         if (!patternExpr.isOK()) {
             return patternExpr.getStatus();
@@ -1311,7 +1247,7 @@ Status translateScalarKeywords(StringMap<BSONElement>* keywordMap,
         andExpr->add(patternExpr.getValue().release());
     }
 
-    if (auto maxLengthElt = keywordMap->get(kSchemaMaxLengthKeyword)) {
+    if (auto maxLengthElt = keywordMap[kSchemaMaxLengthKeyword]) {
         auto maxLengthExpr = parseLength<InternalSchemaMaxLengthMatchExpression>(
             path, maxLengthElt, typeExpr, BSONType::String);
         if (!maxLengthExpr.isOK()) {
@@ -1320,7 +1256,7 @@ Status translateScalarKeywords(StringMap<BSONElement>* keywordMap,
         andExpr->add(maxLengthExpr.getValue().release());
     }
 
-    if (auto minLengthElt = keywordMap->get(kSchemaMinLengthKeyword)) {
+    if (auto minLengthElt = keywordMap[kSchemaMinLengthKeyword]) {
         auto minLengthExpr = parseLength<InternalSchemaMinLengthMatchExpression>(
             path, minLengthElt, typeExpr, BSONType::String);
         if (!minLengthExpr.isOK()) {
@@ -1330,7 +1266,7 @@ Status translateScalarKeywords(StringMap<BSONElement>* keywordMap,
     }
 
     // Numeric keywords.
-    if (auto multipleOfElt = keywordMap->get(kSchemaMultipleOfKeyword)) {
+    if (auto multipleOfElt = keywordMap[kSchemaMultipleOfKeyword]) {
         auto multipleOfExpr = parseMultipleOf(path, multipleOfElt, typeExpr);
         if (!multipleOfExpr.isOK()) {
             return multipleOfExpr.getStatus();
@@ -1338,9 +1274,9 @@ Status translateScalarKeywords(StringMap<BSONElement>* keywordMap,
         andExpr->add(multipleOfExpr.getValue().release());
     }
 
-    if (auto maximumElt = keywordMap->get(kSchemaMaximumKeyword)) {
+    if (auto maximumElt = keywordMap[kSchemaMaximumKeyword]) {
         bool isExclusiveMaximum = false;
-        if (auto exclusiveMaximumElt = keywordMap->get(kSchemaExclusiveMaximumKeyword)) {
+        if (auto exclusiveMaximumElt = keywordMap[kSchemaExclusiveMaximumKeyword]) {
             if (!exclusiveMaximumElt.isBoolean()) {
                 return {Status(ErrorCodes::TypeMismatch,
                                str::stream() << "$jsonSchema keyword '"
@@ -1355,7 +1291,7 @@ Status translateScalarKeywords(StringMap<BSONElement>* keywordMap,
             return maxExpr.getStatus();
         }
         andExpr->add(maxExpr.getValue().release());
-    } else if (keywordMap->get(kSchemaExclusiveMaximumKeyword)) {
+    } else if (keywordMap[kSchemaExclusiveMaximumKeyword]) {
         // If "exclusiveMaximum" is present, "maximum" must also be present.
         return {ErrorCodes::FailedToParse,
                 str::stream() << "$jsonSchema keyword '" << kSchemaMaximumKeyword
@@ -1364,9 +1300,9 @@ Status translateScalarKeywords(StringMap<BSONElement>* keywordMap,
                               << " is present"};
     }
 
-    if (auto minimumElt = keywordMap->get(kSchemaMinimumKeyword)) {
+    if (auto minimumElt = keywordMap[kSchemaMinimumKeyword]) {
         bool isExclusiveMinimum = false;
-        if (auto exclusiveMinimumElt = keywordMap->get(kSchemaExclusiveMinimumKeyword)) {
+        if (auto exclusiveMinimumElt = keywordMap[kSchemaExclusiveMinimumKeyword]) {
             if (!exclusiveMinimumElt.isBoolean()) {
                 return {ErrorCodes::TypeMismatch,
                         str::stream() << "$jsonSchema keyword '" << kSchemaExclusiveMinimumKeyword
@@ -1380,7 +1316,7 @@ Status translateScalarKeywords(StringMap<BSONElement>* keywordMap,
             return minExpr.getStatus();
         }
         andExpr->add(minExpr.getValue().release());
-    } else if (keywordMap->get(kSchemaExclusiveMinimumKeyword)) {
+    } else if (keywordMap[kSchemaExclusiveMinimumKeyword]) {
         // If "exclusiveMinimum" is present, "minimum" must also be present.
         return {ErrorCodes::FailedToParse,
                 str::stream() << "$jsonSchema keyword '" << kSchemaMinimumKeyword
@@ -1397,8 +1333,8 @@ Status translateScalarKeywords(StringMap<BSONElement>* keywordMap,
  *  - description
  *  - title
  */
-Status validateMetadataKeywords(StringMap<BSONElement>* keywordMap) {
-    if (auto descriptionElem = keywordMap->get(kSchemaDescriptionKeyword)) {
+Status validateMetadataKeywords(StringMap<BSONElement>& keywordMap) {
+    if (auto descriptionElem = keywordMap[kSchemaDescriptionKeyword]) {
         if (descriptionElem.type() != BSONType::String) {
             return Status(ErrorCodes::TypeMismatch,
                           str::stream() << "$jsonSchema keyword '" << kSchemaDescriptionKeyword
@@ -1406,7 +1342,7 @@ Status validateMetadataKeywords(StringMap<BSONElement>* keywordMap) {
         }
     }
 
-    if (auto titleElem = keywordMap->get(kSchemaTitleKeyword)) {
+    if (auto titleElem = keywordMap[kSchemaTitleKeyword]) {
         if (titleElem.type() != BSONType::String) {
             return Status(ErrorCodes::TypeMismatch,
                           str::stream() << "$jsonSchema keyword '" << kSchemaTitleKeyword
@@ -1420,35 +1356,35 @@ StatusWithMatchExpression _parse(StringData path, BSONObj schema, bool ignoreUnk
     // Map from JSON Schema keyword to the corresponding element from 'schema', or to an empty
     // BSONElement if the JSON Schema keyword is not specified.
     StringMap<BSONElement> keywordMap{
-        {kSchemaAdditionalItemsKeyword, {}},
-        {kSchemaAdditionalPropertiesKeyword, {}},
-        {kSchemaAllOfKeyword, {}},
-        {kSchemaAnyOfKeyword, {}},
-        {kSchemaBsonTypeKeyword, {}},
-        {kSchemaDependenciesKeyword, {}},
-        {kSchemaDescriptionKeyword, {}},
-        {kSchemaEnumKeyword, {}},
-        {kSchemaExclusiveMaximumKeyword, {}},
-        {kSchemaExclusiveMinimumKeyword, {}},
-        {kSchemaItemsKeyword, {}},
-        {kSchemaMaxItemsKeyword, {}},
-        {kSchemaMaxLengthKeyword, {}},
-        {kSchemaMaxPropertiesKeyword, {}},
-        {kSchemaMaximumKeyword, {}},
-        {kSchemaMinItemsKeyword, {}},
-        {kSchemaMinLengthKeyword, {}},
-        {kSchemaMinPropertiesKeyword, {}},
-        {kSchemaMinimumKeyword, {}},
-        {kSchemaMultipleOfKeyword, {}},
-        {kSchemaNotKeyword, {}},
-        {kSchemaOneOfKeyword, {}},
-        {kSchemaPatternKeyword, {}},
-        {kSchemaPatternPropertiesKeyword, {}},
-        {kSchemaPropertiesKeyword, {}},
-        {kSchemaRequiredKeyword, {}},
-        {kSchemaTitleKeyword, {}},
-        {kSchemaTypeKeyword, {}},
-        {kSchemaUniqueItemsKeyword, {}},
+        {std::string(kSchemaAdditionalItemsKeyword), {}},
+        {std::string(kSchemaAdditionalPropertiesKeyword), {}},
+        {std::string(kSchemaAllOfKeyword), {}},
+        {std::string(kSchemaAnyOfKeyword), {}},
+        {std::string(kSchemaBsonTypeKeyword), {}},
+        {std::string(kSchemaDependenciesKeyword), {}},
+        {std::string(kSchemaDescriptionKeyword), {}},
+        {std::string(kSchemaEnumKeyword), {}},
+        {std::string(kSchemaExclusiveMaximumKeyword), {}},
+        {std::string(kSchemaExclusiveMinimumKeyword), {}},
+        {std::string(kSchemaItemsKeyword), {}},
+        {std::string(kSchemaMaxItemsKeyword), {}},
+        {std::string(kSchemaMaxLengthKeyword), {}},
+        {std::string(kSchemaMaxPropertiesKeyword), {}},
+        {std::string(kSchemaMaximumKeyword), {}},
+        {std::string(kSchemaMinItemsKeyword), {}},
+        {std::string(kSchemaMinLengthKeyword), {}},
+        {std::string(kSchemaMinPropertiesKeyword), {}},
+        {std::string(kSchemaMinimumKeyword), {}},
+        {std::string(kSchemaMultipleOfKeyword), {}},
+        {std::string(kSchemaNotKeyword), {}},
+        {std::string(kSchemaOneOfKeyword), {}},
+        {std::string(kSchemaPatternKeyword), {}},
+        {std::string(kSchemaPatternPropertiesKeyword), {}},
+        {std::string(kSchemaPropertiesKeyword), {}},
+        {std::string(kSchemaRequiredKeyword), {}},
+        {std::string(kSchemaTitleKeyword), {}},
+        {std::string(kSchemaTypeKeyword), {}},
+        {std::string(kSchemaUniqueItemsKeyword), {}},
     };
 
     for (auto&& elt : schema) {
@@ -1475,7 +1411,7 @@ StatusWithMatchExpression _parse(StringData path, BSONObj schema, bool ignoreUnk
         keywordMap[elt.fieldNameStringData()] = elt;
     }
 
-    auto metadataStatus = validateMetadataKeywords(&keywordMap);
+    auto metadataStatus = validateMetadataKeywords(keywordMap);
     if (!metadataStatus.isOK()) {
         return metadataStatus;
     }
@@ -1501,7 +1437,7 @@ StatusWithMatchExpression _parse(StringData path, BSONObj schema, bool ignoreUnk
         typeExpr = std::move(parseTypeResult.getValue());
     } else if (bsonTypeElem) {
         auto parseBsonTypeResult =
-            parseType(path, kSchemaBsonTypeKeyword, bsonTypeElem, MatcherTypeSet::kTypeAliasMap);
+            parseType(path, kSchemaBsonTypeKeyword, bsonTypeElem, kTypeAliasMap);
         if (!parseBsonTypeResult.isOK()) {
             return parseBsonTypeResult.getStatus();
         }
@@ -1511,25 +1447,25 @@ StatusWithMatchExpression _parse(StringData path, BSONObj schema, bool ignoreUnk
     auto andExpr = stdx::make_unique<AndMatchExpression>();
 
     auto translationStatus =
-        translateScalarKeywords(&keywordMap, path, typeExpr.get(), andExpr.get());
+        translateScalarKeywords(keywordMap, path, typeExpr.get(), andExpr.get());
     if (!translationStatus.isOK()) {
         return translationStatus;
     }
 
     translationStatus = translateArrayKeywords(
-        &keywordMap, path, ignoreUnknownKeywords, typeExpr.get(), andExpr.get());
+        keywordMap, path, ignoreUnknownKeywords, typeExpr.get(), andExpr.get());
     if (!translationStatus.isOK()) {
         return translationStatus;
     }
 
     translationStatus = translateObjectKeywords(
-        &keywordMap, path, typeExpr.get(), andExpr.get(), ignoreUnknownKeywords);
+        keywordMap, path, typeExpr.get(), andExpr.get(), ignoreUnknownKeywords);
     if (!translationStatus.isOK()) {
         return translationStatus;
     }
 
     translationStatus =
-        translateLogicalKeywords(&keywordMap, path, andExpr.get(), ignoreUnknownKeywords);
+        translateLogicalKeywords(keywordMap, path, andExpr.get(), ignoreUnknownKeywords);
     if (!translationStatus.isOK()) {
         return translationStatus;
     }
@@ -1556,11 +1492,14 @@ constexpr StringData JSONSchemaParser::kSchemaTypeString;
 
 StatusWithMatchExpression JSONSchemaParser::parse(BSONObj schema, bool ignoreUnknownKeywords) {
     LOG(5) << "Parsing JSON Schema: " << schema.jsonString();
-
-    auto translation = _parse(""_sd, schema, ignoreUnknownKeywords);
-    if (shouldLog(logger::LogSeverity::Debug(5)) && translation.isOK()) {
-        LOG(5) << "Translated schema match expression: " << translation.getValue()->toString();
+    try {
+        auto translation = _parse(""_sd, schema, ignoreUnknownKeywords);
+        if (shouldLog(logger::LogSeverity::Debug(5)) && translation.isOK()) {
+            LOG(5) << "Translated schema match expression: " << translation.getValue()->toString();
+        }
+        return translation;
+    } catch (const DBException& ex) {
+        return {ex.toStatus()};
     }
-    return translation;
 }
 }  // namespace mongo

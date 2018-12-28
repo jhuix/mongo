@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -131,6 +133,35 @@ TEST(CommandWriteOpsParsers, ErrorOnDuplicateCommonFieldBetweenBodyAndSequence) 
     ASSERT_THROWS(InsertOp::parse(request), AssertionException);
 }
 
+TEST(CommandWriteOpsParsers, ErrorOnWrongSizeStmtIdsArray) {
+    auto cmd = BSON("insert"
+                    << "bar"
+                    << "documents"
+                    << BSON_ARRAY(BSONObj() << BSONObj())
+                    << "stmtIds"
+                    << BSON_ARRAY(12));
+    for (bool seq : {false, true}) {
+        auto request = toOpMsg("foo", cmd, seq);
+        ASSERT_THROWS_CODE(InsertOp::parse(request), AssertionException, ErrorCodes::InvalidLength);
+    }
+}
+
+TEST(CommandWriteOpsParsers, ErrorOnStmtIdSpecifiedTwoWays) {
+    auto cmd = BSON("insert"
+                    << "bar"
+                    << "documents"
+                    << BSON_ARRAY(BSONObj())
+                    << "stmtIds"
+                    << BSON_ARRAY(12)
+                    << "stmtId"
+                    << 13);
+    for (bool seq : {false, true}) {
+        auto request = toOpMsg("foo", cmd, seq);
+        ASSERT_THROWS_CODE(
+            InsertOp::parse(request), AssertionException, ErrorCodes::InvalidOptions);
+    }
+}
+
 TEST(CommandWriteOpsParsers, GarbageFieldsInUpdateDoc) {
     auto cmd = BSON("update"
                     << "bar"
@@ -237,6 +268,48 @@ TEST(CommandWriteOpsParsers, RealMultiInsert) {
         ASSERT_EQ(op.getDocuments().size(), 2u);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[0], obj0);
         ASSERT_BSONOBJ_EQ(op.getDocuments()[1], obj1);
+        ASSERT_EQ(0, write_ops::getStmtIdForWriteAt(op, 0));
+        ASSERT_EQ(1, write_ops::getStmtIdForWriteAt(op, 1));
+    }
+}
+
+TEST(CommandWriteOpsParsers, MultiInsertWithStmtId) {
+    const auto ns = NamespaceString("test", "foo");
+    const BSONObj obj0 = BSON("x" << 0);
+    const BSONObj obj1 = BSON("x" << 1);
+    auto cmd =
+        BSON("insert" << ns.coll() << "documents" << BSON_ARRAY(obj0 << obj1) << "stmtId" << 10);
+    for (bool seq : {false, true}) {
+        auto request = toOpMsg(ns.db(), cmd, seq);
+        const auto op = InsertOp::parse(request);
+        ASSERT_EQ(op.getNamespace().ns(), ns.ns());
+        ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
+        ASSERT(op.getWriteCommandBase().getOrdered());
+        ASSERT_EQ(op.getDocuments().size(), 2u);
+        ASSERT_BSONOBJ_EQ(op.getDocuments()[0], obj0);
+        ASSERT_BSONOBJ_EQ(op.getDocuments()[1], obj1);
+        ASSERT_EQ(10, write_ops::getStmtIdForWriteAt(op, 0));
+        ASSERT_EQ(11, write_ops::getStmtIdForWriteAt(op, 1));
+    }
+}
+
+TEST(CommandWriteOpsParsers, MultiInsertWithStmtIdsArray) {
+    const auto ns = NamespaceString("test", "foo");
+    const BSONObj obj0 = BSON("x" << 0);
+    const BSONObj obj1 = BSON("x" << 1);
+    auto cmd = BSON("insert" << ns.coll() << "documents" << BSON_ARRAY(obj0 << obj1) << "stmtIds"
+                             << BSON_ARRAY(15 << 17));
+    for (bool seq : {false, true}) {
+        auto request = toOpMsg(ns.db(), cmd, seq);
+        const auto op = InsertOp::parse(request);
+        ASSERT_EQ(op.getNamespace().ns(), ns.ns());
+        ASSERT(!op.getWriteCommandBase().getBypassDocumentValidation());
+        ASSERT(op.getWriteCommandBase().getOrdered());
+        ASSERT_EQ(op.getDocuments().size(), 2u);
+        ASSERT_BSONOBJ_EQ(op.getDocuments()[0], obj0);
+        ASSERT_BSONOBJ_EQ(op.getDocuments()[1], obj1);
+        ASSERT_EQ(15, write_ops::getStmtIdForWriteAt(op, 0));
+        ASSERT_EQ(17, write_ops::getStmtIdForWriteAt(op, 1));
     }
 }
 

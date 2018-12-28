@@ -3,7 +3,8 @@
 
     var s = new ShardingTest({name: "addshard4", shards: 2, mongos: 1, other: {useHostname: true}});
 
-    var r = new ReplSetTest({name: "addshard4", nodes: 3});
+    var r = new ReplSetTest({name: "addshard4", nodes: 3, nodeOptions: {shardsvr: ""}});
+
     r.startSet();
 
     var config = r.getReplSetConfig();
@@ -36,7 +37,8 @@
     printjson(result);
     assert.eq(result, true);
 
-    r = new ReplSetTest({name: "addshard42", nodes: 3});
+    r.stopSet();
+    r = new ReplSetTest({name: "addshard42", nodes: 3, nodeOptions: {shardsvr: ""}});
     r.startSet();
 
     config = r.getReplSetConfig();
@@ -57,5 +59,6 @@
     assert.eq(result, true);
 
     s.stop();
+    r.stopSet();
 
 })();

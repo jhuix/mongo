@@ -1,23 +1,25 @@
-/*-
- *    Copyright (C) 2017 MongoDB Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +30,7 @@
 
 #pragma once
 
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -35,17 +38,16 @@
 
 namespace mongo {
 class IndexConsistency;
-class IndexObserver;
 class UUIDCatalog;
-class CollectionImpl final : virtual public Collection::Impl,
-                             virtual CappedCallback,
-                             virtual UpdateNotifier {
+class CollectionImpl final : public Collection, public CappedCallback {
 private:
     static const int kMagicNumber = 1357924;
 
 public:
-    explicit CollectionImpl(Collection* _this,
-                            OperationContext* opCtx,
+    enum ValidationAction { WARN, ERROR_V };
+    enum ValidationLevel { OFF, MODERATE, STRICT_V };
+
+    explicit CollectionImpl(OperationContext* opCtx,
                             StringData fullNS,
                             OptionalCollectionUUID uuid,
                             CollectionCatalogEntry* details,  // does not own
@@ -53,8 +55,6 @@ public:
                             DatabaseCatalogEntry* dbce);      // does not own
 
     ~CollectionImpl();
-
-    void init(OperationContext* opCtx) final;
 
     bool ok() const final {
         return _magic == kMagicNumber;
@@ -69,32 +69,29 @@ public:
     }
 
     CollectionInfoCache* infoCache() final {
-        return &_infoCache;
+        return _infoCache.get();
     }
 
     const CollectionInfoCache* infoCache() const final {
-        return &_infoCache;
+        return _infoCache.get();
     }
 
     const NamespaceString& ns() const final {
         return _ns;
     }
 
+    void setNs(NamespaceString nss) final;
+
     OptionalCollectionUUID uuid() const {
         return _uuid;
     }
 
-    void refreshUUID(OperationContext* opCtx) final {
-        auto options = getCatalogEntry()->getCollectionOptions(opCtx);
-        _uuid = options.uuid;
-    }
-
     const IndexCatalog* getIndexCatalog() const final {
-        return &_indexCatalog;
+        return _indexCatalog.get();
     }
 
     IndexCatalog* getIndexCatalog() final {
-        return &_indexCatalog;
+        return _indexCatalog.get();
     }
 
     const RecordStore* getRecordStore() const final {
@@ -106,12 +103,12 @@ public:
     }
 
     CursorManager* getCursorManager() const final {
-        return &_cursorManager;
+        return _cursorManager.get();
     }
 
     bool requiresIdIndex() const final;
 
-    Snapshotted<BSONObj> docFor(OperationContext* opCtx, const RecordId& loc) const final {
+    Snapshotted<BSONObj> docFor(OperationContext* opCtx, RecordId loc) const final {
         return Snapshotted<BSONObj>(opCtx->recoveryUnit()->getSnapshotId(),
                                     _recordStore->dataFor(opCtx, loc).releaseToBson());
     }
@@ -120,18 +117,10 @@ public:
      * @param out - contents set to the right docs if exists, or nothing.
      * @return true iff loc exists
      */
-    bool findDoc(OperationContext* opCtx,
-                 const RecordId& loc,
-                 Snapshotted<BSONObj>* out) const final;
+    bool findDoc(OperationContext* opCtx, RecordId loc, Snapshotted<BSONObj>* out) const final;
 
     std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                     bool forward = true) const final;
-
-    /**
-     * Returns many cursors that partition the Collection into many disjoint sets. Iterating
-     * all returned cursors is equivalent to iterating the full collection.
-     */
-    std::vector<std::unique_ptr<RecordCursor>> getManyCursors(OperationContext* opCtx) const final;
 
     /**
      * Deletes the document with the given RecordId from the collection.
@@ -151,7 +140,7 @@ public:
     void deleteDocument(
         OperationContext* opCtx,
         StmtId stmtId,
-        const RecordId& loc,
+        RecordId loc,
         OpDebug* opDebug,
         bool fromMigrate = false,
         bool noWarn = false,
@@ -168,7 +157,6 @@ public:
                            std::vector<InsertStatement>::const_iterator begin,
                            std::vector<InsertStatement>::const_iterator end,
                            OpDebug* opDebug,
-                           bool enforceQuota,
                            bool fromMigrate = false) final;
 
     /**
@@ -176,12 +164,10 @@ public:
      * i.e. will not add an _id field for documents that are missing it
      *
      * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
-     * 'enforceQuota' If false, quotas will be ignored.
      */
     Status insertDocument(OperationContext* opCtx,
                           const InsertStatement& doc,
                           OpDebug* opDebug,
-                          bool enforceQuota,
                           bool fromMigrate = false) final;
 
     /**
@@ -194,14 +180,15 @@ public:
                                    size_t nDocs) final;
 
     /**
-     * Inserts a document into the record store and adds it to the MultiIndexBlocks passed in.
+     * Inserts a document into the record store for a bulk loader that manages the index building
+     * outside this Collection. The bulk loader is notified with the RecordId of the document
+     * inserted into the RecordStore.
      *
      * NOTE: It is up to caller to commit the indexes.
      */
-    Status insertDocument(OperationContext* opCtx,
-                          const BSONObj& doc,
-                          const std::vector<MultiIndexBlock*>& indexBlocks,
-                          bool enforceQuota) final;
+    Status insertDocumentForBulkLoader(OperationContext* opCtx,
+                                       const BSONObj& doc,
+                                       const OnRecordInsertedFn& onRecordInserted) final;
 
     /**
      * Updates the document @ oldLocation with newDoc.
@@ -213,13 +200,12 @@ public:
      * @return the post update location of the doc (may or may not be the same as oldLocation)
      */
     RecordId updateDocument(OperationContext* opCtx,
-                            const RecordId& oldLocation,
+                            RecordId oldLocation,
                             const Snapshotted<BSONObj>& oldDoc,
                             const BSONObj& newDoc,
-                            bool enforceQuota,
                             bool indexesAffected,
                             OpDebug* opDebug,
-                            OplogUpdateEntryArgs* args) final;
+                            CollectionUpdateArgs* args) final;
 
     bool updateWithDamagesSupported() const final;
 
@@ -231,15 +217,13 @@ public:
      * @return the contents of the updated record.
      */
     StatusWith<RecordData> updateDocumentWithDamages(OperationContext* opCtx,
-                                                     const RecordId& loc,
+                                                     RecordId loc,
                                                      const Snapshotted<RecordData>& oldRec,
                                                      const char* damageSource,
                                                      const mutablebson::DamageVector& damages,
-                                                     OplogUpdateEntryArgs* args) final;
+                                                     CollectionUpdateArgs* args) final;
 
     // -----------
-
-    StatusWith<CompactStats> compact(OperationContext* opCtx, const CompactOptions* options) final;
 
     /**
      * removes all documents as fast as possible
@@ -276,20 +260,15 @@ public:
      */
     void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) final;
 
-    using ValidationAction = Collection::ValidationAction;
-
-    using ValidationLevel = Collection::ValidationLevel;
-
     /**
      * Returns a non-ok Status if validator is not legal for this collection.
      */
     StatusWithMatchExpression parseValidator(
         OperationContext* opCtx,
         const BSONObj& validator,
-        MatchExpressionParser::AllowedFeatureSet allowedFeatures) const final;
-
-    static StatusWith<ValidationLevel> parseValidationLevel(StringData);
-    static StatusWith<ValidationAction> parseValidationAction(StringData);
+        MatchExpressionParser::AllowedFeatureSet allowedFeatures,
+        boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
+            maxFeatureCompatibilityVersion = boost::none) const final;
 
     /**
      * Sets the validator for this collection.
@@ -305,6 +284,16 @@ public:
     StringData getValidationLevel() const final;
     StringData getValidationAction() const final;
 
+    /**
+     * Sets the validator to exactly what's provided. If newLevel or newAction are empty, this
+     * sets them to the defaults. Any error Status returned by this function should be considered
+     * fatal.
+     */
+    Status updateValidator(OperationContext* opCtx,
+                           BSONObj newValidator,
+                           StringData newLevel,
+                           StringData newAction) final;
+
     // -----------
 
     //
@@ -312,6 +301,8 @@ public:
     //
 
     bool isCapped() const final;
+
+    CappedCallback* getCappedCallback() final;
 
     /**
      * Get a pointer to a capped insert notifier object. The caller can wait on this object
@@ -341,13 +332,15 @@ public:
      * If return value is not boost::none, reads with majority read concern using an older snapshot
      * must error.
      */
-    boost::optional<SnapshotName> getMinimumVisibleSnapshot() final {
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() final {
         return _minVisibleSnapshot;
     }
 
-    void setMinimumVisibleSnapshot(SnapshotName name) final {
+    void setMinimumVisibleSnapshot(Timestamp name) final {
         _minVisibleSnapshot = name;
     }
+
+    bool haveCappedWaiters() final;
 
     /**
      * Notify (capped collection) waiters of data changes, like an insert.
@@ -360,40 +353,24 @@ public:
      */
     const CollatorInterface* getDefaultCollator() const final;
 
-    /**
-     * Calls the Inform function in the IndexObserver if it's hooked.
-     */
-    void informIndexObserver(OperationContext* opCtx,
-                             const IndexDescriptor* descriptor,
-                             const IndexKeyEntry& indexEntry,
-                             const ValidationOperation operation) const;
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
+        OperationContext* opCtx,
+        PlanExecutor::YieldPolicy yieldPolicy,
+        ScanDirection scanDirection) final;
 
+    void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) final;
 
-private:
+    void establishOplogCollectionForLogging(OperationContext* opCtx) final;
+
     inline DatabaseCatalogEntry* dbce() const final {
         return this->_dbce;
     }
 
-    inline CollectionCatalogEntry* details() const final {
-        return this->_details;
-    }
-
-    /**
-     * Hooks the IndexObserver into the collection.
-     */
-    void hookIndexObserver(IndexConsistency* consistency);
-
-    /**
-     * Unhooks the IndexObserver from the collection.
-     */
-    void unhookIndexObserver();
-
+private:
     /**
      * Returns a non-ok Status if document does not pass this collection's validator.
      */
     Status checkValidation(OperationContext* opCtx, const BSONObj& document) const;
-
-    Status recordStoreGoingToUpdateInPlace(OperationContext* opCtx, const RecordId& loc);
 
     Status aboutToDeleteCapped(OperationContext* opCtx, const RecordId& loc, RecordData data);
 
@@ -402,42 +379,24 @@ private:
      *  - some user error checks
      *  - adjust padding
      */
-    Status _insertDocument(OperationContext* opCtx, const BSONObj& doc, bool enforceQuota);
+    Status _insertDocument(OperationContext* opCtx, const BSONObj& doc);
 
     Status _insertDocuments(OperationContext* opCtx,
                             std::vector<InsertStatement>::const_iterator begin,
                             std::vector<InsertStatement>::const_iterator end,
-                            bool enforceQuota,
                             OpDebug* opDebug);
-
-
-    /**
-     * Perform update when document move will be required.
-     */
-    StatusWith<RecordId> _updateDocumentWithMove(OperationContext* opCtx,
-                                                 const RecordId& oldLocation,
-                                                 const Snapshotted<BSONObj>& oldDoc,
-                                                 const BSONObj& newDoc,
-                                                 bool enforceQuota,
-                                                 OpDebug* opDebug,
-                                                 OplogUpdateEntryArgs* args,
-                                                 const SnapshotId& sid);
-
-    bool _enforceQuota(bool userEnforeQuota) const;
 
     int _magic;
 
-    const NamespaceString _ns;
+    NamespaceString _ns;
     OptionalCollectionUUID _uuid;
     CollectionCatalogEntry* const _details;
     RecordStore* const _recordStore;
     DatabaseCatalogEntry* const _dbce;
     const bool _needCappedLock;
-    CollectionInfoCache _infoCache;
-    IndexCatalog _indexCatalog;
+    std::unique_ptr<CollectionInfoCache> _infoCache;
+    std::unique_ptr<IndexCatalog> _indexCatalog;
 
-    mutable stdx::mutex _indexObserverMutex;
-    mutable std::unique_ptr<IndexObserver> _indexObserver;
 
     // The default collation which is applied to operations and indices which have no collation of
     // their own. The collection's validator will respect this collation.
@@ -454,10 +413,7 @@ private:
     ValidationAction _validationAction;
     ValidationLevel _validationLevel;
 
-    // this is mutable because read only users of the Collection class
-    // use it keep state.  This seems valid as const correctness of Collection
-    // should be about the data.
-    mutable CursorManager _cursorManager;
+    std::unique_ptr<CursorManager> _cursorManager;
 
     // Notifier object for awaitData. Threads polling a capped collection for new data can wait
     // on this object until notified of the arrival of new data.
@@ -466,10 +422,6 @@ private:
     const std::shared_ptr<CappedInsertNotifier> _cappedNotifier;
 
     // The earliest snapshot that is allowed to use this collection.
-    boost::optional<SnapshotName> _minVisibleSnapshot;
-
-    Collection* _this;
-
-    friend class NamespaceDetails;
+    boost::optional<Timestamp> _minVisibleSnapshot;
 };
 }  // namespace mongo

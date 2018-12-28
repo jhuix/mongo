@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2017 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -48,11 +50,12 @@ const BSONObj kDefaultCollation = BSON("locale"
 
 TEST(ShardCollectionType, ToFromBSON) {
     const OID epoch = OID::gen();
+    const UUID uuid = UUID::gen();
     const ChunkVersion lastRefreshedCollectionVersion(2, 0, epoch);
 
     BSONObjBuilder builder;
-    builder.append(ShardCollectionType::uuid.name(), kNss.ns());
     builder.append(ShardCollectionType::ns.name(), kNss.ns());
+    uuid.appendToBuilder(&builder, ShardCollectionType::uuid.name());
     builder.append(ShardCollectionType::epoch(), epoch);
     builder.append(ShardCollectionType::keyPattern.name(), kKeyPattern);
     builder.append(ShardCollectionType::defaultCollation(), kDefaultCollation);
@@ -64,8 +67,9 @@ TEST(ShardCollectionType, ToFromBSON) {
 
     ShardCollectionType shardCollectionType = assertGet(ShardCollectionType::fromBSON(obj));
 
-    ASSERT_EQUALS(shardCollectionType.getUUID(), kNss);
     ASSERT_EQUALS(shardCollectionType.getNss(), kNss);
+    ASSERT(shardCollectionType.getUUID());
+    ASSERT_EQUALS(*shardCollectionType.getUUID(), uuid);
     ASSERT_EQUALS(shardCollectionType.getEpoch(), epoch);
     ASSERT_BSONOBJ_EQ(shardCollectionType.getKeyPattern().toBSON(), kKeyPattern);
     ASSERT_BSONOBJ_EQ(shardCollectionType.getDefaultCollation(), kDefaultCollation);
@@ -81,7 +85,6 @@ TEST(ShardCollectionType, ToFromShardBSONWithoutOptionals) {
     const OID epoch = OID::gen();
 
     BSONObjBuilder builder;
-    builder.append(ShardCollectionType::uuid.name(), kNss.ns());
     builder.append(ShardCollectionType::ns.name(), kNss.ns());
     builder.append(ShardCollectionType::epoch(), epoch);
     builder.append(ShardCollectionType::keyPattern.name(), kKeyPattern);
@@ -91,12 +94,13 @@ TEST(ShardCollectionType, ToFromShardBSONWithoutOptionals) {
 
     ShardCollectionType shardCollectionType = assertGet(ShardCollectionType::fromBSON(obj));
 
-    ASSERT_EQUALS(shardCollectionType.getUUID(), kNss);
     ASSERT_EQUALS(shardCollectionType.getNss(), kNss);
     ASSERT_EQUALS(shardCollectionType.getEpoch(), epoch);
     ASSERT_BSONOBJ_EQ(shardCollectionType.getKeyPattern().toBSON(), kKeyPattern);
     ASSERT_BSONOBJ_EQ(shardCollectionType.getDefaultCollation(), kDefaultCollation);
     ASSERT_EQUALS(shardCollectionType.getUnique(), true);
+    ASSERT_FALSE(shardCollectionType.hasRefreshing());
+    ASSERT_FALSE(shardCollectionType.hasLastRefreshedCollectionVersion());
 
     ASSERT_BSONOBJ_EQ(obj, shardCollectionType.toBSON());
 }
@@ -106,38 +110,45 @@ TEST(ShardCollectionType, FromEmptyBSON) {
     ASSERT_FALSE(status.isOK());
 }
 
-TEST(ShardCollectionType, FromBSONNoUUIDFails) {
-    BSONObj obj =
-        BSON(ShardCollectionType::ns(kNss.ns()) << ShardCollectionType::keyPattern(kKeyPattern));
-
-    StatusWith<ShardCollectionType> status = ShardCollectionType::fromBSON(obj);
-    ASSERT_EQUALS(status.getStatus().code(), ErrorCodes::NoSuchKey);
-    ASSERT_STRING_CONTAINS(status.getStatus().reason(), ShardCollectionType::uuid());
+TEST(ShardCollectionType, FromBSONNoUUIDIsOK) {
+    BSONObjBuilder builder;
+    builder.append(ShardCollectionType::ns.name(), kNss.ns());
+    builder.append(ShardCollectionType::epoch(), OID::gen());
+    builder.append(ShardCollectionType::keyPattern(), kKeyPattern);
+    builder.append(ShardCollectionType::unique(), true);
+    StatusWith<ShardCollectionType> status = ShardCollectionType::fromBSON(builder.obj());
+    ASSERT_OK(status.getStatus());
+    ASSERT_FALSE(status.getValue().getUUID());
 }
 
 TEST(ShardCollectionType, FromBSONNoNSFails) {
-    BSONObj obj =
-        BSON(ShardCollectionType::uuid(kNss.ns()) << ShardCollectionType::keyPattern(kKeyPattern));
-
-    StatusWith<ShardCollectionType> status = ShardCollectionType::fromBSON(obj);
+    BSONObjBuilder builder;
+    UUID::gen().appendToBuilder(&builder, ShardCollectionType::uuid.name());
+    builder.append(ShardCollectionType::epoch(), OID::gen());
+    builder.append(ShardCollectionType::keyPattern(), kKeyPattern);
+    builder.append(ShardCollectionType::unique(), true);
+    StatusWith<ShardCollectionType> status = ShardCollectionType::fromBSON(builder.obj());
     ASSERT_EQUALS(status.getStatus().code(), ErrorCodes::NoSuchKey);
     ASSERT_STRING_CONTAINS(status.getStatus().reason(), ShardCollectionType::ns());
 }
 
 TEST(ShardCollectionType, FromBSONNoEpochFails) {
-    BSONObj obj = BSON(ShardCollectionType::uuid(kNss.ns()) << ShardCollectionType::ns(kNss.ns()));
-
-    StatusWith<ShardCollectionType> status = ShardCollectionType::fromBSON(obj);
+    BSONObjBuilder builder;
+    builder.append(ShardCollectionType::ns.name(), kNss.ns());
+    UUID::gen().appendToBuilder(&builder, ShardCollectionType::uuid.name());
+    builder.append(ShardCollectionType::keyPattern(), kKeyPattern);
+    builder.append(ShardCollectionType::unique(), true);
+    StatusWith<ShardCollectionType> status = ShardCollectionType::fromBSON(builder.obj());
     ASSERT_EQUALS(status.getStatus().code(), ErrorCodes::NoSuchKey);
     ASSERT_STRING_CONTAINS(status.getStatus().reason(), ShardCollectionType::epoch());
 }
 
 TEST(ShardCollectionType, FromBSONNoShardKeyFails) {
     BSONObjBuilder builder;
-    builder.append(ShardCollectionType::uuid.name(), kNss.ns());
     builder.append(ShardCollectionType::ns.name(), kNss.ns());
+    UUID::gen().appendToBuilder(&builder, ShardCollectionType::uuid.name());
     builder.append(ShardCollectionType::epoch(), OID::gen());
-
+    builder.append(ShardCollectionType::unique(), true);
     StatusWith<ShardCollectionType> status = ShardCollectionType::fromBSON(builder.obj());
     ASSERT_EQUALS(status.getStatus().code(), ErrorCodes::NoSuchKey);
     ASSERT_STRING_CONTAINS(status.getStatus().reason(), ShardCollectionType::keyPattern());
@@ -145,12 +156,11 @@ TEST(ShardCollectionType, FromBSONNoShardKeyFails) {
 
 TEST(ShardCollectionType, FromBSONNoUniqueFails) {
     BSONObjBuilder builder;
-    builder.append(ShardCollectionType::uuid.name(), kNss.ns());
     builder.append(ShardCollectionType::ns.name(), kNss.ns());
+    UUID::gen().appendToBuilder(&builder, ShardCollectionType::uuid.name());
     builder.append(ShardCollectionType::epoch(), OID::gen());
     builder.append(ShardCollectionType::keyPattern.name(), kKeyPattern);
     builder.append(ShardCollectionType::defaultCollation(), kDefaultCollation);
-
     StatusWith<ShardCollectionType> status = ShardCollectionType::fromBSON(builder.obj());
     ASSERT_EQUALS(status.getStatus().code(), ErrorCodes::NoSuchKey);
     ASSERT_STRING_CONTAINS(status.getStatus().reason(), ShardCollectionType::unique());
@@ -158,8 +168,8 @@ TEST(ShardCollectionType, FromBSONNoUniqueFails) {
 
 TEST(ShardCollectionType, FromBSONNoDefaultCollationIsOK) {
     BSONObjBuilder builder;
-    builder.append(ShardCollectionType::uuid.name(), kNss.ns());
     builder.append(ShardCollectionType::ns.name(), kNss.ns());
+    UUID::gen().appendToBuilder(&builder, ShardCollectionType::uuid.name());
     builder.append(ShardCollectionType::epoch(), OID::gen());
     builder.append(ShardCollectionType::keyPattern.name(), kKeyPattern);
     builder.append(ShardCollectionType::unique(), true);

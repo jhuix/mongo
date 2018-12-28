@@ -1,10 +1,10 @@
 // Tests the behavior of change streams on sharded collections.
+// @tags: [uses_change_streams]
 (function() {
     "use strict";
 
     load('jstests/replsets/libs/two_phase_drops.js');  // For TwoPhaseDropCollectionTest.
     load('jstests/aggregation/extras/utils.js');       // For assertErrorCode().
-    load('jstests/libs/change_stream_util.js');        // For ChangeStreamTest.
 
     // For supportsMajorityReadConcern().
     load("jstests/multiVersion/libs/causal_consistency_helpers.js");
@@ -29,7 +29,7 @@
 
     assert.commandWorked(mongosDB.dropDatabase());
 
-    // Enable sharding on the test DB and ensure its primary is shard0000.
+    // Enable sharding on the test DB and ensure its primary is st.shard0.shardName.
     assert.commandWorked(mongosDB.adminCommand({enableSharding: mongosDB.getName()}));
     st.ensurePrimaryShard(mongosDB.getName(), st.rs0.getURL());
 
@@ -41,7 +41,7 @@
     assert.commandWorked(
         mongosDB.adminCommand({split: mongosColl.getFullName(), middle: {_id: 0}}));
 
-    // Move the [0, MaxKey) chunk to shard0001.
+    // Move the [0, MaxKey) chunk to st.shard1.shardName.
     assert.commandWorked(mongosDB.adminCommand(
         {moveChunk: mongosColl.getFullName(), find: {_id: 1}, to: st.rs1.getURL()}));
 
@@ -49,7 +49,8 @@
     assert.writeOK(mongosColl.insert({_id: -1}));
     assert.writeOK(mongosColl.insert({_id: 1}));
 
-    let changeStream = mongosColl.aggregate([{$changeStream: {}}, {$project: {_id: 0}}]);
+    let changeStream =
+        mongosColl.aggregate([{$changeStream: {}}, {$project: {_id: 0, clusterTime: 0}}]);
 
     // Test that a change stream can see inserts on shard 0.
     assert.writeOK(mongosColl.insert({_id: 1000}));
@@ -120,15 +121,18 @@
     changeStream = mongosColl.aggregate([{$changeStream: {}}, {$project: {"_id.clusterTime": 0}}]);
     assert(!changeStream.hasNext());
 
-    // Drop the collection and test that we return "invalidate" entry and close the cursor.
+    // Drop the collection and test that we return a "drop" followed by an "invalidate" entry and
+    // close the cursor.
     jsTestLog("Testing getMore command closes cursor for invalidate entries");
     mongosColl.drop();
     // Wait for the drop to actually happen.
     assert.soon(() => !TwoPhaseDropCollectionTest.collectionIsPendingDropInDatabase(
                     mongosColl.getDB(), mongosColl.getName()));
     assert.soon(() => changeStream.hasNext());
+    assert.eq(changeStream.next().operationType, "drop");
+    assert.soon(() => changeStream.hasNext());
     assert.eq(changeStream.next().operationType, "invalidate");
-    assert(!changeStream.hasNext(), "expected invalidation to cause the cursor to be closed");
+    assert(changeStream.isExhausted());
 
     jsTestLog("Testing aggregate command closes cursor for invalidate entries");
     // Shard the test collection on _id.
@@ -138,7 +142,7 @@
     // Split the collection into 2 chunks: [MinKey, 0), [0, MaxKey).
     assert.commandWorked(
         mongosDB.adminCommand({split: mongosColl.getFullName(), middle: {_id: 0}}));
-    // Move the [0, MaxKey) chunk to shard0001.
+    // Move the [0, MaxKey) chunk to st.shard1.shardName.
     assert.commandWorked(mongosDB.adminCommand(
         {moveChunk: mongosColl.getFullName(), find: {_id: 1}, to: st.rs1.getURL()}));
 
@@ -146,26 +150,51 @@
     assert.writeOK(mongosColl.insert({_id: -1}, {writeConcern: {w: "majority"}}));
     assert.writeOK(mongosColl.insert({_id: 1}, {writeConcern: {w: "majority"}}));
 
-    // Get a valid resume token that the next aggregate command can use.
     changeStream = mongosColl.aggregate([{$changeStream: {}}]);
+    assert(!changeStream.hasNext());
 
-    assert.writeOK(mongosColl.insert({_id: 2}, {writeConcern: {w: "majority"}}));
+    // Store a valid resume token before dropping the collection, to be used later in the test.
     assert.writeOK(mongosColl.insert({_id: -2}, {writeConcern: {w: "majority"}}));
+    assert.writeOK(mongosColl.insert({_id: 2}, {writeConcern: {w: "majority"}}));
 
     assert.soon(() => changeStream.hasNext());
     const resumeToken = changeStream.next()._id;
 
-    // It should not possible to resume a change stream after a collection drop, even if the
-    // invalidate has not been received.
-    assert(mongosColl.drop());
-    // Wait for the drop to actually happen.
-    assert.soon(() => !TwoPhaseDropCollectionTest.collectionIsPendingDropInDatabase(
-                    mongosColl.getDB(), mongosColl.getName()));
+    mongosColl.drop();
 
-    ChangeStreamTest.assertChangeStreamThrowsCode({
-        collection: mongosColl,
+    assert.soon(() => changeStream.hasNext());
+    let next = changeStream.next();
+    assert.eq(next.operationType, "insert");
+    assert.eq(next.documentKey._id, 2);
+
+    assert.soon(() => changeStream.hasNext());
+    assert.eq(changeStream.next().operationType, "drop");
+
+    assert.soon(() => changeStream.hasNext());
+    assert.eq(changeStream.next().operationType, "invalidate");
+
+    // With an explicit collation, test that we can resume from before the collection drop.
+    changeStream = mongosColl.watch([{$project: {_id: 0}}],
+                                    {resumeAfter: resumeToken, collation: {locale: "simple"}});
+
+    assert.soon(() => changeStream.hasNext());
+    next = changeStream.next();
+    assert.eq(next.operationType, "insert");
+    assert.eq(next.documentKey, {_id: 2});
+
+    assert.soon(() => changeStream.hasNext());
+    assert.eq(changeStream.next().operationType, "drop");
+
+    assert.soon(() => changeStream.hasNext());
+    assert.eq(changeStream.next().operationType, "invalidate");
+
+    // Without an explicit collation, test that we *cannot* resume from before the collection drop.
+    assert.commandFailedWithCode(mongosDB.runCommand({
+        aggregate: mongosColl.getName(),
         pipeline: [{$changeStream: {resumeAfter: resumeToken}}],
-        expectedCode: 40615
-    });
+        cursor: {}
+    }),
+                                 ErrorCodes.InvalidResumeToken);
 
+    st.stop();
 })();

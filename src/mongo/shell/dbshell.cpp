@@ -1,30 +1,31 @@
-// dbshell.cpp
-/*
- *    Copyright 2010 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
@@ -42,9 +43,8 @@
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/client/sasl_client_authenticate.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/client.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/server_options.h"
@@ -57,6 +57,8 @@
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/shell/shell_utils_launcher.h"
+#include "mongo/stdx/utility.h"
+#include "mongo/transport/transport_layer_asio.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
@@ -81,6 +83,7 @@
 #endif
 
 using namespace std;
+using namespace std::literals::string_literals;
 using namespace mongo;
 
 string historyFile;
@@ -89,19 +92,34 @@ bool inMultiLine = false;
 static AtomicBool atPrompt(false);  // can eval before getting to prompt
 
 namespace {
-const auto kDefaultMongoURL = "mongodb://127.0.0.1:27017"_sd;
+const std::string kDefaultMongoHost = "127.0.0.1"s;
+const std::string kDefaultMongoPort = "27017"s;
+const std::string kDefaultMongoURL = "mongodb://"s + kDefaultMongoHost + ":"s + kDefaultMongoPort;
 
-// We set the featureCompatibilityVersion to 3.6 in the mongo shell and rely on the server to reject
-// usages of new features if its featureCompatibilityVersion is lower.
-MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion36, ("EndStartupOptionSetup"))
+// Initialize the featureCompatibilityVersion server parameter since the mongo shell does not have a
+// featureCompatibilityVersion document from which to initialize the parameter. The parameter is set
+// to the latest version because there is no feature gating that currently occurs at the mongo shell
+// level. The server is responsible for rejecting usages of new features if its
+// featureCompatibilityVersion is lower.
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion42, ("EndStartupOptionSetup"))
 (InitializerContext* context) {
     mongo::serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::k36);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     return Status::OK();
 }
+const auto kAuthParam = "authSource"s;
 }  // namespace
 
 namespace mongo {
+
+enum ShellExitCode : int {
+    kDBException = 1,
+    kInputFileError = -3,
+    kEvalError = -4,
+    kMongorcError = -5,
+    kUnterminatedProcess = -6,
+    kProcessTerminationError = -7,
+};
 
 Scope* shellMainScope;
 }
@@ -184,7 +202,7 @@ void shellHistoryAdd(const char* line) {
 }
 
 void killOps() {
-    if (mongo::shell_utils::_nokillop)
+    if (shellGlobalParams.nokillop)
         return;
 
     if (atPrompt.load())
@@ -214,20 +232,25 @@ char* shellReadline(const char* prompt, int handlesigint = 0) {
 }
 
 void setupSignals() {
+#ifndef _WIN32
+    signal(SIGHUP, quitNicely);
+#endif
     signal(SIGINT, quitNicely);
 }
 
 string getURIFromArgs(const std::string& arg, const std::string& host, const std::string& port) {
     if (host.empty() && arg.empty() && port.empty()) {
         // Nothing provided, just play the default.
-        return kDefaultMongoURL.toString();
+        return kDefaultMongoURL;
     }
 
-    if (str::startsWith(arg, "mongodb://") && host.empty() && port.empty()) {
+    if ((str::startsWith(arg, "mongodb://") || str::startsWith(arg, "mongodb+srv://")) &&
+        host.empty() && port.empty()) {
         // mongo mongodb://blah
         return arg;
     }
-    if (str::startsWith(host, "mongodb://") && arg.empty() && port.empty()) {
+    if ((str::startsWith(host, "mongodb://") || str::startsWith(host, "mongodb+srv://")) &&
+        arg.empty() && port.empty()) {
         // mongo --host mongodb://blah
         return host;
     }
@@ -548,7 +571,7 @@ string finishCode(string code) {
 }
 
 bool execPrompt(mongo::Scope& scope, const char* promptFunction, string& prompt) {
-    string execStatement = string("__prompt__ = ") + promptFunction + "();";
+    string execStatement = string("__promptWrapper__(") + promptFunction + ");";
     scope.exec("delete __prompt__;", "", false, false, false, 0);
     scope.exec(execStatement, "", false, false, false, 0);
     if (scope.type("__prompt__") == String) {
@@ -704,6 +727,21 @@ static void edit(const string& whatToEdit) {
     }
 }
 
+namespace {
+bool mechanismRequiresPassword(const MongoURI& uri) {
+    if (const auto authMechanisms = uri.getOption("authMechanism")) {
+        constexpr std::array<StringData, 2> passwordlessMechanisms{"GSSAPI"_sd, "MONGODB-X509"_sd};
+        const std::string& authMechanism = authMechanisms.get();
+        for (const auto& mechanism : passwordlessMechanisms) {
+            if (mechanism.toString() == authMechanism) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+}  // namespace
+
 int _main(int argc, char* argv[], char** envp) {
     registerShutdownTask([] {
         // NOTE: This function may be called at any time. It must not
@@ -719,16 +757,21 @@ int _main(int argc, char* argv[], char** envp) {
     mongo::shell_utils::RecordMyLocation(argv[0]);
 
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
+    setGlobalServiceContext(ServiceContext::make());
+    // TODO This should use a TransportLayerManager or TransportLayerFactory
+    auto serviceContext = getGlobalServiceContext();
+    transport::TransportLayerASIO::Options opts;
+    opts.enableIPv6 = shellGlobalParams.enableIPv6;
+    opts.mode = transport::TransportLayerASIO::Options::kEgress;
+
+    serviceContext->setTransportLayer(
+        std::make_unique<transport::TransportLayerASIO>(opts, nullptr));
+    auto tlPtr = serviceContext->getTransportLayer();
+    uassertStatusOK(tlPtr->setup());
+    uassertStatusOK(tlPtr->start());
 
     // hide password from ps output
-    for (int i = 0; i < (argc - 1); ++i) {
-        if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--password")) {
-            char* arg = argv[i + 1];
-            while (*arg) {
-                *arg++ = 'x';
-            }
-        }
-    }
+    redactPasswordOptions(argc, argv);
 
     if (!mongo::serverGlobalParams.quiet.load())
         cout << mongoShellVersion(VersionInfoInterface::instance()) << endl;
@@ -737,24 +780,54 @@ int _main(int argc, char* argv[], char** envp) {
 
     logger::globalLogManager()
         ->getNamedDomain("javascriptOutput")
-        ->attachAppender(logger::MessageLogDomain::AppenderAutoPtr(
-            new logger::ConsoleAppender<logger::MessageEventEphemeral>(
-                new logger::MessageEventUnadornedEncoder)));
+        ->attachAppender(std::make_unique<logger::ConsoleAppender<logger::MessageEventEphemeral>>(
+            std::make_unique<logger::MessageEventUnadornedEncoder>()));
 
+    // Get the URL passed to the shell
+    std::string& cmdlineURI = shellGlobalParams.url;
+
+    // Parse the output of getURIFromArgs which will determine if --host passed in a URI
+    MongoURI parsedURI;
+    parsedURI = uassertStatusOK(MongoURI::parse(getURIFromArgs(
+        cmdlineURI, escape(shellGlobalParams.dbhost), escape(shellGlobalParams.port))));
+
+    // TODO: add in all of the relevant shellGlobalParams to parsedURI
+    parsedURI.setOptionIfNecessary("compressors"s, shellGlobalParams.networkMessageCompressors);
+    parsedURI.setOptionIfNecessary("authMechanism"s, shellGlobalParams.authenticationMechanism);
+    parsedURI.setOptionIfNecessary("authSource"s, shellGlobalParams.authenticationDatabase);
+    parsedURI.setOptionIfNecessary("gssapiServiceName"s, shellGlobalParams.gssapiServiceName);
+    parsedURI.setOptionIfNecessary("gssapiHostName"s, shellGlobalParams.gssapiHostName);
+
+    bool usingPassword = !shellGlobalParams.password.empty();
     if (!shellGlobalParams.nodb) {  // connect to db
+        if (mechanismRequiresPassword(parsedURI) &&
+            (parsedURI.getUser().size() || shellGlobalParams.username.size())) {
+            usingPassword = true;
+        }
+        if (usingPassword && parsedURI.getPassword().empty()) {
+            if (!shellGlobalParams.password.empty()) {
+                parsedURI.setPassword(stdx::as_const(shellGlobalParams.password));
+            } else {
+                parsedURI.setPassword(mongo::askPassword());
+            }
+        }
+        if (parsedURI.getUser().empty() && !shellGlobalParams.username.empty()) {
+            parsedURI.setUser(stdx::as_const(shellGlobalParams.username));
+        }
+
         stringstream ss;
         if (mongo::serverGlobalParams.quiet.load())
             ss << "__quiet = true;";
-        ss << "db = connect( \""
-           << getURIFromArgs(
-                  shellGlobalParams.url, shellGlobalParams.dbhost, shellGlobalParams.port)
-           << "\")";
+        ss << "db = connect( \"" << parsedURI.canonicalizeURIAsString() << "\");";
+
+        if (shellGlobalParams.shouldRetryWrites || parsedURI.getRetryWrites()) {
+            // If the --retryWrites cmdline argument or retryWrites URI param was specified, then
+            // replace the global `db` object with a DB object started in a session. The resulting
+            // Mongo connection checks its _retryWrites property.
+            ss << "db = db.getMongo().startSession().getDatabase(db.getName());";
+        }
 
         mongo::shell_utils::_dbConnect = ss.str();
-
-        if (shellGlobalParams.usingPassword && shellGlobalParams.password.empty()) {
-            shellGlobalParams.password = mongo::askPassword();
-        }
     }
 
     // Construct the authentication-related code to execute on shell startup.
@@ -769,41 +842,39 @@ int _main(int argc, char* argv[], char** envp) {
     //  }())
     stringstream authStringStream;
     authStringStream << "(function() { " << endl;
-    if (!shellGlobalParams.authenticationMechanism.empty()) {
+
+
+    if (const auto authMechanisms = parsedURI.getOption("authMechanism")) {
         authStringStream << "DB.prototype._defaultAuthenticationMechanism = \""
-                         << escape(shellGlobalParams.authenticationMechanism) << "\";" << endl;
+                         << escape(authMechanisms.get()) << "\";" << endl;
     }
 
-    if (!shellGlobalParams.gssapiServiceName.empty()) {
+    if (const auto gssapiServiveName = parsedURI.getOption("gssapiServiceName")) {
         authStringStream << "DB.prototype._defaultGssapiServiceName = \""
-                         << escape(shellGlobalParams.gssapiServiceName) << "\";" << endl;
+                         << escape(gssapiServiveName.get()) << "\";" << endl;
     }
 
-    if (!shellGlobalParams.nodb && (!shellGlobalParams.username.empty() ||
-                                    shellGlobalParams.authenticationMechanism == "MONGODB-X509")) {
-        authStringStream << "var username = \"" << escape(shellGlobalParams.username) << "\";"
-                         << endl;
-        if (shellGlobalParams.usingPassword) {
-            authStringStream << "var password = \"" << escape(shellGlobalParams.password) << "\";"
+    if (!shellGlobalParams.nodb &&
+        (!parsedURI.getUser().empty() ||
+         parsedURI.getOption("authMechanism").get_value_or("") == "MONGODB-X509")) {
+        authStringStream << "var username = \"" << escape(parsedURI.getUser()) << "\";" << endl;
+        if (usingPassword) {
+            authStringStream << "var password = \"" << escape(parsedURI.getPassword()) << "\";"
                              << endl;
         }
-        if (shellGlobalParams.authenticationDatabase.empty()) {
-            authStringStream << "var authDb = db;" << endl;
-        } else {
-            authStringStream << "var authDb = db.getSiblingDB(\""
-                             << escape(shellGlobalParams.authenticationDatabase) << "\");" << endl;
-        }
+        authStringStream << "var authDb = db.getSiblingDB(\""
+                         << escape(parsedURI.getAuthenticationDatabase()) << "\");" << endl;
 
         authStringStream << "authDb._authOrThrow({ ";
-        if (!shellGlobalParams.username.empty()) {
+        if (!parsedURI.getUser().empty()) {
             authStringStream << saslCommandUserFieldName << ": username ";
         }
-        if (shellGlobalParams.usingPassword) {
+        if (usingPassword) {
             authStringStream << ", " << saslCommandPasswordFieldName << ": password ";
         }
-        if (!shellGlobalParams.gssapiHostName.empty()) {
+        if (const auto gssapiHostNameKey = parsedURI.getOption("gssapiHostName")) {
             authStringStream << ", " << saslCommandServiceHostnameFieldName << ": \""
-                             << escape(shellGlobalParams.gssapiHostName) << '"' << endl;
+                             << escape(gssapiHostNameKey.get()) << '"' << endl;
         }
         authStringStream << "});" << endl;
     }
@@ -823,7 +894,7 @@ int _main(int argc, char* argv[], char** envp) {
     unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScope());
     shellMainScope = scope.get();
 
-    if (shellGlobalParams.runShell)
+    if (shellGlobalParams.runShell && !mongo::serverGlobalParams.quiet.load())
         cout << "type \"help\" for help" << endl;
 
     // Load and execute /etc/mongorc.js before starting shell
@@ -845,8 +916,10 @@ int _main(int argc, char* argv[], char** envp) {
 
     if (!shellGlobalParams.script.empty()) {
         mongo::shell_utils::MongoProgramScope s;
-        if (!scope->exec(shellGlobalParams.script, "(shell eval)", false, true, false))
-            return -4;
+        if (!scope->exec(shellGlobalParams.script, "(shell eval)", false, true, false)) {
+            error() << "exiting with code " << static_cast<int>(kEvalError);
+            return kEvalError;
+        }
         scope->exec("shellPrintHelper( __lastres__ );", "(shell2 eval)", true, true, false);
     }
 
@@ -857,13 +930,42 @@ int _main(int argc, char* argv[], char** envp) {
             cout << "loading file: " << shellGlobalParams.files[i] << endl;
 
         if (!scope->execFile(shellGlobalParams.files[i], false, true)) {
-            cout << "failed to load: " << shellGlobalParams.files[i] << endl;
-            return -3;
+            severe() << "failed to load: " << shellGlobalParams.files[i];
+            error() << "exiting with code " << static_cast<int>(kInputFileError);
+            return kInputFileError;
         }
-        if (mongo::shell_utils::KillMongoProgramInstances() != EXIT_SUCCESS) {
-            cout << "one more more child processes exited with an error during "
-                 << shellGlobalParams.files[i] << endl;
-            return -3;
+
+        // Check if the process left any running child processes.
+        std::vector<ProcessId> pids = mongo::shell_utils::getRunningMongoChildProcessIds();
+
+        if (!pids.empty()) {
+            cout << "terminating the following processes started by " << shellGlobalParams.files[i]
+                 << ": ";
+            std::copy(pids.begin(), pids.end(), std::ostream_iterator<ProcessId>(cout, " "));
+            cout << endl;
+
+            if (mongo::shell_utils::KillMongoProgramInstances() != EXIT_SUCCESS) {
+                severe() << "one more more child processes exited with an error during "
+                         << shellGlobalParams.files[i];
+                error() << "exiting with code " << static_cast<int>(kProcessTerminationError);
+                return kProcessTerminationError;
+            }
+
+            bool failIfUnterminatedProcesses = false;
+            const StringData code =
+                "function() { return typeof TestData === 'object' && TestData !== null && "
+                "TestData.hasOwnProperty('failIfUnterminatedProcesses') && "
+                "TestData.failIfUnterminatedProcesses; }"_sd;
+            shellMainScope->invokeSafe(code.rawData(), 0, 0);
+            failIfUnterminatedProcesses = shellMainScope->getBoolean("__returnValue");
+
+            if (failIfUnterminatedProcesses) {
+                severe() << "exiting with a failure due to unterminated processes, "
+                            "a call to MongoRunner.stopMongod(), ReplSetTest#stopSet(), or "
+                            "ShardingTest#stop() may be missing from the test";
+                error() << "exiting with code " << static_cast<int>(kUnterminatedProcess);
+                return kUnterminatedProcess;
+            }
         }
     }
 
@@ -889,10 +991,10 @@ int _main(int argc, char* argv[], char** envp) {
             if (!rcLocation.empty() && ::mongo::shell_utils::fileExists(rcLocation)) {
                 hasMongoRC = true;
                 if (!scope->execFile(rcLocation, false, true)) {
-                    cout << "The \".mongorc.js\" file located in your home folder could not be "
-                            "executed"
-                         << endl;
-                    return -5;
+                    severe() << "The \".mongorc.js\" file located in your home folder could not be "
+                                "executed";
+                    error() << "exiting with code " << static_cast<int>(kMongorcError);
+                    return kMongorcError;
                 }
             }
         }
@@ -912,6 +1014,9 @@ int _main(int argc, char* argv[], char** envp) {
             isatty(fileno(stdin))) {
             scope->exec(
                 "shellHelper( 'show', 'startupWarnings' )", "(shellwarnings)", false, true, false);
+
+            scope->exec(
+                "shellHelper( 'show', 'freeMonitoring' )", "(freeMonitoring)", false, true, false);
 
             scope->exec("shellHelper( 'show', 'automationNotices' )",
                         "(automationnotices)",
@@ -1061,8 +1166,9 @@ int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
         WindowsCommandLine wcl(argc, argvW, envpW);
         returnCode = _main(argc, wcl.argv(), wcl.envp());
     } catch (mongo::DBException& e) {
-        cerr << "exception: " << e.what() << endl;
-        returnCode = 1;
+        severe() << "exception: " << e.what();
+        error() << "exiting with code " << static_cast<int>(kDBException);
+        returnCode = kDBException;
     }
     quickExit(returnCode);
 }
@@ -1072,8 +1178,9 @@ int main(int argc, char* argv[], char** envp) {
     try {
         returnCode = _main(argc, argv, envp);
     } catch (mongo::DBException& e) {
-        cerr << "exception: " << e.what() << endl;
-        returnCode = 1;
+        severe() << "exception: " << e.what();
+        error() << "exiting with code " << static_cast<int>(kDBException);
+        returnCode = kDBException;
     }
     quickExit(returnCode);
 }

@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -34,12 +36,11 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_source.h"
-#include "mongo/s/move_chunk_request.h"
+#include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -68,7 +69,7 @@ public:
     Status awaitUntilCriticalSectionIsAppropriate(OperationContext* opCtx,
                                                   Milliseconds maxTimeToWait) override;
 
-    Status commitClone(OperationContext* opCtx) override;
+    StatusWith<BSONObj> commitClone(OperationContext* opCtx) override;
 
     void cancelClone(OperationContext* opCtx) override;
 
@@ -96,6 +97,18 @@ public:
      */
     const MigrationSessionId& getSessionId() const {
         return _sessionId;
+    }
+
+    /**
+     * Returns the rollback ID recorded at the beginning of session migration. If the underlying
+     * SessionCatalogMigrationSource does not exist, that means this node is running as a standalone
+     * and doesn't support retryable writes, so we return boost::none.
+     */
+    boost::optional<int> getRollbackIdAtInit() const {
+        if (_sessionCatalogSource) {
+            return _sessionCatalogSource->getRollbackIdAtInit();
+        }
+        return boost::none;
     }
 
     /**
@@ -132,15 +145,26 @@ public:
     Status nextModsBatch(OperationContext* opCtx, Database* db, BSONObjBuilder* builder);
 
     /**
-     * Appends to the buffer oplogs that contain session information for this migration.
-     * If this function returns a valid OpTime, this means that the oplog appended are
-     * not guaranteed to be majority committed and the caller has to use wait for the
-     * returned opTime to be majority committed.
+     * Appends to 'arrBuilder' oplog entries which wrote to the currently migrated chunk and contain
+     * session information.
+     *
+     * If this function returns a valid OpTime, this means that the oplog appended are not
+     * guaranteed to be majority committed and the caller has to wait for the returned opTime to be
+     * majority committed before returning them to the donor shard.
+     *
+     * If the underlying SessionCatalogMigrationSource does not exist, that means this node is
+     * running as a standalone and doesn't support retryable writes, so we return boost::none.
+     *
+     * This waiting is necessary because session migration is only allowed to send out committed
+     * entries, as opposed to chunk migration, which can send out uncommitted documents. With chunk
+     * migration, the uncommitted documents will not be visibile until the end of the migration
+     * commits, which means that if it fails, they won't be visible, whereas session oplog entries
+     * take effect immediately since they are appended to the chain.
      */
-    repl::OpTime nextSessionMigrationBatch(OperationContext* opCtx, BSONArrayBuilder* arrBuilder);
+    boost::optional<repl::OpTime> nextSessionMigrationBatch(OperationContext* opCtx,
+                                                            BSONArrayBuilder* arrBuilder);
 
 private:
-    friend class DeleteNotificationStage;
     friend class LogOpForShardingHandler;
 
     // Represents the states in which the cloner can be
@@ -197,11 +221,7 @@ private:
     // The resolved primary of the recipient shard
     const HostAndPort _recipientHost;
 
-    // Registered deletion notifications plan executor, which will listen for document deletions
-    // during the cloning stage
-    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _deleteNotifyExec;
-
-    SessionCatalogMigrationSource _sessionCatalogSource;
+    std::unique_ptr<SessionCatalogMigrationSource> _sessionCatalogSource;
 
     // Protects the entries below
     stdx::mutex _mutex;

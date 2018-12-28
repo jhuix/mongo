@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -216,7 +218,6 @@ void explodeScan(const IndexScanNode* isn,
         // Copy boring fields into new child.
         IndexScanNode* child = new IndexScanNode(isn->index);
         child->direction = isn->direction;
-        child->maxScan = isn->maxScan;
         child->addKeyMetadata = isn->addKeyMetadata;
         child->queryCollator = isn->queryCollator;
 
@@ -373,6 +374,12 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
             return false;
         }
 
+        if (isn->index.multikey && isn->index.multikeyPaths.empty()) {
+            // The index is multikey but has no path-level multikeyness metadata. In this case, the
+            // index can never provide a sort.
+            return false;
+        }
+
         // How many scans will we create if we blow up this ixscan?
         size_t numScans = 1;
 
@@ -405,7 +412,13 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
         // the bounds.
         BSONObjBuilder resultingSortBob;
         while (kpIt.more()) {
-            resultingSortBob.append(kpIt.next());
+            auto elem = kpIt.next();
+            if (isn->multikeyFields.find(elem.fieldNameStringData()) != isn->multikeyFields.end()) {
+                // One of the indexed fields providing the sort is multikey. It is not correct for a
+                // field with multikey components to provide a sort, so bail out.
+                return false;
+            }
+            resultingSortBob.append(elem);
         }
 
         // See if it's the order we're looking for.
@@ -603,12 +616,11 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
     return solnRoot;
 }
 
-// static
-QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(
+std::unique_ptr<QuerySolution> QueryPlannerAnalysis::analyzeDataAccess(
     const CanonicalQuery& query,
     const QueryPlannerParams& params,
     std::unique_ptr<QuerySolutionNode> solnRoot) {
-    unique_ptr<QuerySolution> soln(new QuerySolution());
+    auto soln = stdx::make_unique<QuerySolution>();
     soln->filterData = query.getQueryObj();
     soln->indexFilterApplied = params.indexFiltersApplied;
 
@@ -663,52 +675,12 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(
 
     const QueryRequest& qr = query.getQueryRequest();
 
-    // If we can (and should), add the keep mutations stage.
 
-    // We cannot keep mutated documents if:
-    //
-    // 1. The query requires an index to evaluate the predicate ($text).  We can't tell whether
-    // or not the doc actually satisfies the $text predicate since we can't evaluate a
-    // text MatchExpression.
-    //
-    // 2. The query implies a sort ($geoNear).  It would be rather expensive and hacky to merge
-    // the document at the right place.
-    //
-    // 3. There is an index-provided sort.  Ditto above comment about merging.
-    //
-    // 4. There is a SORT that is not at the root of solution tree. Ditto above comment about
-    // merging.
-    //
-    // TODO: do we want some kind of pre-planning step where we look for certain nodes and cache
-    // them?  We do lookups in the tree a few times.  This may not matter as most trees are
-    // shallow in terms of query nodes.
-    const bool hasNotRootSort = hasSortStage && STAGE_SORT != solnRoot->getType();
-
-    const bool cannotKeepFlagged = hasNode(solnRoot.get(), STAGE_TEXT) ||
-        hasNode(solnRoot.get(), STAGE_GEO_NEAR_2D) ||
-        hasNode(solnRoot.get(), STAGE_GEO_NEAR_2DSPHERE) ||
-        (!qr.getSort().isEmpty() && !hasSortStage) || hasNotRootSort;
-
-    // Only index intersection stages ever produce flagged results.
-    const bool couldProduceFlagged = hasAndHashStage || hasNode(solnRoot.get(), STAGE_AND_SORTED);
-
-    const bool shouldAddMutation = !cannotKeepFlagged && couldProduceFlagged;
-
-    if (shouldAddMutation && (params.options & QueryPlannerParams::KEEP_MUTATIONS)) {
-        KeepMutationsNode* keep = new KeepMutationsNode();
-
-        // We must run the entire expression tree to make sure the document is still valid.
-        keep->filter = query.root()->shallowClone();
-
-        if (STAGE_SORT == solnRoot->getType()) {
-            // We want to insert the invalidated results before the sort stage, if there is one.
-            verify(1 == solnRoot->children.size());
-            keep->children.push_back(solnRoot->children[0]);
-            solnRoot->children[0] = keep;
-        } else {
-            keep->children.push_back(solnRoot.release());
-            solnRoot.reset(keep);
-        }
+    if (qr.getSkip()) {
+        auto skip = std::make_unique<SkipNode>();
+        skip->skip = *qr.getSkip();
+        skip->children.push_back(solnRoot.release());
+        solnRoot = std::move(skip);
     }
 
     // Project the results.
@@ -817,13 +789,6 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(
         }
     }
 
-    if (qr.getSkip()) {
-        SkipNode* skip = new SkipNode();
-        skip->skip = *qr.getSkip();
-        skip->children.push_back(solnRoot.release());
-        solnRoot.reset(skip);
-    }
-
     // When there is both a blocking sort and a limit, the limit will
     // be enforced by the blocking sort.
     // Otherwise, we need to limit the results in the case of a hard limit
@@ -847,7 +812,7 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(
     }
 
     soln->root = std::move(solnRoot);
-    return soln.release();
+    return soln;
 }
 
 }  // namespace mongo

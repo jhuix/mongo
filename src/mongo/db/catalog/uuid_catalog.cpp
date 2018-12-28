@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,7 +34,9 @@
 #include "uuid_catalog.h"
 
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/uuid.h"
 
@@ -41,6 +45,56 @@ namespace {
 const ServiceContext::Decoration<UUIDCatalog> getCatalog =
     ServiceContext::declareDecoration<UUIDCatalog>();
 }  // namespace
+
+void UUIDCatalogObserver::onCreateCollection(OperationContext* opCtx,
+                                             Collection* coll,
+                                             const NamespaceString& collectionName,
+                                             const CollectionOptions& options,
+                                             const BSONObj& idIndex,
+                                             const OplogSlot& createOpTime) {
+    if (!options.uuid)
+        return;
+    UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
+    catalog.onCreateCollection(opCtx, coll, options.uuid.get());
+}
+
+void UUIDCatalogObserver::onCollMod(OperationContext* opCtx,
+                                    const NamespaceString& nss,
+                                    OptionalCollectionUUID uuid,
+                                    const BSONObj& collModCmd,
+                                    const CollectionOptions& oldCollOptions,
+                                    boost::optional<TTLCollModInfo> ttlInfo) {
+    if (!uuid)
+        return;
+    UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
+    Collection* catalogColl = catalog.lookupCollectionByUUID(uuid.get());
+    invariant(
+        catalogColl->uuid() == uuid,
+        str::stream() << (uuid ? uuid->toString() : "<no uuid>") << ","
+                      << (catalogColl->uuid() ? catalogColl->uuid()->toString() : "<no uuid>"));
+}
+
+repl::OpTime UUIDCatalogObserver::onDropCollection(OperationContext* opCtx,
+                                                   const NamespaceString& collectionName,
+                                                   OptionalCollectionUUID uuid,
+                                                   const CollectionDropType dropType) {
+
+    if (!uuid)
+        return {};
+
+    // Replicated drops are two-phase, meaning that the collection is first renamed into a "drop
+    // pending" state and reaped later. This op observer is only called for the rename phase, which
+    // means the UUID mapping is still valid.
+    //
+    // On the other hand, if the drop is not replicated, it takes effect immediately. In this case,
+    // the UUID mapping must be removed from the UUID catalog.
+    if (dropType == CollectionDropType::kOnePhase) {
+        UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
+        catalog.onDropCollection(opCtx, uuid.get());
+    }
+
+    return {};
+}
 
 UUIDCatalog& UUIDCatalog::get(ServiceContext* svcCtx) {
     return getCatalog(svcCtx);
@@ -52,8 +106,10 @@ UUIDCatalog& UUIDCatalog::get(OperationContext* opCtx) {
 void UUIDCatalog::onCreateCollection(OperationContext* opCtx,
                                      Collection* coll,
                                      CollectionUUID uuid) {
-    removeUUIDCatalogEntry(uuid);
-    registerUUIDCatalogEntry(uuid, coll);
+
+    stdx::lock_guard<stdx::mutex> lock(_catalogLock);
+    _removeUUIDCatalogEntry_inlock(uuid);  // Remove UUID if it exists
+    _registerUUIDCatalogEntry_inlock(uuid, coll);
     opCtx->recoveryUnit()->onRollback([this, uuid] { removeUUIDCatalogEntry(uuid); });
 }
 
@@ -63,25 +119,24 @@ void UUIDCatalog::onDropCollection(OperationContext* opCtx, CollectionUUID uuid)
         [this, foundColl, uuid] { registerUUIDCatalogEntry(uuid, foundColl); });
 }
 
-void UUIDCatalog::onRenameCollection(OperationContext* opCtx,
-                                     GetNewCollectionFunction getNewCollection,
-                                     CollectionUUID uuid) {
-    Collection* oldColl = removeUUIDCatalogEntry(uuid);
-    opCtx->recoveryUnit()->onCommit([this, getNewCollection, uuid] {
-        // Reset current UUID entry in case some other operation updates the UUID catalog before the
-        // WUOW is committed. registerUUIDCatalogEntry() is a no-op if there's an existing UUID
-        // entry.
-        removeUUIDCatalogEntry(uuid);
-        auto newColl = getNewCollection();
-        invariant(newColl);
-        registerUUIDCatalogEntry(uuid, newColl);
-    });
-    opCtx->recoveryUnit()->onRollback([this, oldColl, uuid] {
-        // Reset current UUID entry in case some other operation updates the UUID catalog before the
-        // WUOW is rolled back. registerUUIDCatalogEntry() is a no-op if there's an existing UUID
-        // entry.
-        removeUUIDCatalogEntry(uuid);
-        registerUUIDCatalogEntry(uuid, oldColl);
+void UUIDCatalog::setCollectionNamespace(OperationContext* opCtx,
+                                         Collection* coll,
+                                         const NamespaceString& fromCollection,
+                                         const NamespaceString& toCollection) {
+    // Rather than maintain, in addition to the UUID -> Collection* mapping, an auxiliary data
+    // structure with the UUID -> namespace mapping, the UUIDCatalog relies on Collection::ns() to
+    // provide UUID to namespace lookup. In addition, the UUIDCatalog does not require callers to
+    // hold locks.
+    //
+    // This means that Collection::ns() may be called while only '_catalogLock' (and no lock manager
+    // locks) are held. The purpose of this function is ensure that we write to the Collection's
+    // namespace string under '_catalogLock'.
+    invariant(coll);
+    stdx::lock_guard<stdx::mutex> lock(_catalogLock);
+    coll->setNs(toCollection);
+    opCtx->recoveryUnit()->onRollback([this, coll, fromCollection] {
+        stdx::lock_guard<stdx::mutex> lock(_catalogLock);
+        coll->setNs(std::move(fromCollection));
     });
 }
 
@@ -95,6 +150,22 @@ void UUIDCatalog::onCloseDatabase(Database* db) {
     }
 }
 
+void UUIDCatalog::onCloseCatalog(OperationContext* opCtx) {
+    invariant(opCtx->lockState()->isW());
+    stdx::lock_guard<stdx::mutex> lock(_catalogLock);
+    invariant(!_shadowCatalog);
+    _shadowCatalog.emplace();
+    for (auto entry : _catalog)
+        _shadowCatalog->insert({entry.first, entry.second->ns()});
+}
+
+void UUIDCatalog::onOpenCatalog(OperationContext* opCtx) {
+    invariant(opCtx->lockState()->isW());
+    stdx::lock_guard<stdx::mutex> lock(_catalogLock);
+    invariant(_shadowCatalog);
+    _shadowCatalog.reset();
+}
+
 Collection* UUIDCatalog::lookupCollectionByUUID(CollectionUUID uuid) const {
     stdx::lock_guard<stdx::mutex> lock(_catalogLock);
     auto foundIt = _catalog.find(uuid);
@@ -104,37 +175,36 @@ Collection* UUIDCatalog::lookupCollectionByUUID(CollectionUUID uuid) const {
 NamespaceString UUIDCatalog::lookupNSSByUUID(CollectionUUID uuid) const {
     stdx::lock_guard<stdx::mutex> lock(_catalogLock);
     auto foundIt = _catalog.find(uuid);
-    Collection* coll = foundIt == _catalog.end() ? nullptr : foundIt->second;
-    return foundIt == _catalog.end() ? NamespaceString() : coll->ns();
+    if (foundIt != _catalog.end())
+        return foundIt->second->ns();
+
+    // Only in the case that the catalog is closed and a UUID is currently unknown, resolve it
+    // using the pre-close state. This ensures that any tasks reloading the catalog can see their
+    // own updates.
+    if (_shadowCatalog) {
+        auto shadowIt = _shadowCatalog->find(uuid);
+        if (shadowIt != _shadowCatalog->end())
+            return shadowIt->second;
+    }
+    return NamespaceString();
 }
 
+Collection* UUIDCatalog::replaceUUIDCatalogEntry(CollectionUUID uuid, Collection* coll) {
+    stdx::lock_guard<stdx::mutex> lock(_catalogLock);
+    invariant(coll);
+    Collection* oldColl = _removeUUIDCatalogEntry_inlock(uuid);
+    invariant(oldColl != nullptr);  // Need to replace an existing coll
+    _registerUUIDCatalogEntry_inlock(uuid, coll);
+    return oldColl;
+}
 void UUIDCatalog::registerUUIDCatalogEntry(CollectionUUID uuid, Collection* coll) {
     stdx::lock_guard<stdx::mutex> lock(_catalogLock);
-
-    if (coll && !_catalog.count(uuid)) {
-        // Invalidate this database's ordering, since we're adding a new UUID.
-        _orderedCollections.erase(coll->ns().db());
-
-        std::pair<CollectionUUID, Collection*> entry = std::make_pair(uuid, coll);
-        LOG(2) << "registering collection " << coll->ns() << " with UUID " << uuid.toString();
-        invariant(_catalog.insert(entry).second == true);
-    }
+    _registerUUIDCatalogEntry_inlock(uuid, coll);
 }
 
 Collection* UUIDCatalog::removeUUIDCatalogEntry(CollectionUUID uuid) {
     stdx::lock_guard<stdx::mutex> lock(_catalogLock);
-
-    auto foundIt = _catalog.find(uuid);
-    if (foundIt == _catalog.end())
-        return nullptr;
-
-    // Invalidate this database's ordering, since we're deleting a UUID.
-    _orderedCollections.erase(foundIt->second->ns().db());
-
-    auto foundCol = foundIt->second;
-    LOG(2) << "unregistering collection " << foundCol->ns() << " with UUID " << uuid.toString();
-    _catalog.erase(foundIt);
-    return foundCol;
+    return _removeUUIDCatalogEntry_inlock(uuid);
 }
 
 boost::optional<CollectionUUID> UUIDCatalog::prev(const StringData& db, CollectionUUID uuid) {
@@ -183,5 +253,28 @@ const std::vector<CollectionUUID>& UUIDCatalog::_getOrdering_inlock(
     std::sort(newOrdering.begin(), newOrdering.end());
 
     return newOrdering;
+}
+void UUIDCatalog::_registerUUIDCatalogEntry_inlock(CollectionUUID uuid, Collection* coll) {
+    if (coll && !_catalog.count(uuid)) {
+        // Invalidate this database's ordering, since we're adding a new UUID.
+        _orderedCollections.erase(coll->ns().db());
+
+        std::pair<CollectionUUID, Collection*> entry = std::make_pair(uuid, coll);
+        LOG(2) << "registering collection " << coll->ns() << " with UUID " << uuid.toString();
+        invariant(_catalog.insert(entry).second == true);
+    }
+}
+Collection* UUIDCatalog::_removeUUIDCatalogEntry_inlock(CollectionUUID uuid) {
+    auto foundIt = _catalog.find(uuid);
+    if (foundIt == _catalog.end())
+        return nullptr;
+
+    // Invalidate this database's ordering, since we're deleting a UUID.
+    _orderedCollections.erase(foundIt->second->ns().db());
+
+    auto foundCol = foundIt->second;
+    LOG(2) << "unregistering collection " << foundCol->ns() << " with UUID " << uuid.toString();
+    _catalog.erase(foundIt);
+    return foundCol;
 }
 }  // namespace mongo

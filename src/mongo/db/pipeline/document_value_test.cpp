@@ -1,31 +1,31 @@
-// documenttests.cpp : Unit tests for Document, Value, and related classes.
 
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -1716,6 +1716,75 @@ public:
                         Value::deserializeForSorter(reader, Value::SorterDeserializeSettings()));
     }
 };
+
+namespace {
+
+// Integer limits.
+const int kIntMax = std::numeric_limits<int>::max();
+const int kIntMin = std::numeric_limits<int>::lowest();
+const long long kIntMaxAsLongLong = kIntMax;
+const long long kIntMinAsLongLong = kIntMin;
+const double kIntMaxAsDouble = kIntMax;
+const double kIntMinAsDouble = kIntMin;
+const Decimal128 kIntMaxAsDecimal = Decimal128(kIntMax);
+const Decimal128 kIntMinAsDecimal = Decimal128(kIntMin);
+
+// 64-bit integer limits.
+const long long kLongLongMax = std::numeric_limits<long long>::max();
+const long long kLongLongMin = std::numeric_limits<long long>::lowest();
+const double kLongLongMaxAsDouble = static_cast<double>(kLongLongMax);
+const double kLongLongMinAsDouble = static_cast<double>(kLongLongMin);
+const Decimal128 kLongLongMaxAsDecimal = Decimal128(static_cast<int64_t>(kLongLongMax));
+const Decimal128 kLongLongMinAsDecimal = Decimal128(static_cast<int64_t>(kLongLongMin));
+
+// Double limits.
+const double kDoubleMax = std::numeric_limits<double>::max();
+const double kDoubleMin = std::numeric_limits<double>::lowest();
+const Decimal128 kDoubleMaxAsDecimal = Decimal128(kDoubleMin);
+const Decimal128 kDoubleMinAsDecimal = Decimal128(kDoubleMin);
+
+}  // namespace
+
+TEST(ValueIntegral, CorrectlyIdentifiesValidIntegralValues) {
+    ASSERT_TRUE(Value(kIntMax).integral());
+    ASSERT_TRUE(Value(kIntMin).integral());
+    ASSERT_TRUE(Value(kIntMaxAsLongLong).integral());
+    ASSERT_TRUE(Value(kIntMinAsLongLong).integral());
+    ASSERT_TRUE(Value(kIntMaxAsDouble).integral());
+    ASSERT_TRUE(Value(kIntMinAsDouble).integral());
+    ASSERT_TRUE(Value(kIntMaxAsDecimal).integral());
+    ASSERT_TRUE(Value(kIntMinAsDecimal).integral());
+}
+
+TEST(ValueIntegral, CorrectlyIdentifiesInvalidIntegralValues) {
+    ASSERT_FALSE(Value(kLongLongMax).integral());
+    ASSERT_FALSE(Value(kLongLongMin).integral());
+    ASSERT_FALSE(Value(kLongLongMaxAsDouble).integral());
+    ASSERT_FALSE(Value(kLongLongMinAsDouble).integral());
+    ASSERT_FALSE(Value(kLongLongMaxAsDecimal).integral());
+    ASSERT_FALSE(Value(kLongLongMinAsDecimal).integral());
+    ASSERT_FALSE(Value(kDoubleMax).integral());
+    ASSERT_FALSE(Value(kDoubleMin).integral());
+}
+
+TEST(ValueIntegral, CorrectlyIdentifiesValid64BitIntegralValues) {
+    ASSERT_TRUE(Value(kIntMax).integral64Bit());
+    ASSERT_TRUE(Value(kIntMin).integral64Bit());
+    ASSERT_TRUE(Value(kLongLongMax).integral64Bit());
+    ASSERT_TRUE(Value(kLongLongMin).integral64Bit());
+    ASSERT_TRUE(Value(kLongLongMinAsDouble).integral64Bit());
+    ASSERT_TRUE(Value(kLongLongMaxAsDecimal).integral64Bit());
+    ASSERT_TRUE(Value(kLongLongMinAsDecimal).integral64Bit());
+}
+
+TEST(ValueIntegral, CorrectlyIdentifiesInvalid64BitIntegralValues) {
+    ASSERT_FALSE(Value(kLongLongMaxAsDouble).integral64Bit());
+    ASSERT_FALSE(Value(kDoubleMax).integral64Bit());
+    ASSERT_FALSE(Value(kDoubleMin).integral64Bit());
+    ASSERT_FALSE(Value(kDoubleMaxAsDecimal).integral64Bit());
+    ASSERT_FALSE(Value(kDoubleMinAsDecimal).integral64Bit());
+}
+
 }  // namespace Value
 
 class All : public Suite {

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,7 +32,6 @@
 
 #include "mongo/db/ops/parsed_update.h"
 
-#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/canonical_query.h"
@@ -43,7 +44,7 @@ namespace mongo {
 ParsedUpdate::ParsedUpdate(OperationContext* opCtx, const UpdateRequest* request)
     : _opCtx(opCtx),
       _request(request),
-      _driver(UpdateDriver::Options(new ExpressionContext(opCtx, nullptr))),
+      _driver(new ExpressionContext(opCtx, nullptr)),
       _canonicalQuery() {}
 
 Status ParsedUpdate::parseRequest() {
@@ -73,9 +74,7 @@ Status ParsedUpdate::parseRequest() {
     // may determine whether or not we need to produce a CanonicalQuery at all.  For example, if
     // the update involves the positional-dollar operator, we must have a CanonicalQuery even if
     // it isn't required for query execution.
-    status = parseUpdate();
-    if (!status.isOK())
-        return status;
+    parseUpdate();
     status = parseQuery();
     if (!status.isOK())
         return status;
@@ -140,34 +139,15 @@ Status ParsedUpdate::parseQueryToCQ() {
     return statusWithCQ.getStatus();
 }
 
-Status ParsedUpdate::parseUpdate() {
-    const NamespaceString& ns(_request->getNamespaceString());
-
-    // Should the modifiers validate their embedded docs via okForStorage
-    // Only user updates should be checked. Any system or replication stuff should pass through.
-    // Config db docs shouldn't get checked for valid field names since the shard key can have
-    // a dot (".") in it.
-    const bool shouldValidate =
-        !(_request->isFromOplogApplication() || ns.isConfigDB() || _request->isFromMigration());
-
+void ParsedUpdate::parseUpdate() {
+    _driver.setCollator(_collator.get());
     _driver.setLogOp(true);
-    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(_opCtx, _collator.get()));
-    _driver.setModOptions(ModifierInterface::Options(
-        _request->isFromOplogApplication(), shouldValidate, std::move(expCtx)));
+    _driver.setFromOplogApplication(_request->isFromOplogApplication());
 
-    return _driver.parse(_request->getUpdates(), _arrayFilters, _request->isMulti());
+    _driver.parse(_request->getUpdates(), _arrayFilters, _request->isMulti());
 }
 
 Status ParsedUpdate::parseArrayFilters() {
-    if (!_request->getArrayFilters().empty() &&
-        !serverGlobalParams.featureCompatibility.isFullyUpgradedTo36()) {
-        return Status(ErrorCodes::InvalidOptions,
-                      str::stream()
-                          << "The featureCompatibilityVersion must be 3.6 to use arrayFilters. See "
-                          << feature_compatibility_version::kDochubLink
-                          << ".");
-    }
-
     for (auto rawArrayFilter : _request->getArrayFilters()) {
         boost::intrusive_ptr<ExpressionContext> expCtx(
             new ExpressionContext(_opCtx, _collator.get()));
@@ -177,16 +157,13 @@ Status ParsedUpdate::parseArrayFilters() {
                                          ExtensionsCallbackNoop(),
                                          MatchExpressionParser::kBanAllSpecialFeatures);
         if (!parsedArrayFilter.isOK()) {
-            return Status(parsedArrayFilter.getStatus().code(),
-                          str::stream() << "Error parsing array filter: "
-                                        << parsedArrayFilter.getStatus().reason());
+            return parsedArrayFilter.getStatus().withContext("Error parsing array filter");
         }
         auto parsedArrayFilterWithPlaceholder =
             ExpressionWithPlaceholder::make(std::move(parsedArrayFilter.getValue()));
         if (!parsedArrayFilterWithPlaceholder.isOK()) {
-            return Status(parsedArrayFilterWithPlaceholder.getStatus().code(),
-                          str::stream() << "Error parsing array filter: "
-                                        << parsedArrayFilterWithPlaceholder.getStatus().reason());
+            return parsedArrayFilterWithPlaceholder.getStatus().withContext(
+                "Error parsing array filter");
         }
         auto finalArrayFilter = std::move(parsedArrayFilterWithPlaceholder.getValue());
         auto fieldName = finalArrayFilter->getPlaceholder();
@@ -209,18 +186,7 @@ Status ParsedUpdate::parseArrayFilters() {
 }
 
 PlanExecutor::YieldPolicy ParsedUpdate::yieldPolicy() const {
-    if (_request->isGod()) {
-        return PlanExecutor::NO_YIELD;
-    }
-    if (_request->getYieldPolicy() == PlanExecutor::YIELD_AUTO && isIsolated()) {
-        return PlanExecutor::WRITE_CONFLICT_RETRY_ONLY;  // Don't yield locks.
-    }
-    return _request->getYieldPolicy();
-}
-
-bool ParsedUpdate::isIsolated() const {
-    return _canonicalQuery.get() ? _canonicalQuery->isIsolated()
-                                 : QueryRequest::isQueryIsolated(_request->getQuery());
+    return _request->isGod() ? PlanExecutor::NO_YIELD : _request->getYieldPolicy();
 }
 
 bool ParsedUpdate::hasParsedQuery() const {

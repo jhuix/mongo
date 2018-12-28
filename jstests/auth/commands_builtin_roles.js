@@ -5,7 +5,13 @@ Exhaustive test for authorization of commands with builtin roles.
 The test logic implemented here operates on the test cases defined
 in jstests/auth/commands.js.
 
+@tags: [requires_sharding]
+
 */
+
+// TODO SERVER-35447: This test involves killing all sessions, which will not work as expected if
+// the kill command is sent with an implicit session.
+TestData.disableImplicitSessions = true;
 
 load("jstests/auth/lib/commands_lib.js");
 
@@ -53,7 +59,7 @@ function testProperAuthorization(conn, t, testcase, r) {
     authCommandsLib.authenticatedSetup(t, runOnDb);
     var command = t.command;
     if (typeof(command) === "function") {
-        command = t.command(state);
+        command = t.command(state, testcase.commandArgs);
     }
     var res = runOnDb.runCommand(command);
 
@@ -67,11 +73,6 @@ function testProperAuthorization(conn, t, testcase, r) {
             out = "command failed with " + tojson(res) + " on db " + testcase.runOnDb +
                 " with role " + r.key;
         }
-        // test can provide a function that will run if
-        // the command completed successfully
-        else if (testcase.onSuccess) {
-            testcase.onSuccess(res);
-        }
     } else {
         if (res.ok == 1 || (res.ok == 0 && res.code != authErrCode)) {
             out = "expected authorization failure" + " but received result " + tojson(res) +
@@ -80,7 +81,7 @@ function testProperAuthorization(conn, t, testcase, r) {
     }
 
     r.db.logout();
-    authCommandsLib.teardown(conn, t, runOnDb);
+    authCommandsLib.teardown(conn, t, runOnDb, res);
     return out;
 }
 
@@ -153,7 +154,12 @@ authCommandsLib.runTests(conn, impls);
 MongoRunner.stopMongod(conn);
 
 // run all tests sharded
-conn = new ShardingTest(
-    {shards: 2, mongos: 1, keyFile: "jstests/libs/key1", other: {shardOptions: opts}});
+// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
+conn = new ShardingTest({
+    shards: 2,
+    mongos: 1,
+    keyFile: "jstests/libs/key1",
+    other: {shardOptions: opts, shardAsReplicaSet: false}
+});
 authCommandsLib.runTests(conn, impls);
 conn.stop();

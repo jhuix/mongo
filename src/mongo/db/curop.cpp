@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2009 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 // CHECK_LOG_REDACTION
 
@@ -34,17 +36,24 @@
 
 #include "mongo/db/curop.h"
 
+#include <iomanip>
+
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/concurrency/locker.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/rpc/metadata/impersonated_user_metadata.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
@@ -57,15 +66,7 @@ namespace {
 // OP_QUERY find. The $orderby field is omitted because "orderby" (no dollar sign) is also allowed,
 // and this requires special handling.
 const std::vector<const char*> kDollarQueryModifiers = {
-    "$hint",
-    "$comment",
-    "$maxScan",
-    "$max",
-    "$min",
-    "$returnKey",
-    "$showDiskLoc",
-    "$snapshot",
-    "$maxTimeMS",
+    "$hint", "$comment", "$max", "$min", "$returnKey", "$showDiskLoc", "$snapshot", "$maxTimeMS",
 };
 
 }  // namespace
@@ -84,12 +85,12 @@ BSONObj upconvertQueryEntry(const BSONObj& query,
 
     // Extract the query predicate.
     BSONObj filter;
-    if (auto elem = query["query"]) {
+    if (query["query"].isABSONObj()) {
         predicateIsWrapped = true;
-        bob.appendAs(elem, "filter");
-    } else if (auto elem = query["$query"]) {
+        bob.appendAs(query["query"], "filter");
+    } else if (query["$query"].isABSONObj()) {
         predicateIsWrapped = true;
-        bob.appendAs(elem, "filter");
+        bob.appendAs(query["$query"], "filter");
     } else if (!query.isEmpty()) {
         bob.append("filter", query);
     }
@@ -224,7 +225,87 @@ CurOp* CurOp::get(const OperationContext& opCtx) {
     return _curopStack(opCtx).top();
 }
 
-CurOp::CurOp(OperationContext* opCtx) : CurOp(opCtx, &_curopStack(opCtx)) {}
+void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
+                                     Client* client,
+                                     bool truncateOps,
+                                     BSONObjBuilder* infoBuilder) {
+    invariant(client);
+    OperationContext* clientOpCtx = client->getOperationContext();
+
+    infoBuilder->append("type", "op");
+
+    const std::string hostName = getHostNameCachedAndPort();
+    infoBuilder->append("host", hostName);
+
+    client->reportState(*infoBuilder);
+    const auto& clientMetadata = ClientMetadataIsMasterState::get(client).getClientMetadata();
+
+    if (clientMetadata) {
+        auto appName = clientMetadata.get().getApplicationName();
+        if (!appName.empty()) {
+            infoBuilder->append("appName", appName);
+        }
+
+        auto clientMetadataDocument = clientMetadata.get().getDocument();
+        infoBuilder->append("clientMetadata", clientMetadataDocument);
+    }
+
+    // Fill out the rest of the BSONObj with opCtx specific details.
+    infoBuilder->appendBool("active", static_cast<bool>(clientOpCtx));
+    infoBuilder->append("currentOpTime",
+                        opCtx->getServiceContext()->getPreciseClockSource()->now().toString());
+
+    auto authSession = AuthorizationSession::get(client);
+    // Depending on whether we're impersonating or not, this might be "effectiveUsers" or
+    // "userImpersonators".
+    const auto serializeAuthenticatedUsers = [&](StringData name) {
+        if (authSession->isAuthenticated()) {
+            BSONArrayBuilder users(infoBuilder->subarrayStart(name));
+            for (auto userIt = authSession->getAuthenticatedUserNames(); userIt.more();
+                 userIt.next()) {
+                userIt->serializeToBSON(&users);
+            }
+        }
+    };
+
+    auto maybeImpersonationData = rpc::getImpersonatedUserMetadata(clientOpCtx);
+    if (maybeImpersonationData) {
+        BSONArrayBuilder users(infoBuilder->subarrayStart("effectiveUsers"));
+        for (const auto& user : maybeImpersonationData->getUsers()) {
+            user.serializeToBSON(&users);
+        }
+
+        users.doneFast();
+        serializeAuthenticatedUsers("userImpersonators"_sd);
+    } else {
+        serializeAuthenticatedUsers("effectiveUsers"_sd);
+    }
+
+    if (clientOpCtx) {
+        infoBuilder->append("opid", clientOpCtx->getOpID());
+        if (clientOpCtx->isKillPending()) {
+            infoBuilder->append("killPending", true);
+        }
+
+        if (auto lsid = clientOpCtx->getLogicalSessionId()) {
+            BSONObjBuilder lsidBuilder(infoBuilder->subobjStart("lsid"));
+            lsid->serialize(&lsidBuilder);
+        }
+
+        CurOp::get(clientOpCtx)->reportState(infoBuilder, truncateOps);
+    }
+}
+
+void CurOp::setGenericCursor_inlock(GenericCursor gc) {
+    _genericCursor = std::move(gc);
+}
+
+CurOp::CurOp(OperationContext* opCtx) : CurOp(opCtx, &_curopStack(opCtx)) {
+    // If this is a sub-operation, we store the snapshot of lock stats as the base lock stats of the
+    // current operation.
+    if (_parent != nullptr)
+        _lockStatsBase = opCtx->lockState()->getLockerInfo(boost::none)->stats;
+}
 
 CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) : _stack(stack) {
     if (opCtx) {
@@ -232,6 +313,32 @@ CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) : _stack(stack) {
     } else {
         _stack->push_nolock(this);
     }
+}
+
+CurOp::~CurOp() {
+    if (parent() != nullptr)
+        parent()->yielded(_numYields);
+    invariant(this == _stack->pop());
+}
+
+void CurOp::setGenericOpRequestDetails(OperationContext* opCtx,
+                                       const NamespaceString& nss,
+                                       const Command* command,
+                                       BSONObj cmdObj,
+                                       NetworkOp op) {
+    // Set the _isCommand flags based on network op only. For legacy writes on mongoS, we resolve
+    // them to OpMsgRequests and then pass them into the Commands path, so having a valid Command*
+    // here does not guarantee that the op was issued from the client using a command protocol.
+    const bool isCommand = (op == dbMsg || (op == dbQuery && nss.isCommand()));
+    auto logicalOp = (command ? command->getLogicalOp() : networkOpToLogicalOp(op));
+
+    stdx::lock_guard<Client> clientLock(*opCtx->getClient());
+    _isCommand = _debug.iscommand = isCommand;
+    _logicalOp = _debug.logicalOp = logicalOp;
+    _networkOp = _debug.networkOp = op;
+    _opDescription = cmdObj;
+    _command = command;
+    _ns = nss.ns();
 }
 
 ProgressMeter& CurOp::setMessage_inlock(const char* msg,
@@ -250,10 +357,6 @@ ProgressMeter& CurOp::setMessage_inlock(const char* msg,
     }
     _message = msg;
     return _progressMeter;
-}
-
-CurOp::~CurOp() {
-    invariant(this == _stack->pop());
 }
 
 void CurOp::setNS_inlock(StringData ns) {
@@ -276,6 +379,38 @@ void CurOp::enter_inlock(const char* ns, boost::optional<int> dbProfileLevel) {
 
 void CurOp::raiseDbProfileLevel(int dbProfileLevel) {
     _dbprofile = std::max(dbProfileLevel, _dbprofile);
+}
+
+bool CurOp::completeAndLogOperation(OperationContext* opCtx,
+                                    logger::LogComponent component,
+                                    boost::optional<size_t> responseLength,
+                                    boost::optional<long long> slowMsOverride,
+                                    bool forceLog) {
+    // Log the operation if it is eligible according to the current slowMS and sampleRate settings.
+    const bool shouldLogOp = (forceLog || shouldLog(component, logger::LogSeverity::Debug(1)));
+    const long long slowMs = slowMsOverride.value_or(serverGlobalParams.slowMS);
+
+    const auto client = opCtx->getClient();
+
+    // Record the size of the response returned to the client, if applicable.
+    if (responseLength) {
+        _debug.responseLength = *responseLength;
+    }
+
+    // Obtain the total execution time of this operation.
+    _end = curTimeMicros64();
+    _debug.executionTimeMicros = durationCount<Microseconds>(elapsedTimeExcludingPauses());
+
+    const bool shouldSample =
+        client->getPrng().nextCanonicalDouble() < serverGlobalParams.sampleRate;
+
+    if (shouldLogOp || (shouldSample && _debug.executionTimeMicros > slowMs * 1000LL)) {
+        auto lockerInfo = opCtx->lockState()->getLockerInfo(_lockStatsBase);
+        log(component) << _debug.report(client, *this, (lockerInfo ? &lockerInfo->stats : nullptr));
+    }
+
+    // Return 'true' if this operation should also be added to the profiler.
+    return shouldDBProfile(shouldSample);
 }
 
 Command::ReadWriteType CurOp::getReadWriteType() const {
@@ -339,6 +474,37 @@ void appendAsObjOrString(StringData name,
 }
 }  // namespace
 
+BSONObj CurOp::truncateAndSerializeGenericCursor(GenericCursor* cursor,
+                                                 boost::optional<size_t> maxQuerySize) {
+    // This creates a new builder to truncate the object that will go into the curOp output. In
+    // order to make sure the object is not too large but not truncate the comment, we only
+    // truncate the originatingCommand and not the entire cursor.
+    if (maxQuerySize) {
+        BSONObjBuilder tempObj;
+        appendAsObjOrString(
+            "truncatedObj", cursor->getOriginatingCommand().get(), maxQuerySize, &tempObj);
+        auto originatingCommand = tempObj.done().getObjectField("truncatedObj");
+        cursor->setOriginatingCommand(originatingCommand.getOwned());
+    }
+    // lsid, ns, and planSummary exist in the top level curop object, so they need to be temporarily
+    // removed from the cursor object to avoid duplicating information.
+    auto lsid = cursor->getLsid();
+    auto ns = cursor->getNs();
+    auto originalPlanSummary(cursor->getPlanSummary() ? boost::optional<std::string>(
+                                                            cursor->getPlanSummary()->toString())
+                                                      : boost::none);
+    cursor->setLsid(boost::none);
+    cursor->setNs(boost::none);
+    cursor->setPlanSummary(boost::none);
+    auto serialized = cursor->toBSON();
+    cursor->setLsid(lsid);
+    cursor->setNs(ns);
+    if (originalPlanSummary) {
+        cursor->setPlanSummary(StringData(*originalPlanSummary));
+    }
+    return serialized;
+}
+
 void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
     if (_start) {
         builder->append("secs_running", durationCount<Seconds>(elapsedTimeTotal()));
@@ -354,30 +520,15 @@ void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
     // is true, limit the size of each op to 1000 bytes. Otherwise, do not truncate.
     const boost::optional<size_t> maxQuerySize{truncateOps, 1000};
 
-    if (!_command && _networkOp == dbQuery) {
-        // This is a legacy OP_QUERY. We upconvert the "query" field of the currentOp output to look
-        // similar to a find command.
-        //
-        // CurOp doesn't have access to the ntoreturn or ntoskip values. By setting them to zero, we
-        // will omit mention of them in the currentOp output.
-        const int ntoreturn = 0;
-        const int ntoskip = 0;
-
-        appendAsObjOrString(
-            "command",
-            upconvertQueryEntry(_opDescription, NamespaceString(_ns), ntoreturn, ntoskip),
-            maxQuerySize,
-            builder);
-    } else {
-        appendAsObjOrString("command", _opDescription, maxQuerySize, builder);
-    }
-
-    if (!_originatingCommand.isEmpty()) {
-        appendAsObjOrString("originatingCommand", _originatingCommand, maxQuerySize, builder);
-    }
+    appendAsObjOrString("command", _opDescription, maxQuerySize, builder);
 
     if (!_planSummary.empty()) {
         builder->append("planSummary", _planSummary);
+    }
+
+    if (_genericCursor) {
+        builder->append("cursor",
+                        truncateAndSerializeGenericCursor(&(*_genericCursor), maxQuerySize));
     }
 
     if (!_message.empty()) {
@@ -403,8 +554,6 @@ StringData getProtoString(int op) {
         return "op_msg";
     } else if (op == dbQuery) {
         return "op_query";
-    } else if (op == dbCommand) {
-        return "op_command";
     }
     MONGO_UNREACHABLE;
 }
@@ -416,10 +565,13 @@ StringData getProtoString(int op) {
 #define OPDEBUG_TOSTRING_HELP_BOOL(x) \
     if (x)                            \
     s << " " #x ":" << (x)
+#define OPDEBUG_TOSTRING_HELP_OPTIONAL(x, y) \
+    if (y)                                   \
+    s << " " x ":" << (*y)
 
 string OpDebug::report(Client* client,
                        const CurOp& curop,
-                       const SingleThreadedLockStats& lockStats) const {
+                       const SingleThreadedLockStats* lockStats) const {
     StringBuilder s;
     if (iscommand)
         s << "command ";
@@ -436,28 +588,22 @@ string OpDebug::report(Client* client,
         }
     }
 
-    BSONObj query;
-
-    // If necessary, upconvert legacy find operations so that their log lines resemble their find
-    // command counterpart.
-    if (!iscommand && networkOp == dbQuery) {
-        query = upconvertQueryEntry(
-            curop.opDescription(), NamespaceString(curop.getNS()), ntoreturn, ntoskip);
-    } else {
-        query = curop.opDescription();
-    }
-
+    auto query = curop.opDescription();
     if (!query.isEmpty()) {
         s << " command: ";
         if (iscommand) {
-            Command* curCommand = curop.getCommand();
+            const Command* curCommand = curop.getCommand();
             if (curCommand) {
                 mutablebson::Document cmdToLog(query, mutablebson::Document::kInPlaceDisabled);
-                curCommand->redactForLogging(&cmdToLog);
+                curCommand->snipForLogging(&cmdToLog);
                 s << curCommand->getName() << " ";
                 s << redact(cmdToLog.getObject());
-            } else {  // Should not happen but we need to handle curCommand == NULL gracefully.
-                s << redact(query);
+            } else {
+                // Should not happen but we need to handle curCommand == NULL gracefully.
+                // We don't know what the request payload is intended to be, so it might be
+                // sensitive, and we don't know how to redact it properly without a 'Command*'.
+                // So we just don't log it at all.
+                s << "unrecognized";
             }
         } else {
             s << redact(query);
@@ -470,58 +616,60 @@ string OpDebug::report(Client* client,
     }
 
     if (!curop.getPlanSummary().empty()) {
-        s << " planSummary: " << redact(curop.getPlanSummary().toString());
+        s << " planSummary: " << curop.getPlanSummary().toString();
     }
 
+    OPDEBUG_TOSTRING_HELP(nShards);
     OPDEBUG_TOSTRING_HELP(cursorid);
     OPDEBUG_TOSTRING_HELP(ntoreturn);
     OPDEBUG_TOSTRING_HELP(ntoskip);
     OPDEBUG_TOSTRING_HELP_BOOL(exhaust);
 
-    OPDEBUG_TOSTRING_HELP(keysExamined);
-    OPDEBUG_TOSTRING_HELP(docsExamined);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("keysExamined", additiveMetrics.keysExamined);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("docsExamined", additiveMetrics.docsExamined);
     OPDEBUG_TOSTRING_HELP_BOOL(hasSortStage);
+    OPDEBUG_TOSTRING_HELP_BOOL(usedDisk);
     OPDEBUG_TOSTRING_HELP_BOOL(fromMultiPlanner);
     OPDEBUG_TOSTRING_HELP_BOOL(replanned);
-    OPDEBUG_TOSTRING_HELP(nMatched);
-    OPDEBUG_TOSTRING_HELP(nModified);
-    OPDEBUG_TOSTRING_HELP(ninserted);
-    OPDEBUG_TOSTRING_HELP(ndeleted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("nMatched", additiveMetrics.nMatched);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("nModified", additiveMetrics.nModified);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("ninserted", additiveMetrics.ninserted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("ndeleted", additiveMetrics.ndeleted);
     OPDEBUG_TOSTRING_HELP_BOOL(fastmodinsert);
     OPDEBUG_TOSTRING_HELP_BOOL(upsert);
     OPDEBUG_TOSTRING_HELP_BOOL(cursorExhausted);
 
-    if (nmoved > 0) {
-        s << " nmoved:" << nmoved;
-    }
-
-    if (keysInserted > 0) {
-        s << " keysInserted:" << keysInserted;
-    }
-
-    if (keysDeleted > 0) {
-        s << " keysDeleted:" << keysDeleted;
-    }
-
-    if (writeConflicts > 0) {
-        s << " writeConflicts:" << writeConflicts;
-    }
-
-    if (!exceptionInfo.isOK()) {
-        s << " exception: " << redact(exceptionInfo.reason());
-        s << " code:" << exceptionInfo.code();
-    }
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("nmoved", additiveMetrics.nmoved);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("keysInserted", additiveMetrics.keysInserted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("keysDeleted", additiveMetrics.keysDeleted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("prepareReadConflicts", additiveMetrics.prepareReadConflicts);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("writeConflicts", additiveMetrics.writeConflicts);
 
     s << " numYields:" << curop.numYields();
-
     OPDEBUG_TOSTRING_HELP(nreturned);
+
+    if (queryHash) {
+        s << " queryHash:" << unsignedIntToFixedLengthHex(*queryHash);
+        invariant(planCacheKey);
+        s << " planCacheKey:" << unsignedIntToFixedLengthHex(*planCacheKey);
+    }
+
+    if (!errInfo.isOK()) {
+        s << " ok:" << 0;
+        if (!errInfo.reason().empty()) {
+            s << " errMsg:\"" << escape(redact(errInfo.reason())) << "\"";
+        }
+        s << " errName:" << errInfo.code();
+        s << " errCode:" << static_cast<int>(errInfo.code());
+    }
+
     if (responseLength > 0) {
         s << " reslen:" << responseLength;
     }
 
-    {
+    if (lockStats) {
         BSONObjBuilder locks;
-        lockStats.report(&locks);
+        lockStats->report(&locks);
         s << " locks:" << locks.obj().toString();
     }
 
@@ -540,6 +688,9 @@ string OpDebug::report(Client* client,
 #define OPDEBUG_APPEND_BOOL(x) \
     if (x)                     \
     b.appendBool(#x, (x))
+#define OPDEBUG_APPEND_OPTIONAL(x, y) \
+    if (y)                            \
+    b.appendNumber(x, (*y))
 
 void OpDebug::append(const CurOp& curop,
                      const SingleThreadedLockStats& lockStats,
@@ -551,65 +702,60 @@ void OpDebug::append(const CurOp& curop,
     NamespaceString nss = NamespaceString(curop.getNS());
     b.append("ns", nss.ns());
 
-    if (!iscommand && networkOp == dbQuery) {
-        appendAsObjOrString("command",
-                            upconvertQueryEntry(curop.opDescription(), nss, ntoreturn, ntoskip),
-                            maxElementSize,
-                            &b);
-    } else if (curop.haveOpDescription()) {
-        appendAsObjOrString("command", curop.opDescription(), maxElementSize, &b);
-    }
+    appendAsObjOrString("command", curop.opDescription(), maxElementSize, &b);
 
     auto originatingCommand = curop.originatingCommand();
     if (!originatingCommand.isEmpty()) {
         appendAsObjOrString("originatingCommand", originatingCommand, maxElementSize, &b);
     }
 
+    OPDEBUG_APPEND_NUMBER(nShards);
     OPDEBUG_APPEND_NUMBER(cursorid);
     OPDEBUG_APPEND_BOOL(exhaust);
 
-    OPDEBUG_APPEND_NUMBER(keysExamined);
-    OPDEBUG_APPEND_NUMBER(docsExamined);
+    OPDEBUG_APPEND_OPTIONAL("keysExamined", additiveMetrics.keysExamined);
+    OPDEBUG_APPEND_OPTIONAL("docsExamined", additiveMetrics.docsExamined);
     OPDEBUG_APPEND_BOOL(hasSortStage);
+    OPDEBUG_APPEND_BOOL(usedDisk);
     OPDEBUG_APPEND_BOOL(fromMultiPlanner);
     OPDEBUG_APPEND_BOOL(replanned);
-    OPDEBUG_APPEND_NUMBER(nMatched);
-    OPDEBUG_APPEND_NUMBER(nModified);
-    OPDEBUG_APPEND_NUMBER(ninserted);
-    OPDEBUG_APPEND_NUMBER(ndeleted);
+    OPDEBUG_APPEND_OPTIONAL("nMatched", additiveMetrics.nMatched);
+    OPDEBUG_APPEND_OPTIONAL("nModified", additiveMetrics.nModified);
+    OPDEBUG_APPEND_OPTIONAL("ninserted", additiveMetrics.ninserted);
+    OPDEBUG_APPEND_OPTIONAL("ndeleted", additiveMetrics.ndeleted);
     OPDEBUG_APPEND_BOOL(fastmodinsert);
     OPDEBUG_APPEND_BOOL(upsert);
     OPDEBUG_APPEND_BOOL(cursorExhausted);
 
-    if (nmoved > 0) {
-        b.appendNumber("nmoved", nmoved);
-    }
-
-    if (keysInserted > 0) {
-        b.appendNumber("keysInserted", keysInserted);
-    }
-
-    if (keysDeleted > 0) {
-        b.appendNumber("keysDeleted", keysDeleted);
-    }
-
-    if (writeConflicts > 0) {
-        b.appendNumber("writeConflicts", writeConflicts);
-    }
+    OPDEBUG_APPEND_OPTIONAL("nmoved", additiveMetrics.nmoved);
+    OPDEBUG_APPEND_OPTIONAL("keysInserted", additiveMetrics.keysInserted);
+    OPDEBUG_APPEND_OPTIONAL("keysDeleted", additiveMetrics.keysDeleted);
+    OPDEBUG_APPEND_OPTIONAL("prepareReadConflicts", additiveMetrics.prepareReadConflicts);
+    OPDEBUG_APPEND_OPTIONAL("writeConflicts", additiveMetrics.writeConflicts);
 
     b.appendNumber("numYield", curop.numYields());
+    OPDEBUG_APPEND_NUMBER(nreturned);
+
+    if (queryHash) {
+        b.append("queryHash", unsignedIntToFixedLengthHex(*queryHash));
+        invariant(planCacheKey);
+        b.append("planCacheKey", unsignedIntToFixedLengthHex(*planCacheKey));
+    }
 
     {
         BSONObjBuilder locks(b.subobjStart("locks"));
         lockStats.report(&locks);
     }
 
-    if (!exceptionInfo.isOK()) {
-        b.append("exception", exceptionInfo.reason());
-        b.append("exceptionCode", exceptionInfo.code());
+    if (!errInfo.isOK()) {
+        b.appendNumber("ok", 0.0);
+        if (!errInfo.reason().empty()) {
+            b.append("errMsg", errInfo.reason());
+        }
+        b.append("errName", ErrorCodes::errorString(errInfo.code()));
+        b.append("errCode", errInfo.code());
     }
 
-    OPDEBUG_APPEND_NUMBER(nreturned);
     OPDEBUG_APPEND_NUMBER(responseLength);
     if (iscommand) {
         b.append("protocol", getProtoString(networkOp));
@@ -626,11 +772,113 @@ void OpDebug::append(const CurOp& curop,
 }
 
 void OpDebug::setPlanSummaryMetrics(const PlanSummaryStats& planSummaryStats) {
-    keysExamined = planSummaryStats.totalKeysExamined;
-    docsExamined = planSummaryStats.totalDocsExamined;
+    additiveMetrics.keysExamined = planSummaryStats.totalKeysExamined;
+    additiveMetrics.docsExamined = planSummaryStats.totalDocsExamined;
     hasSortStage = planSummaryStats.hasSortStage;
+    usedDisk = planSummaryStats.usedDisk;
     fromMultiPlanner = planSummaryStats.fromMultiPlanner;
     replanned = planSummaryStats.replanned;
+}
+
+namespace {
+
+/**
+ * Adds two boost::optional long longs together. Returns boost::none if both 'lhs' and 'rhs' are
+ * uninitialized, or the sum of 'lhs' and 'rhs' if they are both initialized. Returns 'lhs' if only
+ * 'rhs' is uninitialized and vice-versa.
+ */
+boost::optional<long long> addOptionalLongs(const boost::optional<long long>& lhs,
+                                            const boost::optional<long long>& rhs) {
+    if (!rhs) {
+        return lhs;
+    }
+    return lhs ? (*lhs + *rhs) : rhs;
+}
+}  // namespace
+
+void OpDebug::AdditiveMetrics::add(const AdditiveMetrics& otherMetrics) {
+    keysExamined = addOptionalLongs(keysExamined, otherMetrics.keysExamined);
+    docsExamined = addOptionalLongs(docsExamined, otherMetrics.docsExamined);
+    nMatched = addOptionalLongs(nMatched, otherMetrics.nMatched);
+    nModified = addOptionalLongs(nModified, otherMetrics.nModified);
+    ninserted = addOptionalLongs(ninserted, otherMetrics.ninserted);
+    ndeleted = addOptionalLongs(ndeleted, otherMetrics.ndeleted);
+    nmoved = addOptionalLongs(nmoved, otherMetrics.nmoved);
+    keysInserted = addOptionalLongs(keysInserted, otherMetrics.keysInserted);
+    keysDeleted = addOptionalLongs(keysDeleted, otherMetrics.keysDeleted);
+    prepareReadConflicts =
+        addOptionalLongs(prepareReadConflicts, otherMetrics.prepareReadConflicts);
+    writeConflicts = addOptionalLongs(writeConflicts, otherMetrics.writeConflicts);
+}
+
+bool OpDebug::AdditiveMetrics::equals(const AdditiveMetrics& otherMetrics) {
+    return keysExamined == otherMetrics.keysExamined && docsExamined == otherMetrics.docsExamined &&
+        nMatched == otherMetrics.nMatched && nModified == otherMetrics.nModified &&
+        ninserted == otherMetrics.ninserted && ndeleted == otherMetrics.ndeleted &&
+        nmoved == otherMetrics.nmoved && keysInserted == otherMetrics.keysInserted &&
+        keysDeleted == otherMetrics.keysDeleted &&
+        prepareReadConflicts == otherMetrics.prepareReadConflicts &&
+        writeConflicts == otherMetrics.writeConflicts;
+}
+
+void OpDebug::AdditiveMetrics::incrementWriteConflicts(long long n) {
+    if (!writeConflicts) {
+        writeConflicts = 0;
+    }
+    *writeConflicts += n;
+}
+
+void OpDebug::AdditiveMetrics::incrementKeysInserted(long long n) {
+    if (!keysInserted) {
+        keysInserted = 0;
+    }
+    *keysInserted += n;
+}
+
+void OpDebug::AdditiveMetrics::incrementKeysDeleted(long long n) {
+    if (!keysDeleted) {
+        keysDeleted = 0;
+    }
+    *keysDeleted += n;
+}
+
+void OpDebug::AdditiveMetrics::incrementNmoved(long long n) {
+    if (!nmoved) {
+        nmoved = 0;
+    }
+    *nmoved += n;
+}
+
+void OpDebug::AdditiveMetrics::incrementNinserted(long long n) {
+    if (!ninserted) {
+        ninserted = 0;
+    }
+    *ninserted += n;
+}
+
+void OpDebug::AdditiveMetrics::incrementPrepareReadConflicts(long long n) {
+    if (!prepareReadConflicts) {
+        prepareReadConflicts = 0;
+    }
+    *prepareReadConflicts += n;
+}
+
+string OpDebug::AdditiveMetrics::report() const {
+    StringBuilder s;
+
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("keysExamined", keysExamined);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("docsExamined", docsExamined);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("nMatched", nMatched);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("nModified", nModified);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("ninserted", ninserted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("ndeleted", ndeleted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("nmoved", nmoved);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("keysInserted", keysInserted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("keysDeleted", keysDeleted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("prepareReadConflicts", prepareReadConflicts);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("writeConflicts", writeConflicts);
+
+    return s.str();
 }
 
 }  // namespace mongo

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,12 +36,11 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
-#include "mongo/db/repl/topology_coordinator_impl.h"
+#include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/unittest/unittest.h"
@@ -124,9 +125,13 @@ TEST_F(ReplCoordHBV1Test,
     hbResp.setState(MemberState::RS_PRIMARY);
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setConfig(rsConfig);
+    // The smallest valid optime in PV1.
+    OpTime opTime(Timestamp(), 0);
+    hbResp.setAppliedOpTime(opTime);
+    hbResp.setDurableOpTime(opTime);
     BSONObjBuilder responseBuilder;
     responseBuilder << "ok" << 1;
-    hbResp.addToBSON(&responseBuilder, true);
+    hbResp.addToBSON(&responseBuilder);
     net->scheduleResponse(
         noi, startDate + Milliseconds(200), makeResponseStatus(responseBuilder.obj()));
     assertRunUntil(startDate + Milliseconds(200));
@@ -194,9 +199,13 @@ TEST_F(ReplCoordHBV1Test,
     hbResp.setState(MemberState::RS_PRIMARY);
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setConfig(rsConfig);
+    // The smallest valid optime in PV1.
+    OpTime opTime(Timestamp(), 0);
+    hbResp.setAppliedOpTime(opTime);
+    hbResp.setDurableOpTime(opTime);
     BSONObjBuilder responseBuilder;
     responseBuilder << "ok" << 1;
-    hbResp.addToBSON(&responseBuilder, true);
+    hbResp.addToBSON(&responseBuilder);
     net->scheduleResponse(
         noi, startDate + Milliseconds(200), makeResponseStatus(responseBuilder.obj()));
     assertRunUntil(startDate + Milliseconds(200));
@@ -264,12 +273,16 @@ TEST_F(ReplCoordHBV1Test,
     hbResp.setState(MemberState::RS_PRIMARY);
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setConfig(rsConfig);
+    // The smallest valid optime in PV1.
+    OpTime opTime(Timestamp(), 0);
+    hbResp.setAppliedOpTime(opTime);
+    hbResp.setDurableOpTime(opTime);
     BSONObjBuilder responseBuilder;
     responseBuilder << "ok" << 1;
-    hbResp.addToBSON(&responseBuilder, true);
+    hbResp.addToBSON(&responseBuilder);
     net->scheduleResponse(
-        noi, startDate + Milliseconds(200), makeResponseStatus(responseBuilder.obj()));
-    assertRunUntil(startDate + Milliseconds(2200));
+        noi, startDate + Milliseconds(50), makeResponseStatus(responseBuilder.obj()));
+    assertRunUntil(startDate + Milliseconds(550));
 
     // Because the new config is stored using an out-of-band thread, we need to perform some
     // extra synchronization to let the executor finish the heartbeat reconfig.  We know that
@@ -374,17 +387,18 @@ TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotM
         hbResp.setSetName(rsConfig.getReplSetName());
         hbResp.setState(MemberState::RS_PRIMARY);
         hbResp.setConfigVersion(rsConfig.getConfigVersion());
+        hbResp.setAppliedOpTime(opTime);
+        hbResp.setDurableOpTime(opTime);
 
         BSONObjBuilder responseBuilder;
         responseBuilder << "ok" << 1;
-        hbResp.addToBSON(&responseBuilder, true);
+        hbResp.addToBSON(&responseBuilder);
 
         rpc::ReplSetMetadata metadata(
             opTime.getTerm(), opTime, opTime, rsConfig.getConfigVersion(), unexpectedId, 1, -1);
-        BSONObjBuilder metadataBuilder;
-        metadata.writeToMetadata(&metadataBuilder).transitional_ignore();
+        uassertStatusOK(metadata.writeToMetadata(&responseBuilder));
 
-        heartbeatResponse = makeResponseStatus(responseBuilder.obj(), metadataBuilder.obj());
+        heartbeatResponse = makeResponseStatus(responseBuilder.obj());
     }
 
     // process heartbeat

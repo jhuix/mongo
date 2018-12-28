@@ -1,30 +1,33 @@
 // processinfo_win32.cpp
 
-/*    Copyright 2009 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
@@ -77,7 +80,7 @@ ProcessInfo::ProcessInfo(ProcessId pid) {}
 ProcessInfo::~ProcessInfo() {}
 
 // get the number of CPUs available to the current process
-boost::optional<unsigned long> ProcessInfo::getNumAvailableCores() {
+boost::optional<unsigned long> ProcessInfo::getNumCoresForProcess() {
     DWORD_PTR process_mask, system_mask;
 
     if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask)) {
@@ -213,61 +216,6 @@ bool getFileVersion(const char* filePath, DWORD& fileVersionMS, DWORD& fileVersi
     return true;
 }
 
-// If the version of the ntfs.sys driver shows that the KB2731284 hotfix or a later update
-// is installed, zeroing out data files is unnecessary. The file version numbers used below
-// are taken from the Hotfix File Information at http://support.microsoft.com/kb/2731284.
-// In https://support.microsoft.com/en-us/kb/3121255, the LDR branch prefix for SP1 is now
-// .23xxxx since patch numbers have rolled over to the next range.
-// Windows 7 RTM has not received patches for KB3121255.
-bool isKB2731284OrLaterUpdateInstalled() {
-    UINT pathBufferSize = GetSystemDirectoryA(NULL, 0);
-    if (pathBufferSize == 0) {
-        DWORD gle = GetLastError();
-        warning() << "GetSystemDirectoryA failed with " << errnoWithDescription(gle);
-        return false;
-    }
-
-    std::unique_ptr<char[]> systemDirectory(new char[pathBufferSize]);
-    UINT systemDirectoryPathLen;
-    systemDirectoryPathLen = GetSystemDirectoryA(systemDirectory.get(), pathBufferSize);
-    if (systemDirectoryPathLen == 0) {
-        DWORD gle = GetLastError();
-        warning() << "GetSystemDirectoryA failed with " << errnoWithDescription(gle);
-        return false;
-    }
-
-    if (systemDirectoryPathLen != pathBufferSize - 1) {
-        warning() << "GetSystemDirectoryA returned unexpected path length";
-        return false;
-    }
-
-    string ntfsDotSysPath = systemDirectory.get();
-    if (ntfsDotSysPath.back() != '\\') {
-        ntfsDotSysPath.append("\\");
-    }
-    ntfsDotSysPath.append("drivers\\ntfs.sys");
-    DWORD fileVersionMS;
-    DWORD fileVersionLS;
-    if (getFileVersion(ntfsDotSysPath.c_str(), fileVersionMS, fileVersionLS)) {
-        WORD fileVersionFirstNumber = HIWORD(fileVersionMS);
-        WORD fileVersionSecondNumber = LOWORD(fileVersionMS);
-        WORD fileVersionThirdNumber = HIWORD(fileVersionLS);
-        WORD fileVersionFourthNumber = LOWORD(fileVersionLS);
-
-        if (fileVersionFirstNumber == 6 && fileVersionSecondNumber == 1 &&
-            fileVersionThirdNumber == 7600 && fileVersionFourthNumber >= 21296 &&
-            fileVersionFourthNumber <= 21999) {
-            return true;
-        } else if (fileVersionFirstNumber == 6 && fileVersionSecondNumber == 1 &&
-                   fileVersionThirdNumber == 7601 && fileVersionFourthNumber >= 22083 &&
-                   fileVersionFourthNumber <= 23999) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 void ProcessInfo::SystemInfo::collectSystemInfo() {
     BSONObjBuilder bExtra;
     stringstream verstr;
@@ -291,7 +239,12 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     // get OS version info
     ZeroMemory(&osvi, sizeof(osvi));
     osvi.dwOSVersionInfoSize = sizeof(osvi);
+#pragma warning(push)
+// GetVersionEx is deprecated
+#pragma warning(disable : 4996)
     if (GetVersionEx((OSVERSIONINFO*)&osvi)) {
+#pragma warning(pop)
+
         verstr << osvi.dwMajorVersion << "." << osvi.dwMinorVersion;
         if (osvi.wServicePackMajor)
             verstr << " SP" << osvi.wServicePackMajor;
@@ -299,6 +252,12 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
 
         osName = "Microsoft ";
         switch (osvi.dwMajorVersion) {
+            case 10:
+                if (osvi.wProductType == VER_NT_WORKSTATION)
+                    osName += "Windows 10";
+                else
+                    osName += "Windows Server 2016";
+                break;
             case 6:
                 switch (osvi.dwMinorVersion) {
                     case 3:
@@ -318,19 +277,6 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
                             osName += "Windows 7";
                         else
                             osName += "Windows Server 2008 R2";
-
-                        // Windows 6.1 is either Windows 7 or Windows 2008 R2. There is no SP2 for
-                        // either of these two operating systems, but the check will hold if one
-                        // were released. This code assumes that SP2 will include fix for
-                        // http://support.microsoft.com/kb/2731284.
-                        //
-                        if ((osvi.wServicePackMajor >= 0) && (osvi.wServicePackMajor < 2)) {
-                            if (isKB2731284OrLaterUpdateInstalled()) {
-                                fileZeroNeeded = false;
-                            } else {
-                                fileZeroNeeded = true;
-                            }
-                        }
                         break;
                     case 0:
                         if (osvi.wProductType == VER_NT_WORKSTATION)
@@ -344,25 +290,8 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
                         break;
                 }
                 break;
-            case 5:
-                switch (osvi.dwMinorVersion) {
-                    case 2:
-                        osName += "Windows Server 2003";
-                        break;
-                    case 1:
-                        osName += "Windows XP";
-                        break;
-                    case 0:
-                        if (osvi.wProductType == VER_NT_WORKSTATION)
-                            osName += "Windows 2000 Professional";
-                        else
-                            osName += "Windows 2000 Server";
-                        break;
-                    default:
-                        osName += "Windows NT version ";
-                        osName += verstr.str();
-                        break;
-                }
+            default:
+                osName += "Windows";
                 break;
         }
     } else {
@@ -437,6 +366,8 @@ bool ProcessInfo::checkNumaEnabled() {
 }
 
 bool ProcessInfo::blockCheckSupported() {
+    sysInfo();  // Initialize SystemInfo, which calls collectSystemInfo(), which creates
+                // psapiGlobal.
     return psapiGlobal->supported;
 }
 

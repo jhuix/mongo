@@ -1,11 +1,11 @@
 // Cannot implicitly shard accessed collections because of collection existing when none
 // expected.
-// @tags: [assumes_no_implicit_collection_creation_after_drop]
+// @tags: [assumes_no_implicit_collection_creation_after_drop, requires_getmore]
 
 // Basic functional tests for the listCollections command.
 //
-// Note that storage engines are allowed to advertise internal collections to the user (in
-// particular, the MMAPv1 storage engine currently advertises the "system.indexes" collection).
+// Note that storage engines used to be allowed to advertise internal collections to the user (in
+// particular, the MMAPv1 storage engine used to advertise the "system.indexes" collection).
 // Hence, this test suite does not test for a particular number of collections returned in
 // listCollections output, but rather tests for existence or absence of particular collections in
 // listCollections output.
@@ -56,20 +56,6 @@
     assert.eq("view", collObj.type, tojson(collObj));
     assert.eq(true, collObj.info.readOnly, tojson(collObj));
     assert(!collObj.hasOwnProperty("idIndex"), tojson(collObj));
-
-    //
-    // Test basic command output for system.indexes.
-    //
-
-    collObj = res.cursor.firstBatch.filter(function(c) {
-        return c.name === "system.indexes";
-    })[0];
-    if (collObj) {
-        assert.eq("object", typeof(collObj.options), tojson(collObj));
-        assert.eq("collection", collObj.type, tojson(collObj));
-        assert.eq(false, collObj.info.readOnly, tojson(collObj));
-        assert(!collObj.hasOwnProperty("idIndex"), tojson(collObj));
-    }
 
     //
     // Test basic usage with DBCommandCursor.

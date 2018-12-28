@@ -1,37 +1,40 @@
 // dbhash.cpp
 
+
 /**
-*    Copyright (C) 2013-2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include <boost/optional.hpp>
 #include <map>
 #include <string>
 
@@ -44,10 +47,11 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -62,13 +66,24 @@ public:
         return false;
     }
 
-    virtual bool slaveOk() const {
-        return true;
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kRead;
+    }
+
+    bool supportsReadConcern(const std::string& dbName,
+                             const BSONObj& cmdObj,
+                             repl::ReadConcernLevel level) const override {
+        return level == repl::ReadConcernLevel::kLocalReadConcern ||
+            level == repl::ReadConcernLevel::kSnapshotReadConcern;
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::dbHash);
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
@@ -101,7 +116,14 @@ public:
 
         // We lock the entire database in S-mode in order to ensure that the contents will not
         // change for the snapshot.
-        AutoGetDb autoDb(opCtx, ns, MODE_S);
+        auto lockMode = LockMode::MODE_S;
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        if (txnParticipant && txnParticipant->inMultiDocumentTransaction()) {
+            // However, if we are inside a multi-statement transaction, then we only need to lock
+            // the database in intent mode to ensure that none of the collections get dropped.
+            lockMode = getLockModeForQuery(opCtx);
+        }
+        AutoGetDb autoDb(opCtx, ns, lockMode);
         Database* db = autoDb.getDb();
         std::list<std::string> colls;
         if (db) {
@@ -123,6 +145,8 @@ public:
                                                                "system.version",
                                                                "system.views"};
 
+        BSONArrayBuilder cappedCollections;
+        BSONObjBuilder collectionsByUUID;
 
         BSONObjBuilder bb(result.subobjStart("collections"));
         for (const auto& collectionName : colls) {
@@ -140,6 +164,11 @@ public:
             if (collNss.isSystem() && !isReplicatedSystemColl)
                 continue;
 
+            if (collNss.coll().startsWith("tmp.mr.")) {
+                // We skip any incremental map reduce collections as they also aren't replicated.
+                continue;
+            }
+
             if (desiredCollections.size() > 0 &&
                 desiredCollections.count(collNss.coll().toString()) == 0)
                 continue;
@@ -148,6 +177,16 @@ public:
             if (collNss.isDropPendingNamespace())
                 continue;
 
+            if (Collection* collection = db->getCollection(opCtx, collectionName)) {
+                if (collection->isCapped()) {
+                    cappedCollections.append(collNss.coll());
+                }
+
+                if (OptionalCollectionUUID uuid = collection->uuid()) {
+                    uuid->appendToBuilder(&collectionsByUUID, collNss.coll());
+                }
+            }
+
             // Compute the hash for this collection.
             std::string hash = _hashCollection(opCtx, db, collNss.toString());
 
@@ -155,6 +194,9 @@ public:
             md5_append(&globalState, (const md5_byte_t*)hash.c_str(), hash.size());
         }
         bb.done();
+
+        result.append("capped", BSONArray(cappedCollections.done()));
+        result.append("uuids", collectionsByUUID.done());
 
         md5digest d;
         md5_finish(&globalState, d);
@@ -177,7 +219,34 @@ private:
         if (!collection)
             return "";
 
-        IndexDescriptor* desc = collection->getIndexCatalog()->findIdIndex(opCtx);
+        boost::optional<Lock::CollectionLock> collLock;
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        if (txnParticipant && txnParticipant->inMultiDocumentTransaction()) {
+            // When inside a multi-statement transaction, we are only holding the database lock in
+            // intent mode. We need to also acquire the collection lock in intent mode to ensure
+            // reading from the consistent snapshot doesn't overlap with any catalog operations on
+            // the collection.
+            invariant(
+                opCtx->lockState()->isDbLockedForMode(db->name(), getLockModeForQuery(opCtx)));
+            collLock.emplace(opCtx->lockState(), fullCollectionName, getLockModeForQuery(opCtx));
+
+            auto minSnapshot = collection->getMinimumVisibleSnapshot();
+            auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+            invariant(mySnapshot);
+
+            uassert(ErrorCodes::SnapshotUnavailable,
+                    str::stream() << "Unable to read from a snapshot due to pending collection"
+                                     " catalog changes; please retry the operation. Snapshot"
+                                     " timestamp is "
+                                  << mySnapshot->toString()
+                                  << ". Collection minimum timestamp is "
+                                  << minSnapshot->toString(),
+                    !minSnapshot || *mySnapshot >= *minSnapshot);
+        } else {
+            invariant(opCtx->lockState()->isDbLockedForMode(db->name(), MODE_S));
+        }
+
+        auto desc = collection->getIndexCatalog()->findIdIndex(opCtx);
 
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
         if (desc) {

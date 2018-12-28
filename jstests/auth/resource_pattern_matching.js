@@ -1,6 +1,12 @@
 /*
  * Tests that resource pattern matching rules work as expected.
+ * @tags: [requires_replication, requires_sharding]
  */
+
+// TODO SERVER-35447: This test logs in users on the admin database, but doesn't log them out, which
+// can fail with implicit sessions and ReplSetTest when the fixture attempts to verify data hashes
+// at shutdown by authenticating as the __system user.
+TestData.disableImplicitSessions = true;
 
 function setup_users(granter) {
     var admindb = granter.getSiblingDB("admin");
@@ -241,6 +247,7 @@ rst.stopSet();
 print('--- done with the rs tests ---');
 
 print('--- sharding test ---');
+// TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
 var st = new ShardingTest({
     mongos: 2,
     shard: 1,
@@ -248,7 +255,8 @@ var st = new ShardingTest({
     other: {
         mongosOptions: {'auth': null},
         configOptions: {'auth': null},
-        shardOptions: {'auth': null}
+        shardOptions: {'auth': null},
+        shardAsReplicaSet: false
     }
 });
 run_tests(st.s0.getDB('admin'), st.s1.getDB('admin'));

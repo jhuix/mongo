@@ -4,46 +4,19 @@
 (function() {
     "use strict";
 
-    var runCommandOriginal = Mongo.prototype.runCommand;
-    var runCommandWithMetadataOriginal = Mongo.prototype.runCommandWithMetadata;
-    var getDBOriginal = Mongo.prototype.getDB;
-    var sessionMap = new WeakMap();
+    load("jstests/libs/override_methods/override_helpers.js");
 
-    let sessionOptions = {};
-    if (typeof TestData !== "undefined" && TestData.hasOwnProperty("sessionOptions")) {
-        sessionOptions = TestData.sessionOptions;
-    }
+    const getDBOriginal = Mongo.prototype.getDB;
 
-    const driverSession = startSession(db.getMongo());
-    db = driverSession.getDatabase(db.getName());
-    sessionMap.set(db.getMongo(), driverSession);
-
-    var originalStartParallelShell = startParallelShell;
-    startParallelShell = function(jsCode, port, noConnect) {
-        var newCode;
-        var overridesFile = "jstests/libs/override_methods/enable_sessions.js";
-        if (typeof(jsCode) === "function") {
-            // Load the override file and immediately invoke the supplied function.
-            newCode = `load("${overridesFile}"); (${jsCode})();`;
-        } else {
-            newCode = `load("${overridesFile}"); ${jsCode};`;
-        }
-
-        return originalStartParallelShell(newCode, port, noConnect);
-    };
-
-    function startSession(conn) {
-        const driverSession = conn.startSession(sessionOptions);
-        // Override the endSession function to be a no-op so fuzzer doesn't accidentally end the
-        // session.
-        driverSession.endSession = Function.prototype;
-        return driverSession;
-    }
+    const sessionMap = new WeakMap();
+    const sessionOptions = TestData.sessionOptions;
 
     // Override the runCommand to check for any command obj that does not contain a logical session
     // and throw an error.
-    function runCommandWithLsidCheck(conn, dbName, cmdObj, func, funcArgs) {
-        const cmdName = Object.keys(cmdObj)[0];
+    function runCommandWithLsidCheck(conn, dbName, cmdName, cmdObj, func, makeFuncArgs) {
+        if (jsTest.options().disableEnableSessions) {
+            return func.apply(conn, makeFuncArgs(cmdObj));
+        }
 
         // If the command is in a wrapped form, then we look for the actual command object
         // inside the query/$query object.
@@ -61,24 +34,22 @@
                 throw new Error("command object does not have session id: " + tojson(cmdObj));
             }
         }
-        return func.apply(conn, funcArgs);
+        return func.apply(conn, makeFuncArgs(cmdObj));
     }
-
-    Mongo.prototype.runCommand = function(dbName, commandObj, options) {
-        return runCommandWithLsidCheck(this, dbName, commandObj, runCommandOriginal, arguments);
-    };
-
-    Mongo.prototype.runCommandWithMetadata = function(dbName, metadata, commandObj) {
-        return runCommandWithLsidCheck(
-            this, dbName, commandObj, runCommandWithMetadataOriginal, arguments);
-    };
 
     // Override the getDB to return a db object with the correct driverSession. We use a WeakMap
     // to cache the session for each connection instance so we can retrieve the same session on
     // subsequent calls to getDB.
     Mongo.prototype.getDB = function(dbName) {
+        if (jsTest.options().disableEnableSessions) {
+            return getDBOriginal.apply(this, arguments);
+        }
+
         if (!sessionMap.has(this)) {
-            const session = startSession(this);
+            const session = this.startSession(sessionOptions);
+            // Override the endSession function to be a no-op so jstestfuzz doesn't accidentally
+            // end the session.
+            session.endSession = Function.prototype;
             sessionMap.set(this, session);
         }
 
@@ -86,5 +57,12 @@
         db._session = sessionMap.get(this);
         return db;
     };
+
+    // Override the global `db` object to be part of a session.
+    db = db.getMongo().getDB(db.getName());
+
+    OverrideHelpers.prependOverrideInParallelShell(
+        "jstests/libs/override_methods/enable_sessions.js");
+    OverrideHelpers.overrideRunCommand(runCommandWithLsidCheck);
 
 })();

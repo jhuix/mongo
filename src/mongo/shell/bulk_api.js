@@ -400,6 +400,9 @@ var _bulk_api_module = (function() {
         // Define properties
         defineReadOnlyProperty(this, "code", commandError.code);
         defineReadOnlyProperty(this, "errmsg", commandError.errmsg);
+        if (commandError.hasOwnProperty("errorLabels")) {
+            defineReadOnlyProperty(this, "errorLabels", commandError.errorLabels);
+        }
 
         this.name = 'WriteCommandError';
         this.message = this.errmsg;
@@ -418,14 +421,6 @@ var _bulk_api_module = (function() {
 
         this.shellPrint = function() {
             return this.toString();
-        };
-
-        this.toSingleResult = function() {
-            // This is *only* safe to do with a WriteCommandError from the bulk api when the bulk is
-            // known to be of size == 1
-            var bulkResult = getEmptyBulkResult();
-            bulkResult.writeErrors.push({code: this.code, index: 0, errmsg: this.errmsg});
-            return new BulkWriteResult(bulkResult, NONE).toSingleResult();
         };
     };
 
@@ -885,7 +880,8 @@ var _bulk_api_module = (function() {
 
                 const session = collection.getDB().getSession();
                 if (serverSupportsRetryableWrites && session.getOptions().shouldRetryWrites() &&
-                    session._serverSession.canRetryWrites(cmd)) {
+                    session._serverSession.canRetryWrites(cmd) &&
+                    !session._serverSession.isTxnActive()) {
                     cmd = session._serverSession.assignTransactionNumber(cmd);
                 }
             }
@@ -1210,6 +1206,7 @@ var _bulk_api_module = (function() {
     module.BulkWriteResult = BulkWriteResult;
     module.BulkWriteError = BulkWriteError;
     module.WriteCommandError = WriteCommandError;
+    module.WriteError = WriteError;
     module.initializeUnorderedBulkOp = function() {
         return new Bulk(this, false);
     };
@@ -1227,6 +1224,7 @@ WriteResult = _bulk_api_module.WriteResult;
 BulkWriteResult = _bulk_api_module.BulkWriteResult;
 BulkWriteError = _bulk_api_module.BulkWriteError;
 WriteCommandError = _bulk_api_module.WriteCommandError;
+WriteError = _bulk_api_module.WriteError;
 
 /***********************************************************
  * Adds the initializers of bulk operations to the db collection

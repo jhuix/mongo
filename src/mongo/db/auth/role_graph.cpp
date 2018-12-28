@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,9 +34,11 @@
 #include <set>
 #include <vector>
 
+#include "mongo/bson/mutable/document.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/role_name.h"
-#include "mongo/platform/unordered_set.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -77,7 +81,7 @@ bool RoleGraph::_roleExistsDontCreateBuiltin(const RoleName& role) {
 
 Status RoleGraph::createRole(const RoleName& role) {
     if (roleExists(role)) {
-        return Status(ErrorCodes::DuplicateKey,
+        return Status(ErrorCodes::Error(51007),
                       mongoutils::str::stream() << "Role: " << role.getFullName()
                                                 << " already exists");
     }
@@ -399,7 +403,7 @@ Status RoleGraph::replaceRole(const RoleName& roleName,
     for (size_t i = 0; i < roles.size(); ++i) {
         const RoleName& grantedRole = roles[i];
         status = createRole(grantedRole);
-        fassert(17170, status.isOK() || status == ErrorCodes::DuplicateKey);
+        fassert(17170, status.isOK() || status.code() == 51007);
         fassert(17171, addRoleToRole(roleName, grantedRole));
     }
     fassert(17172, addPrivilegesToRole(roleName, privileges));
@@ -421,7 +425,7 @@ Status RoleGraph::recomputePrivilegeData() {
      * we can get back to them after visiting their children.
      */
 
-    unordered_set<RoleName> visitedRoles;
+    stdx::unordered_set<RoleName> visitedRoles;
     for (EdgeSet::const_iterator it = _roleToSubordinates.begin(); it != _roleToSubordinates.end();
          ++it) {
         Status status = _recomputePrivilegeDataHelper(it->first, visitedRoles);
@@ -433,7 +437,7 @@ Status RoleGraph::recomputePrivilegeData() {
 }
 
 Status RoleGraph::_recomputePrivilegeDataHelper(const RoleName& startingRole,
-                                                unordered_set<RoleName>& visitedRoles) {
+                                                stdx::unordered_set<RoleName>& visitedRoles) {
     if (visitedRoles.count(startingRole)) {
         return Status::OK();
     }
@@ -494,7 +498,7 @@ Status RoleGraph::_recomputePrivilegeDataHelper(const RoleName& startingRole,
         currentRoleAllPrivileges = _directPrivilegesForRole[currentRole];
 
         // Need to do the same thing for the indirect roles
-        unordered_set<RoleName>& currentRoleIndirectRoles =
+        stdx::unordered_set<RoleName>& currentRoleIndirectRoles =
             _roleToIndirectSubordinates[currentRole];
         currentRoleIndirectRoles.clear();
         for (const auto& role : currentRoleDirectRoles) {
@@ -539,14 +543,56 @@ Status RoleGraph::_recomputePrivilegeDataHelper(const RoleName& startingRole,
     return Status::OK();
 }
 
-RoleNameIterator RoleGraph::getRolesForDatabase(const std::string& dbname) {
+RoleNameIterator RoleGraph::getRolesForDatabase(StringData dbname) {
     _createBuiltinRolesForDBIfNeeded(dbname);
-
-    std::set<RoleName>::const_iterator lower = _allRoles.lower_bound(RoleName("", dbname));
-    std::string afterDB = dbname;
+    std::set<RoleName>::const_iterator lower =
+        _allRoles.lower_bound(RoleName("", dbname.toString()));
+    std::string afterDB = dbname.toString();
     afterDB.push_back('\0');
     std::set<RoleName>::const_iterator upper = _allRoles.lower_bound(RoleName("", afterDB));
     return makeRoleNameIterator(lower, upper);
+}
+
+
+Status RoleGraph::getBSONForRole(RoleGraph* graph,
+                                 const RoleName& roleName,
+                                 mutablebson::Element result) try {
+    if (!graph->roleExists(roleName)) {
+        return Status(ErrorCodes::RoleNotFound,
+                      mongoutils::str::stream() << roleName.getFullName()
+                                                << "does not name an existing role");
+    }
+    std::string id = mongoutils::str::stream() << roleName.getDB() << "." << roleName.getRole();
+    uassertStatusOK(result.appendString("_id", id));
+    uassertStatusOK(
+        result.appendString(AuthorizationManager::ROLE_NAME_FIELD_NAME, roleName.getRole()));
+    uassertStatusOK(
+        result.appendString(AuthorizationManager::ROLE_DB_FIELD_NAME, roleName.getDB()));
+
+    // Build privileges array
+    mutablebson::Element privilegesArrayElement =
+        result.getDocument().makeElementArray("privileges");
+    uassertStatusOK(result.pushBack(privilegesArrayElement));
+    const PrivilegeVector& privileges = graph->getDirectPrivileges(roleName);
+    uassertStatusOK(Privilege::getBSONForPrivileges(privileges, privilegesArrayElement));
+
+    // Build roles array
+    mutablebson::Element rolesArrayElement = result.getDocument().makeElementArray("roles");
+    uassertStatusOK(result.pushBack(rolesArrayElement));
+    for (RoleNameIterator roles = graph->getDirectSubordinates(roleName); roles.more();
+         roles.next()) {
+        const RoleName& subRole = roles.get();
+        mutablebson::Element roleObj = result.getDocument().makeElementObject("");
+        uassertStatusOK(
+            roleObj.appendString(AuthorizationManager::ROLE_NAME_FIELD_NAME, subRole.getRole()));
+        uassertStatusOK(
+            roleObj.appendString(AuthorizationManager::ROLE_DB_FIELD_NAME, subRole.getDB()));
+        uassertStatusOK(rolesArrayElement.pushBack(roleObj));
+    }
+
+    return Status::OK();
+} catch (...) {
+    return exceptionToStatus();
 }
 
 }  // namespace mongo

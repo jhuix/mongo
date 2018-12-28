@@ -1,25 +1,27 @@
 // collection_catalog_entry.h
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -40,6 +42,7 @@
 
 namespace mongo {
 
+class Collection;
 class IndexDescriptor;
 class OperationContext;
 
@@ -50,6 +53,10 @@ public:
 
     const NamespaceString& ns() const {
         return _ns;
+    }
+
+    void setNs(NamespaceString ns) {
+        _ns = std::move(ns);
     }
 
     // ------- indexes ----------
@@ -63,6 +70,12 @@ public:
     virtual int getMaxAllowedIndexes() const = 0;
 
     virtual void getAllIndexes(OperationContext* opCtx, std::vector<std::string>* names) const = 0;
+
+    virtual void getReadyIndexes(OperationContext* opCtx,
+                                 std::vector<std::string>* names) const = 0;
+
+    virtual void getAllUniqueIndexes(OperationContext* opCtx,
+                                     std::vector<std::string>* names) const {}
 
     virtual BSONObj getIndexSpec(OperationContext* opCtx, StringData idxName) const = 0;
 
@@ -102,11 +115,15 @@ public:
 
     virtual bool isIndexReady(OperationContext* opCtx, StringData indexName) const = 0;
 
+    virtual bool isIndexPresent(OperationContext* opCtx, StringData indexName) const = 0;
+
     virtual KVPrefix getIndexPrefix(OperationContext* opCtx, StringData indexName) const = 0;
 
     virtual Status removeIndex(OperationContext* opCtx, StringData indexName) = 0;
 
-    virtual Status prepareForIndexBuild(OperationContext* opCtx, const IndexDescriptor* spec) = 0;
+    virtual Status prepareForIndexBuild(OperationContext* opCtx,
+                                        const IndexDescriptor* spec,
+                                        bool isBackgroundSecondaryBuild) = 0;
 
     virtual void indexBuildSuccess(OperationContext* opCtx, StringData indexName) = 0;
 
@@ -117,6 +134,8 @@ public:
     virtual void updateTTLSetting(OperationContext* opCtx,
                                   StringData idxName,
                                   long long newExpireSeconds) = 0;
+
+    virtual void updateIndexMetadata(OperationContext* opCtx, const IndexDescriptor* desc) {}
 
     /**
      * Sets the flags field of CollectionOptions to newValue.
@@ -140,19 +159,8 @@ public:
     virtual void setIsTemp(OperationContext* opCtx, bool isTemp) = 0;
 
     /**
-     * Assigns a new UUID to this collection. This is to be called when the schemaVersion is set
-     * to 3.6 and there are collections that still do not have UUIDs.
-     */
-    virtual void addUUID(OperationContext* opCtx, CollectionUUID uuid, Collection* coll) = 0;
-    /**
-     * Removes the UUID from this collection. This is to be called when the schemaVersion is set
-     * to 3.4 and there are collections that still have UUIDs.
-     */
-    virtual void removeUUID(OperationContext* opCtx) = 0;
-
-    /**
      * Compare the UUID argument to the UUID obtained from the metadata. Return true if they
-     * are equal, false otherwise.
+     * are equal, false otherwise. uuid can become a CollectionUUID once MMAPv1 is removed.
      */
     virtual bool isEqualToMetadataUUID(OperationContext* opCtx, OptionalCollectionUUID uuid) = 0;
 
@@ -160,6 +168,10 @@ public:
      * Updates size of a capped Collection.
      */
     virtual void updateCappedSize(OperationContext* opCtx, long long size) = 0;
+
+    // TODO SERVER-36385 Remove this function: we don't set the feature tracker bit in 4.4 because
+    // 4.4 can only downgrade to 4.2 which can read long TypeBits.
+    virtual void setIndexKeyStringWithLongTypeBitsExistsOnDisk(OperationContext* opCtx) = 0;
 
 private:
     NamespaceString _ns;

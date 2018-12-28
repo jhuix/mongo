@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -485,6 +487,90 @@ TEST_F(QueryPlannerTest, PredicatesOverLeadingFieldsWithSharedPathPrefixHandledC
     assertNumSolutions(1U);
     assertSolutionExists(
         "{text: {search: 'foo', prefix: {'a.x': 1, 'a.y': 2, 'b.x': 3, 'b.y': 4}}}");
+}
+
+TEST_F(QueryPlannerTest, EqualityToArrayOverLeadingFieldHandledCorrectly) {
+    addIndex(BSON("a" << 1 << "_fts"
+                      << "text"
+                      << "_ftsx"
+                      << 1));
+
+    runQuery(fromjson("{a: [1, 2, 3], $text: {$search: 'foo'}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists("{text: {search: 'foo', prefix: {a: [1, 2, 3]}}}");
+}
+
+TEST_F(QueryPlannerTest, EqualityToArrayOverLeadingFieldHandledCorrectlyWithMultikeyTrue) {
+    const bool multikey = true;
+    addIndex(BSON("a" << 1 << "_fts"
+                      << "text"
+                      << "_ftsx"
+                      << 1),
+             multikey);
+
+    runQuery(fromjson("{a: [1, 2, 3], $text: {$search: 'foo'}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists("{text: {search: 'foo', prefix: {a: [1, 2, 3]}}}");
+}
+
+TEST_F(QueryPlannerTest, InexactFetchPredicateOverTrailingFieldHandledCorrectly) {
+    addIndex(BSON("a" << 1 << "_fts"
+                      << "text"
+                      << "_ftsx"
+                      << 1
+                      << "b"
+                      << 1));
+
+    runQuery(fromjson("{a: 3, $text: {$search: 'foo'}, b: {$exists: true}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: {b: {$exists: true}}, node: {text: {search: 'foo', prefix: {a: 3}}}}}");
+}
+
+TEST_F(QueryPlannerTest, InexactFetchPredicateOverTrailingFieldHandledCorrectlyMultikeyTrue) {
+    const bool multikey = true;
+    addIndex(BSON("a" << 1 << "_fts"
+                      << "text"
+                      << "_ftsx"
+                      << 1
+                      << "b"
+                      << 1),
+             multikey);
+
+    runQuery(fromjson("{a: 3, $text: {$search: 'foo'}, b: {$exists: true}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: {b: {$exists: true}}, node: {text: {search: 'foo', prefix: {a: 3}}}}}");
+}
+
+TEST_F(QueryPlannerTest, ExprEqCannotUsePrefixOfTextIndex) {
+    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    addIndex(BSON("a" << 1 << "_fts"
+                      << "text"
+                      << "_ftsx"
+                      << 1));
+
+    runInvalidQuery(fromjson("{a: {$_internalExprEq: 3}, $text: {$search: 'blah'}}"));
+}
+
+TEST_F(QueryPlannerTest, ExprEqCanUseSuffixOfTextIndex) {
+    params.options = QueryPlannerParams::NO_TABLE_SCAN;
+    addIndex(BSON("_fts"
+                  << "text"
+                  << "_ftsx"
+                  << 1
+                  << "a"
+                  << 1));
+
+    runQuery(fromjson("{a: {$_internalExprEq: 3}, $text: {$search: 'blah'}}"));
+
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{text: {search: 'blah', prefix: {}, filter: {a: {$_internalExprEq: 3}}}}");
 }
 
 }  // namespace

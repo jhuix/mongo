@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,6 +41,7 @@
 #include "mongo/db/exec/idhack.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/update.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -79,6 +82,7 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
     PlanExecutor::YieldPolicy yieldPolicy,
     Direction direction,
     const RecordId& startLoc) {
+    invariant(collection);
     auto ws = stdx::make_unique<WorkingSet>();
 
     auto root = _collectionScan(opCtx, ws.get(), collection, direction, startLoc);
@@ -87,7 +91,7 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
 
     auto executor =
         PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
-    invariantOK(executor.getStatus());
+    invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
 
@@ -116,7 +120,7 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::indexScan(
 
     auto executor =
         PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
-    invariantOK(executor.getStatus());
+    invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
 
@@ -130,6 +134,7 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
     BoundInclusion boundInclusion,
     PlanExecutor::YieldPolicy yieldPolicy,
     Direction direction) {
+    invariant(collection);
     auto ws = stdx::make_unique<WorkingSet>();
 
     std::unique_ptr<PlanStage> root = _indexScan(opCtx,
@@ -146,7 +151,7 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
 
     auto executor =
         PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
-    invariantOK(executor.getStatus());
+    invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
 
@@ -157,15 +162,16 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::updateWith
     const IndexDescriptor* descriptor,
     const BSONObj& key,
     PlanExecutor::YieldPolicy yieldPolicy) {
+    invariant(collection);
     auto ws = stdx::make_unique<WorkingSet>();
 
-    auto idHackStage = stdx::make_unique<IDHackStage>(opCtx, collection, key, ws.get(), descriptor);
+    auto idHackStage = stdx::make_unique<IDHackStage>(opCtx, key, ws.get(), descriptor);
     auto root =
         stdx::make_unique<UpdateStage>(opCtx, params, ws.get(), collection, idHackStage.release());
 
     auto executor =
         PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
-    invariantOK(executor.getStatus());
+    invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
 
@@ -177,8 +183,8 @@ std::unique_ptr<PlanStage> InternalPlanner::_collectionScan(OperationContext* op
     invariant(collection);
 
     CollectionScanParams params;
-    params.collection = collection;
     params.start = startLoc;
+    params.shouldWaitForOplogVisibility = shouldWaitForOplogVisibility(opCtx, collection, false);
 
     if (FORWARD == direction) {
         params.direction = CollectionScanParams::FORWARD;
@@ -186,7 +192,7 @@ std::unique_ptr<PlanStage> InternalPlanner::_collectionScan(OperationContext* op
         params.direction = CollectionScanParams::BACKWARD;
     }
 
-    return stdx::make_unique<CollectionScan>(opCtx, params, ws, nullptr);
+    return stdx::make_unique<CollectionScan>(opCtx, collection, params, ws, nullptr);
 }
 
 std::unique_ptr<PlanStage> InternalPlanner::_indexScan(OperationContext* opCtx,
@@ -201,15 +207,16 @@ std::unique_ptr<PlanStage> InternalPlanner::_indexScan(OperationContext* opCtx,
     invariant(collection);
     invariant(descriptor);
 
-    IndexScanParams params;
-    params.descriptor = descriptor;
+    IndexScanParams params(opCtx, descriptor);
     params.direction = direction;
     params.bounds.isSimpleRange = true;
     params.bounds.startKey = startKey;
     params.bounds.endKey = endKey;
     params.bounds.boundInclusion = boundInclusion;
+    params.shouldDedup = descriptor->isMultikey(opCtx);
 
-    std::unique_ptr<PlanStage> root = stdx::make_unique<IndexScan>(opCtx, params, ws, nullptr);
+    std::unique_ptr<PlanStage> root =
+        stdx::make_unique<IndexScan>(opCtx, std::move(params), ws, nullptr);
 
     if (InternalPlanner::IXSCAN_FETCH & options) {
         root = stdx::make_unique<FetchStage>(opCtx, ws, root.release(), nullptr, collection);

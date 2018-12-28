@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -52,7 +54,6 @@
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/grid.h"
 #include "mongo/stdx/memory.h"
@@ -164,10 +165,24 @@ shared_ptr<Shard> ShardRegistry::lookupRSName(const string& name) const {
     return _data.findByRSName(name);
 }
 
-void ShardRegistry::getAllShardIds(vector<ShardId>* all) const {
+void ShardRegistry::getAllShardIdsNoReload(vector<ShardId>* all) const {
     std::set<ShardId> seen;
     _data.getAllShardIds(seen);
     all->assign(seen.begin(), seen.end());
+}
+
+void ShardRegistry::getAllShardIds(OperationContext* opCtx, vector<ShardId>* all) {
+    getAllShardIdsNoReload(all);
+    if (all->empty()) {
+        bool didReload = reload(opCtx);
+        getAllShardIdsNoReload(all);
+        // If we didn't do the reload ourselves, we should retry to ensure
+        // that the reload is actually initiated while we're executing this
+        if (!didReload && all->empty()) {
+            reload(opCtx);
+            getAllShardIdsNoReload(all);
+        }
+    }
 }
 
 int ShardRegistry::getNumShards() const {
@@ -236,7 +251,7 @@ void ShardRegistry::_internalReload(const CallbackArgs& cbArgs) {
         return;
     }
 
-    Client::initThreadIfNotAlready("shard registry reload");
+    ThreadClient tc("shard registry reload", getGlobalServiceContext());
     auto opCtx = cc().makeOperationContext();
 
     try {
@@ -330,9 +345,9 @@ bool ShardRegistry::reload(OperationContext* opCtx) {
 void ShardRegistry::replicaSetChangeShardRegistryUpdateHook(
     const std::string& setName, const std::string& newConnectionString) {
     // Inform the ShardRegsitry of the new connection string for the shard.
-    auto connString = fassertStatusOK(28805, ConnectionString::parse(newConnectionString));
+    auto connString = fassert(28805, ConnectionString::parse(newConnectionString));
     invariant(setName == connString.getSetName());
-    grid.shardRegistry()->updateReplSetHosts(connString);
+    Grid::get(getGlobalServiceContext())->shardRegistry()->updateReplSetHosts(connString);
 }
 
 void ShardRegistry::replicaSetChangeConfigServerUpdateHook(const std::string& setName,
@@ -340,9 +355,10 @@ void ShardRegistry::replicaSetChangeConfigServerUpdateHook(const std::string& se
     // This is run in it's own thread. Exceptions escaping would result in a call to terminate.
     Client::initThread("replSetChange");
     auto opCtx = cc().makeOperationContext();
+    auto const grid = Grid::get(opCtx.get());
 
     try {
-        std::shared_ptr<Shard> s = Grid::get(opCtx.get())->shardRegistry()->lookupRSName(setName);
+        std::shared_ptr<Shard> s = grid->shardRegistry()->lookupRSName(setName);
         if (!s) {
             LOG(1) << "shard not found for set: " << newConnectionString
                    << " when attempting to inform config servers of updated set membership";
@@ -354,15 +370,13 @@ void ShardRegistry::replicaSetChangeConfigServerUpdateHook(const std::string& se
             return;
         }
 
-        auto status =
-            Grid::get(opCtx.get())
-                ->catalogClient()
-                ->updateConfigDocument(opCtx.get(),
-                                       ShardType::ConfigNS,
-                                       BSON(ShardType::name(s->getId().toString())),
-                                       BSON("$set" << BSON(ShardType::host(newConnectionString))),
-                                       false,
-                                       ShardingCatalogClient::kMajorityWriteConcern);
+        auto status = grid->catalogClient()->updateConfigDocument(
+            opCtx.get(),
+            ShardType::ConfigNS,
+            BSON(ShardType::name(s->getId().toString())),
+            BSON("$set" << BSON(ShardType::host(newConnectionString))),
+            false,
+            ShardingCatalogClient::kMajorityWriteConcern);
         if (!status.isOK()) {
             error() << "RSChangeWatcher: could not update config db for set: " << setName
                     << " to: " << newConnectionString << causedBy(status.getStatus());
@@ -377,17 +391,23 @@ void ShardRegistry::replicaSetChangeConfigServerUpdateHook(const std::string& se
 ////////////// ShardRegistryData //////////////////
 
 ShardRegistryData::ShardRegistryData(OperationContext* opCtx, ShardFactory* shardFactory) {
-    auto shardsStatus =
-        grid.catalogClient()->getAllShards(opCtx, repl::ReadConcernLevel::kMajorityReadConcern);
+    auto const catalogClient = Grid::get(opCtx)->catalogClient();
 
-    if (!shardsStatus.isOK()) {
-        uasserted(shardsStatus.getStatus().code(),
-                  str::stream() << "could not get updated shard list from config server due to "
-                                << shardsStatus.getStatus().reason());
+    auto readConcern = repl::ReadConcernLevel::kMajorityReadConcern;
+
+    // ShardRemote requires a majority read. We can only allow a non-majority read if we are a
+    // config server.
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
+        !repl::ReadConcernArgs::get(opCtx).isEmpty()) {
+        readConcern = repl::ReadConcernArgs::get(opCtx).getLevel();
     }
 
-    auto shards = std::move(shardsStatus.getValue().value);
-    auto reloadOpTime = std::move(shardsStatus.getValue().opTime);
+    auto shardsAndOpTime =
+        uassertStatusOKWithContext(catalogClient->getAllShards(opCtx, readConcern),
+                                   "could not get updated shard list from config server");
+
+    auto shards = std::move(shardsAndOpTime.value);
+    auto reloadOpTime = std::move(shardsAndOpTime.opTime);
 
     LOG(1) << "found " << shards.size()
            << " shards listed on config server(s) with lastVisibleOpTime: "

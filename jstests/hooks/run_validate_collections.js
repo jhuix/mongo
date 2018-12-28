@@ -3,84 +3,41 @@
 'use strict';
 
 (function() {
+    load('jstests/libs/discover_topology.js');      // For Topology and DiscoverTopology.
+    load('jstests/hooks/validate_collections.js');  // For CollectionValidator.
+
     assert.eq(typeof db, 'object', 'Invalid `db` object, is the shell connected to a mongod?');
-    load('jstests/hooks/validate_collections.js');  // For validateCollections.
+    const topology = DiscoverTopology.findConnectedNodes(db.getMongo());
 
-    function getDirectConnections(conn) {
-        // If conn does not point to a repl set, then this function returns [conn].
-        const res = conn.adminCommand({isMaster: 1});
-        const connections = [];
+    const hostList = [];
+    let setFCVHost;
 
-        if (res.hasOwnProperty('hosts')) {
-            for (let hostString of res.hosts) {
-                connections.push(new Mongo(hostString));
-            }
-        } else {
-            connections.push(conn);
-        }
+    if (topology.type === Topology.kStandalone) {
+        hostList.push(topology.mongod);
+        setFCVHost = topology.mongod;
+    } else if (topology.type === Topology.kReplicaSet) {
+        hostList.push(...topology.nodes);
+        setFCVHost = topology.primary;
+    } else if (topology.type === Topology.kShardedCluster) {
+        hostList.push(...topology.configsvr.nodes);
 
-        return connections;
-    }
+        for (let shardName of Object.keys(topology.shards)) {
+            const shard = topology.shards[shardName];
 
-    function getConfigConnStr() {
-        const shardMap = db.adminCommand({getShardMap: 1});
-        if (!shardMap.hasOwnProperty('map')) {
-            throw new Error('Expected getShardMap() to return an object a "map" field: ' +
-                            tojson(shardMap));
-        }
-
-        const map = shardMap.map;
-
-        if (!map.hasOwnProperty('config')) {
-            throw new Error('Expected getShardMap().map to have a "config" field: ' + tojson(map));
-        }
-
-        return map.config;
-    }
-
-    function isMongos() {
-        return db.isMaster().msg === 'isdbgrid';
-    }
-
-    function getServerList() {
-        const serverList = [];
-
-        if (isMongos()) {
-            // We're connected to a sharded cluster through a mongos.
-
-            // 1) Add all the config servers to the server list.
-            const configConnStr = getConfigConnStr();
-            const configServerReplSetConn = new Mongo(configConnStr);
-            serverList.push(...getDirectConnections(configServerReplSetConn));
-
-            // 2) Add shard members to the server list.
-            const configDB = db.getSiblingDB('config');
-            const cursor = configDB.shards.find();
-
-            while (cursor.hasNext()) {
-                const shard = cursor.next();
-                const shardReplSetConn = new Mongo(shard.host);
-                serverList.push(...getDirectConnections(shardReplSetConn));
-            }
-        } else {
-            // We're connected to a mongod.
-            serverList.push(...getDirectConnections(db.getMongo()));
-        }
-
-        return serverList;
-    }
-
-    const serverList = getServerList();
-    for (let server of serverList) {
-        print('Running validate() on ' + server.host);
-        server.setSlaveOk();
-        jsTest.authenticate(server);
-
-        const dbNames = server.getDBNames();
-        for (let dbName of dbNames) {
-            if (!validateCollections(server.getDB(dbName), {full: true})) {
-                throw new Error('Collection validation failed');
+            if (shard.type === Topology.kStandalone) {
+                hostList.push(shard.mongod);
+            } else if (shard.type === Topology.kReplicaSet) {
+                hostList.push(...shard.nodes);
+            } else {
+                throw new Error('Unrecognized topology format: ' + tojson(topology));
             }
         }
+        // Any of the mongos instances can be used for setting FCV.
+        setFCVHost = topology.mongos.nodes[0];
+    } else {
+        throw new Error('Unrecognized topology format: ' + tojson(topology));
     }
+
+    new CollectionValidator().validateNodes(hostList, setFCVHost);
+
 })();

@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2017 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -39,11 +41,8 @@
 
 namespace mongo {
 
-const std::string ShardCollectionType::ConfigNS =
-    NamespaceString::kShardConfigCollectionsCollectionName.toString();
-
-const BSONField<std::string> ShardCollectionType::uuid("_id");
-const BSONField<std::string> ShardCollectionType::ns("ns");
+const BSONField<std::string> ShardCollectionType::ns("_id");
+const BSONField<UUID> ShardCollectionType::uuid("uuid");
 const BSONField<OID> ShardCollectionType::epoch("epoch");
 const BSONField<BSONObj> ShardCollectionType::keyPattern("key");
 const BSONField<BSONObj> ShardCollectionType::defaultCollation("defaultCollation");
@@ -51,29 +50,23 @@ const BSONField<bool> ShardCollectionType::unique("unique");
 const BSONField<bool> ShardCollectionType::refreshing("refreshing");
 const BSONField<Date_t> ShardCollectionType::lastRefreshedCollectionVersion(
     "lastRefreshedCollectionVersion");
+const BSONField<int> ShardCollectionType::enterCriticalSectionCounter(
+    "enterCriticalSectionCounter");
 
-ShardCollectionType::ShardCollectionType(const NamespaceString& uuid,
-                                         const NamespaceString& nss,
-                                         const OID& epoch,
+ShardCollectionType::ShardCollectionType(NamespaceString nss,
+                                         boost::optional<UUID> uuid,
+                                         OID epoch,
                                          const KeyPattern& keyPattern,
                                          const BSONObj& defaultCollation,
-                                         const bool& unique)
-    : _uuid(uuid),
-      _nss(nss),
-      _epoch(epoch),
+                                         bool unique)
+    : _nss(std::move(nss)),
+      _uuid(uuid),
+      _epoch(std::move(epoch)),
       _keyPattern(keyPattern.toBSON()),
       _defaultCollation(defaultCollation.getOwned()),
       _unique(unique) {}
 
 StatusWith<ShardCollectionType> ShardCollectionType::fromBSON(const BSONObj& source) {
-    NamespaceString uuid;
-    {
-        std::string ns;
-        Status status = bsonExtractStringField(source, ShardCollectionType::uuid.name(), &ns);
-        if (!status.isOK())
-            return status;
-        uuid = NamespaceString{ns};
-    }
 
     NamespaceString nss;
     {
@@ -83,6 +76,23 @@ StatusWith<ShardCollectionType> ShardCollectionType::fromBSON(const BSONObj& sou
             return status;
         }
         nss = NamespaceString{ns};
+    }
+
+    boost::optional<UUID> uuid;
+    {
+        BSONElement uuidElem;
+        Status status = bsonExtractTypedField(
+            source, ShardCollectionType::uuid.name(), BSONType::BinData, &uuidElem);
+        if (status.isOK()) {
+            auto uuidWith = UUID::parse(uuidElem);
+            if (!uuidWith.isOK())
+                return uuidWith.getStatus();
+            uuid = uuidWith.getValue();
+        } else if (status == ErrorCodes::NoSuchKey) {
+            // The field is not set, which is okay.
+        } else {
+            return status;
+        }
     }
 
     OID epoch;
@@ -134,7 +144,8 @@ StatusWith<ShardCollectionType> ShardCollectionType::fromBSON(const BSONObj& sou
         }
     }
 
-    ShardCollectionType shardCollectionType(uuid, nss, epoch, pattern, collation, unique);
+    ShardCollectionType shardCollectionType(
+        std::move(nss), uuid, std::move(epoch), pattern, collation, unique);
 
     // Below are optional fields.
 
@@ -154,13 +165,13 @@ StatusWith<ShardCollectionType> ShardCollectionType::fromBSON(const BSONObj& sou
     {
         if (!source[lastRefreshedCollectionVersion.name()].eoo()) {
             auto statusWithLastRefreshedCollectionVersion =
-                ChunkVersion::parseFromBSONWithFieldAndSetEpoch(
-                    source, lastRefreshedCollectionVersion.name(), epoch);
+                ChunkVersion::parseLegacyWithField(source, lastRefreshedCollectionVersion());
             if (!statusWithLastRefreshedCollectionVersion.isOK()) {
                 return statusWithLastRefreshedCollectionVersion.getStatus();
             }
+            auto version = std::move(statusWithLastRefreshedCollectionVersion.getValue());
             shardCollectionType.setLastRefreshedCollectionVersion(
-                std::move(statusWithLastRefreshedCollectionVersion.getValue()));
+                ChunkVersion(version.majorVersion(), version.minorVersion(), epoch));
         }
     }
 
@@ -170,8 +181,10 @@ StatusWith<ShardCollectionType> ShardCollectionType::fromBSON(const BSONObj& sou
 BSONObj ShardCollectionType::toBSON() const {
     BSONObjBuilder builder;
 
-    builder.append(uuid.name(), _uuid.ns());
     builder.append(ns.name(), _nss.ns());
+    if (_uuid) {
+        _uuid->appendToBuilder(&builder, uuid.name());
+    }
     builder.append(epoch.name(), _epoch);
     builder.append(keyPattern.name(), _keyPattern.toBSON());
 
@@ -196,19 +209,18 @@ std::string ShardCollectionType::toString() const {
     return toBSON().toString();
 }
 
-void ShardCollectionType::setUUID(const NamespaceString& uuid) {
-    invariant(uuid.isValid());
+void ShardCollectionType::setUUID(UUID uuid) {
     _uuid = uuid;
 }
 
-void ShardCollectionType::setNss(const NamespaceString& nss) {
+void ShardCollectionType::setNss(NamespaceString nss) {
     invariant(nss.isValid());
-    _nss = nss;
+    _nss = std::move(nss);
 }
 
-void ShardCollectionType::setEpoch(const OID& epoch) {
+void ShardCollectionType::setEpoch(OID epoch) {
     invariant(epoch.isSet());
-    _epoch = epoch;
+    _epoch = std::move(epoch);
 }
 
 void ShardCollectionType::setKeyPattern(const KeyPattern& keyPattern) {

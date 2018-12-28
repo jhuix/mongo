@@ -1,6 +1,7 @@
 /**
  * Tests that a query with default read preference ("primary") will succeed even if the node being
  * queried steps down before the final result batch has been delivered.
+ * @tags: [requires_replication, requires_sharding]
  */
 
 // Checking UUID consistency involves talking to a shard node, which in this test is shutdown
@@ -8,6 +9,15 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
 (function() {
     'use strict';
+
+    // Set the refresh period to 10 min to rule out races
+    _setShellFailPoint({
+        configureFailPoint: "modifyReplicaSetMonitorDefaultRefreshPeriod",
+        mode: "alwaysOn",
+        data: {
+            period: 10 * 60,
+        },
+    });
 
     var dbName = "test";
     var collName = jsTest.name();
@@ -64,8 +74,8 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     rst.stopSet();
 
     // Test querying a replica set primary through mongos.
-    var st = new ShardingTest({shards: 1, rs: true});
+    var st = new ShardingTest({shards: 1, rs: {nodes: 2}, config: 2});
     rst = st.rs0;
-    runTest(st.s0.host, rst);
+    runTest(st.s0.host, rst, true);
     st.stop();
 })();

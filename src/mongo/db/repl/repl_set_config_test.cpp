@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -44,7 +46,7 @@ namespace {
 // Creates a bson document reprsenting a replica set config doc with the given members, and votes
 BSONObj createConfigDoc(int members, int voters = ReplSetConfig::kMaxVotingMembers) {
     str::stream configJson;
-    configJson << "{_id:'rs0', version:1, members:[";
+    configJson << "{_id:'rs0', version:1, protocolVersion:1, members:[";
     for (int i = 0; i < members; ++i) {
         configJson << "{_id:" << i << ", host:'node" << i << "'";
         if (i >= voters) {
@@ -64,6 +66,8 @@ TEST(ReplSetConfig, ParseMinimalConfigAndCheckDefaults) {
                                      << "rs0"
                                      << "version"
                                      << 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345")))));
@@ -79,9 +83,9 @@ TEST(ReplSetConfig, ParseMinimalConfigAndCheckDefaults) {
                   config.getHeartbeatTimeoutPeriod());
     ASSERT_EQUALS(ReplSetConfig::kDefaultElectionTimeoutPeriod, config.getElectionTimeoutPeriod());
     ASSERT_TRUE(config.isChainingAllowed());
-    ASSERT_FALSE(config.getWriteConcernMajorityShouldJournal());
+    ASSERT_TRUE(config.getWriteConcernMajorityShouldJournal());
     ASSERT_FALSE(config.isConfigServer());
-    ASSERT_EQUALS(0, config.getProtocolVersion());
+    ASSERT_EQUALS(1, config.getProtocolVersion());
     ASSERT_EQUALS(
         ConnectionString::forReplicaSet("rs0", {HostAndPort{"localhost:12345"}}).toString(),
         config.getConnectionString().toString());
@@ -140,6 +144,8 @@ TEST(ReplSetConfig, GetConnectionStringFiltersHiddenNodes) {
                                      << "rs0"
                                      << "version"
                                      << 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:11111")
@@ -168,6 +174,8 @@ TEST(ReplSetConfig, MajorityCalculationThreeVotersNoArbiters) {
                                      << "rs0"
                                      << "version"
                                      << 2
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                               << "h1:1")
@@ -198,6 +206,8 @@ TEST(ReplSetConfig, MajorityCalculationNearlyHalfArbiters) {
                                      << "mySet"
                                      << "version"
                                      << 2
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("host"
                                                         << "node1:12345"
@@ -233,6 +243,8 @@ TEST(ReplSetConfig, MajorityCalculationEvenNumberOfMembers) {
                                      << "mySet"
                                      << "version"
                                      << 2
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("host"
                                                         << "node1:12345"
@@ -260,6 +272,8 @@ TEST(ReplSetConfig, MajorityCalculationNearlyHalfSecondariesNoVotes) {
                                      << "mySet"
                                      << "version"
                                      << 2
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("host"
                                                         << "node1:12345"
@@ -313,6 +327,8 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingIdField) {
                                      << ""
                                      << "version"
                                      << 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345")))));
@@ -326,6 +342,8 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingVersionField) {
     ASSERT_EQUALS(ErrorCodes::NoSuchKey,
                   config.initialize(BSON("_id"
                                          << "rs0"
+                                         << "protocolVersion"
+                                         << 1
                                          << "members"
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                   << "localhost:12345")))));
@@ -334,6 +352,8 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingVersionField) {
                                          << "rs0"
                                          << "version"
                                          << "1"
+                                         << "protocolVersion"
+                                         << 1
                                          << "members"
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                   << "localhost:12345")))));
@@ -342,6 +362,8 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingVersionField) {
                                      << "rs0"
                                      << "version"
                                      << 1.0
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345")))));
@@ -350,6 +372,8 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingVersionField) {
                                      << "rs0"
                                      << "version"
                                      << 0.0
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345")))));
@@ -358,6 +382,8 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingVersionField) {
                                      << "rs0"
                                      << "version"
                                      << static_cast<long long>(std::numeric_limits<int>::max()) + 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345")))));
@@ -371,6 +397,8 @@ TEST(ReplSetConfig, ParseFailsWithBadMembers) {
                                          << "rs0"
                                          << "version"
                                          << 1
+                                         << "protocolVersion"
+                                         << 1
                                          << "members"
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                   << "localhost:12345")
@@ -378,6 +406,8 @@ TEST(ReplSetConfig, ParseFailsWithBadMembers) {
     ASSERT_NOT_OK(config.initialize(BSON("_id"
                                          << "rs0"
                                          << "version"
+                                         << 1
+                                         << "protocolVersion"
                                          << 1
                                          << "members"
                                          << BSON_ARRAY(BSON("host"
@@ -389,6 +419,8 @@ TEST(ReplSetConfig, ParseFailsWithLocalNonLocalHostMix) {
     ASSERT_OK(config.initialize(BSON("_id"
                                      << "rs0"
                                      << "version"
+                                     << 1
+                                     << "protocolVersion"
                                      << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -403,6 +435,8 @@ TEST(ReplSetConfig, ParseFailsWithNoElectableNodes) {
     const BSONObj configBsonNoElectableNodes = BSON("_id"
                                                     << "rs0"
                                                     << "version"
+                                                    << 1
+                                                    << "protocolVersion"
                                                     << 1
                                                     << "members"
                                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -420,6 +454,8 @@ TEST(ReplSetConfig, ParseFailsWithNoElectableNodes) {
     const BSONObj configBsonNoElectableNodesOneArbiter = BSON("_id"
                                                               << "rs0"
                                                               << "version"
+                                                              << 1
+                                                              << "protocolVersion"
                                                               << 1
                                                               << "members"
                                                               << BSON_ARRAY(
@@ -439,6 +475,8 @@ TEST(ReplSetConfig, ParseFailsWithNoElectableNodes) {
                                                                << "rs0"
                                                                << "version"
                                                                << 1
+                                                               << "protocolVersion"
+                                                               << 1
                                                                << "members"
                                                                << BSON_ARRAY(
                                                                       BSON("_id" << 0 << "host"
@@ -456,6 +494,8 @@ TEST(ReplSetConfig, ParseFailsWithNoElectableNodes) {
     const BSONObj configBsonOneElectableNode = BSON("_id"
                                                     << "rs0"
                                                     << "version"
+                                                    << 1
+                                                    << "protocolVersion"
                                                     << 1
                                                     << "members"
                                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -475,6 +515,8 @@ TEST(ReplSetConfig, ParseFailsWithTooFewVoters) {
     const BSONObj configBsonNoVoters = BSON("_id"
                                             << "rs0"
                                             << "version"
+                                            << 1
+                                            << "protocolVersion"
                                             << 1
                                             << "members"
                                             << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -496,6 +538,8 @@ TEST(ReplSetConfig, ParseFailsWithTooFewVoters) {
     const BSONObj configBsonOneVoter = BSON("_id"
                                             << "rs0"
                                             << "version"
+                                            << 1
+                                            << "protocolVersion"
                                             << 1
                                             << "members"
                                             << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -526,6 +570,8 @@ TEST(ReplSetConfig, ParseFailsWithDuplicateHost) {
                                     << "rs0"
                                     << "version"
                                     << 1
+                                    << "protocolVersion"
+                                    << 1
                                     << "members"
                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                              << "localhost:1")
@@ -542,6 +588,7 @@ TEST(ReplSetConfig, ParseFailsWithTooManyNodes) {
     mmb::Element configDocRoot = configDoc.root();
     ASSERT_OK(configDocRoot.appendString("_id", "rs0"));
     ASSERT_OK(configDocRoot.appendInt("version", 1));
+    ASSERT_OK(configDocRoot.appendInt("protocolVersion", 1));
     mmb::Element membersArray = configDoc.makeElementArray("members");
     ASSERT_OK(configDocRoot.pushBack(membersArray));
     for (size_t i = 0; i < ReplSetConfig::kMaxMembers; ++i) {
@@ -579,6 +626,8 @@ TEST(ReplSetConfig, ParseFailsWithUnexpectedField) {
                                            << "rs0"
                                            << "version"
                                            << 1
+                                           << "protocolVersion"
+                                           << 1
                                            << "unexpectedfield"
                                            << "value"));
     ASSERT_EQUALS(ErrorCodes::BadValue, status);
@@ -590,6 +639,8 @@ TEST(ReplSetConfig, ParseFailsWithNonArrayMembersField) {
                                            << "rs0"
                                            << "version"
                                            << 1
+                                           << "protocolVersion"
+                                           << 1
                                            << "members"
                                            << "value"));
     ASSERT_EQUALS(ErrorCodes::TypeMismatch, status);
@@ -600,6 +651,8 @@ TEST(ReplSetConfig, ParseFailsWithNonNumericHeartbeatIntervalMillisField) {
     Status status = config.initialize(BSON("_id"
                                            << "rs0"
                                            << "version"
+                                           << 1
+                                           << "protocolVersion"
                                            << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -621,6 +674,8 @@ TEST(ReplSetConfig, ParseFailsWithNonNumericElectionTimeoutMillisField) {
                                            << "rs0"
                                            << "version"
                                            << 1
+                                           << "protocolVersion"
+                                           << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                     << "localhost:12345"))
@@ -635,6 +690,8 @@ TEST(ReplSetConfig, ParseFailsWithNonNumericHeartbeatTimeoutSecsField) {
     Status status = config.initialize(BSON("_id"
                                            << "rs0"
                                            << "version"
+                                           << 1
+                                           << "protocolVersion"
                                            << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -651,6 +708,8 @@ TEST(ReplSetConfig, ParseFailsWithNonBoolChainingAllowedField) {
                                            << "rs0"
                                            << "version"
                                            << 1
+                                           << "protocolVersion"
+                                           << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                     << "localhost:12345"))
@@ -666,6 +725,8 @@ TEST(ReplSetConfig, ParseFailsWithNonBoolConfigServerField) {
                                            << "rs0"
                                            << "version"
                                            << 1
+                                           << "protocolVersion"
+                                           << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                     << "localhost:12345"))
@@ -680,6 +741,8 @@ TEST(ReplSetConfig, ParseFailsWithNonObjectSettingsField) {
                                            << "rs0"
                                            << "version"
                                            << 1
+                                           << "protocolVersion"
+                                           << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                     << "localhost:12345"))
@@ -693,6 +756,8 @@ TEST(ReplSetConfig, ParseFailsWithGetLastErrorDefaultsFieldUnparseable) {
     Status status = config.initialize(BSON("_id"
                                            << "rs0"
                                            << "version"
+                                           << 1
+                                           << "protocolVersion"
                                            << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -709,6 +774,8 @@ TEST(ReplSetConfig, ParseFailsWithNonObjectGetLastErrorDefaultsField) {
                                            << "rs0"
                                            << "version"
                                            << 1
+                                           << "protocolVersion"
+                                           << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                     << "localhost:12345"))
@@ -723,6 +790,8 @@ TEST(ReplSetConfig, ParseFailsWithNonObjectGetLastErrorModesField) {
     Status status = config.initialize(BSON("_id"
                                            << "rs0"
                                            << "version"
+                                           << 1
+                                           << "protocolVersion"
                                            << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -739,6 +808,8 @@ TEST(ReplSetConfig, ParseFailsWithDuplicateGetLastErrorModesField) {
                                            << "rs0"
                                            << "version"
                                            << 1
+                                           << "protocolVersion"
+                                           << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                     << "localhost:12345"
@@ -749,7 +820,7 @@ TEST(ReplSetConfig, ParseFailsWithDuplicateGetLastErrorModesField) {
                                            << BSON("getLastErrorModes"
                                                    << BSON("one" << BSON("tag" << 1) << "one"
                                                                  << BSON("tag" << 1)))));
-    ASSERT_EQUALS(ErrorCodes::DuplicateKey, status);
+    ASSERT_EQUALS(51001, status.code());
 }
 
 TEST(ReplSetConfig, ParseFailsWithNonObjectGetLastErrorModesEntryField) {
@@ -757,6 +828,8 @@ TEST(ReplSetConfig, ParseFailsWithNonObjectGetLastErrorModesEntryField) {
     Status status = config.initialize(BSON("_id"
                                            << "rs0"
                                            << "version"
+                                           << 1
+                                           << "protocolVersion"
                                            << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -775,6 +848,8 @@ TEST(ReplSetConfig, ParseFailsWithNonNumericGetLastErrorModesConstraintValue) {
         config.initialize(BSON("_id"
                                << "rs0"
                                << "version"
+                               << 1
+                               << "protocolVersion"
                                << 1
                                << "members"
                                << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -795,6 +870,8 @@ TEST(ReplSetConfig, ParseFailsWithNegativeGetLastErrorModesConstraintValue) {
                                << "rs0"
                                << "version"
                                << 1
+                               << "protocolVersion"
+                               << 1
                                << "members"
                                << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                         << "localhost:12345"
@@ -813,6 +890,8 @@ TEST(ReplSetConfig, ParseFailsWithNonExistentGetLastErrorModesConstraintTag) {
                                << "rs0"
                                << "version"
                                << 1
+                               << "protocolVersion"
+                               << 1
                                << "members"
                                << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                         << "localhost:12345"
@@ -822,6 +901,22 @@ TEST(ReplSetConfig, ParseFailsWithNonExistentGetLastErrorModesConstraintTag) {
                                << "settings"
                                << BSON("getLastErrorModes" << BSON("one" << BSON("tag2" << 1)))));
     ASSERT_EQUALS(ErrorCodes::NoSuchKey, status);
+}
+
+TEST(ReplSetConfig, ParseFailsWithRepairField) {
+    ReplSetConfig config;
+    Status status = config.initialize(BSON("_id"
+                                           << "rs0"
+                                           << "repaired"
+                                           << true
+                                           << "version"
+                                           << 1
+                                           << "protocolVersion"
+                                           << 1
+                                           << "members"
+                                           << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                    << "localhost:12345"))));
+    ASSERT_EQUALS(ErrorCodes::RepairedReplicaSetNode, status);
 }
 
 TEST(ReplSetConfig, ValidateFailsWithBadProtocolVersion) {
@@ -843,11 +938,32 @@ TEST(ReplSetConfig, ValidateFailsWithBadProtocolVersion) {
     ASSERT_EQUALS(ErrorCodes::BadValue, status);
 }
 
+TEST(ReplSetConfig, ValidateFailsWithProtocolVersion0) {
+    ReplSetConfig config;
+    Status status = config.initialize(BSON("_id"
+                                           << "rs0"
+                                           << "protocolVersion"
+                                           << 0
+                                           << "version"
+                                           << 1
+                                           << "members"
+                                           << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                    << "localhost:12345")
+                                                         << BSON("_id" << 1 << "host"
+                                                                       << "localhost:54321"))));
+    ASSERT_OK(status);
+
+    status = config.validate();
+    ASSERT_EQUALS(ErrorCodes::BadValue, status);
+}
+
 TEST(ReplSetConfig, ValidateFailsWithDuplicateMemberId) {
     ReplSetConfig config;
     Status status = config.initialize(BSON("_id"
                                            << "rs0"
                                            << "version"
+                                           << 1
+                                           << "protocolVersion"
                                            << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -866,6 +982,8 @@ TEST(ReplSetConfig, ValidateFailsWithInvalidMember) {
                                            << "rs0"
                                            << "version"
                                            << 1
+                                           << "protocolVersion"
+                                           << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                     << "localhost:12345"
@@ -883,6 +1001,8 @@ TEST(ReplSetConfig, ChainingAllowedField) {
                                      << "rs0"
                                      << "version"
                                      << 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345"))
@@ -894,6 +1014,8 @@ TEST(ReplSetConfig, ChainingAllowedField) {
     ASSERT_OK(config.initialize(BSON("_id"
                                      << "rs0"
                                      << "version"
+                                     << 1
+                                     << "protocolVersion"
                                      << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -923,6 +1045,8 @@ TEST(ReplSetConfig, ConfigServerField) {
     ASSERT_OK(config2.initialize(BSON("_id"
                                       << "rs0"
                                       << "version"
+                                      << 1
+                                      << "protocolVersion"
                                       << 1
                                       << "configsvr"
                                       << false
@@ -1004,6 +1128,8 @@ TEST(ReplSetConfig, HeartbeatIntervalField) {
                                      << "rs0"
                                      << "version"
                                      << 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345"))
@@ -1015,6 +1141,8 @@ TEST(ReplSetConfig, HeartbeatIntervalField) {
     ASSERT_OK(config.initialize(BSON("_id"
                                      << "rs0"
                                      << "version"
+                                     << 1
+                                     << "protocolVersion"
                                      << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -1030,6 +1158,8 @@ TEST(ReplSetConfig, ElectionTimeoutField) {
                                      << "rs0"
                                      << "version"
                                      << 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345"))
@@ -1041,6 +1171,8 @@ TEST(ReplSetConfig, ElectionTimeoutField) {
     auto status = config.initialize(BSON("_id"
                                          << "rs0"
                                          << "version"
+                                         << 1
+                                         << "protocolVersion"
                                          << 1
                                          << "members"
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -1057,6 +1189,8 @@ TEST(ReplSetConfig, HeartbeatTimeoutField) {
                                      << "rs0"
                                      << "version"
                                      << 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345"))
@@ -1068,6 +1202,8 @@ TEST(ReplSetConfig, HeartbeatTimeoutField) {
     auto status = config.initialize(BSON("_id"
                                          << "rs0"
                                          << "version"
+                                         << 1
+                                         << "protocolVersion"
                                          << 1
                                          << "members"
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -1084,6 +1220,8 @@ TEST(ReplSetConfig, GleDefaultField) {
                                      << "rs0"
                                      << "version"
                                      << 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345"))
@@ -1097,6 +1235,8 @@ TEST(ReplSetConfig, GleDefaultField) {
                                      << "rs0"
                                      << "version"
                                      << 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345"))
@@ -1109,6 +1249,8 @@ TEST(ReplSetConfig, GleDefaultField) {
                                      << "rs0"
                                      << "version"
                                      << 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345"))
@@ -1120,6 +1262,8 @@ TEST(ReplSetConfig, GleDefaultField) {
         config.initialize(BSON("_id"
                                << "rs0"
                                << "version"
+                               << 1
+                               << "protocolVersion"
                                << 1
                                << "members"
                                << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -1213,6 +1357,8 @@ TEST(ReplSetConfig, toBSONRoundTripAbility) {
         << "rs0"
         << "version"
         << 1
+        << "protocolVersion"
+        << 1
         << "members"
         << BSON_ARRAY(BSON("_id" << 0 << "host"
                                  << "localhost:12345"))
@@ -1271,7 +1417,7 @@ TEST(ReplSetConfig, toBSONRoundTripAbilityLarge) {
                                                  << "hdd"
                                                  << "true")))
              << "protocolVersion"
-             << 0
+             << 1
              << "settings"
 
              << BSON("heartbeatIntervalMillis" << 5000 << "heartbeatTimeoutSecs" << 20
@@ -1287,8 +1433,6 @@ TEST(ReplSetConfig, toBSONRoundTripAbilityLarge) {
                                                                << "coasts"
                                                                << BSON("coast" << 2))))));
     BSONObj configObjA = configA.toBSON();
-    // Ensure a protocolVersion does not show up if it is 0 to maintain cross version compatibility.
-    ASSERT_FALSE(configObjA.hasField("protocolVersion"));
     ASSERT_OK(configB.initialize(configObjA));
     ASSERT_TRUE(configA == configB);
 }
@@ -1301,6 +1445,8 @@ TEST(ReplSetConfig, toBSONRoundTripAbilityInvalid) {
                                 << ""
                                 << "version"
                                 << -3
+                                << "protocolVersion"
+                                << 1
                                 << "members"
                                 << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                          << "localhost:12345"
@@ -1340,6 +1486,8 @@ TEST(ReplSetConfig, CheckIfWriteConcernCanBeSatisfied) {
     ASSERT_OK(configA.initialize(BSON("_id"
                                       << "rs0"
                                       << "version"
+                                      << 1
+                                      << "protocolVersion"
                                       << 1
                                       << "members"
                                       << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -1395,7 +1543,7 @@ TEST(ReplSetConfig, CheckIfWriteConcernCanBeSatisfied) {
 
     WriteConcernOptions invalidNumberWC;
     invalidNumberWC.wNumNodes = 6;
-    ASSERT_EQUALS(ErrorCodes::CannotSatisfyWriteConcern,
+    ASSERT_EQUALS(ErrorCodes::UnsatisfiableWriteConcern,
                   configA.checkIfWriteConcernCanBeSatisfied(invalidNumberWC));
 
     WriteConcernOptions majorityWC;
@@ -1413,12 +1561,12 @@ TEST(ReplSetConfig, CheckIfWriteConcernCanBeSatisfied) {
 
     WriteConcernOptions invalidModeNotEnoughValuesWC;
     invalidModeNotEnoughValuesWC.wMode = "invalidNotEnoughValues";
-    ASSERT_EQUALS(ErrorCodes::CannotSatisfyWriteConcern,
+    ASSERT_EQUALS(ErrorCodes::UnsatisfiableWriteConcern,
                   configA.checkIfWriteConcernCanBeSatisfied(invalidModeNotEnoughValuesWC));
 
     WriteConcernOptions invalidModeNotEnoughNodesWC;
     invalidModeNotEnoughNodesWC.wMode = "invalidNotEnoughNodes";
-    ASSERT_EQUALS(ErrorCodes::CannotSatisfyWriteConcern,
+    ASSERT_EQUALS(ErrorCodes::UnsatisfiableWriteConcern,
                   configA.checkIfWriteConcernCanBeSatisfied(invalidModeNotEnoughNodesWC));
 }
 
@@ -1442,28 +1590,6 @@ TEST(ReplSetConfig, CheckBeyondMaximumNodesFailsValidate) {
     ASSERT_NOT_OK(configA.validate());
     ASSERT_NOT_OK(configB.validate());
     ASSERT_TRUE(configA == configB);
-}
-
-TEST(ReplSetConfig, CheckConfigServerCantBeProtocolVersion0) {
-    ReplSetConfig configA;
-    ASSERT_OK(configA.initialize(BSON("_id"
-                                      << "rs0"
-                                      << "protocolVersion"
-                                      << 0
-                                      << "version"
-                                      << 1
-                                      << "configsvr"
-                                      << true
-                                      << "members"
-                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                               << "localhost:12345")
-                                                    << BSON("_id" << 1 << "host"
-                                                                  << "localhost:54321"
-                                                                  << "arbiterOnly"
-                                                                  << true)))));
-    Status status = configA.validate();
-    ASSERT_EQUALS(ErrorCodes::BadValue, status);
-    ASSERT_STRING_CONTAINS(status.reason(), "cannot run in protocolVersion 0");
 }
 
 TEST(ReplSetConfig, CheckConfigServerCantHaveArbiters) {
@@ -1566,6 +1692,8 @@ TEST(ReplSetConfig, GetPriorityTakeoverDelay) {
                                       << "rs0"
                                       << "version"
                                       << 1
+                                      << "protocolVersion"
+                                      << 1
                                       << "members"
                                       << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                << "localhost:12345"
@@ -1600,6 +1728,8 @@ TEST(ReplSetConfig, GetPriorityTakeoverDelay) {
     ASSERT_OK(configB.initialize(BSON("_id"
                                       << "rs0"
                                       << "version"
+                                      << 1
+                                      << "protocolVersion"
                                       << 1
                                       << "members"
                                       << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -1638,6 +1768,8 @@ TEST(ReplSetConfig, GetCatchUpTakeoverDelay) {
                                      << "rs0"
                                      << "version"
                                      << 1
+                                     << "protocolVersion"
+                                     << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                               << "localhost:12345"))
@@ -1649,6 +1781,8 @@ TEST(ReplSetConfig, GetCatchUpTakeoverDelay) {
     Status status = config.initialize(BSON("_id"
                                            << "rs0"
                                            << "version"
+                                           << 1
+                                           << "protocolVersion"
                                            << 1
                                            << "members"
                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -1666,6 +1800,8 @@ TEST(ReplSetConfig, GetCatchUpTakeoverDelayDefault) {
     ASSERT_OK(config.initialize(BSON("_id"
                                      << "rs0"
                                      << "version"
+                                     << 1
+                                     << "protocolVersion"
                                      << 1
                                      << "members"
                                      << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -1685,32 +1821,7 @@ TEST(ReplSetConfig, GetCatchUpTakeoverDelayDefault) {
 }
 
 TEST(ReplSetConfig, ConfirmDefaultValuesOfAndAbilityToSetWriteConcernMajorityJournalDefault) {
-    // PV0, should default to false.
     ReplSetConfig config;
-    ASSERT_OK(config.initialize(BSON("_id"
-                                     << "rs0"
-                                     << "version"
-                                     << 1
-                                     << "members"
-                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                              << "localhost:12345")))));
-    ASSERT_OK(config.validate());
-    ASSERT_FALSE(config.getWriteConcernMajorityShouldJournal());
-    ASSERT_FALSE(config.toBSON().hasField("writeConcernMajorityJournalDefault"));
-
-    // Should be able to set it true in PV0.
-    ASSERT_OK(config.initialize(BSON("_id"
-                                     << "rs0"
-                                     << "version"
-                                     << 1
-                                     << "members"
-                                     << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                              << "localhost:12345"))
-                                     << "writeConcernMajorityJournalDefault"
-                                     << true)));
-    ASSERT_OK(config.validate());
-    ASSERT_TRUE(config.getWriteConcernMajorityShouldJournal());
-    ASSERT_TRUE(config.toBSON().hasField("writeConcernMajorityJournalDefault"));
 
     // PV1, should default to true.
     ASSERT_OK(config.initialize(BSON("_id"
@@ -1724,7 +1835,7 @@ TEST(ReplSetConfig, ConfirmDefaultValuesOfAndAbilityToSetWriteConcernMajorityJou
                                                               << "localhost:12345")))));
     ASSERT_OK(config.validate());
     ASSERT_TRUE(config.getWriteConcernMajorityShouldJournal());
-    ASSERT_FALSE(config.toBSON().hasField("writeConcernMajorityJournalDefault"));
+    ASSERT_TRUE(config.toBSON().hasField("writeConcernMajorityJournalDefault"));
 
     // Should be able to set it false in PV1.
     ASSERT_OK(config.initialize(BSON("_id"
@@ -1754,6 +1865,8 @@ TEST(ReplSetConfig, ReplSetId) {
                                                    << "rs0"
                                                    << "version"
                                                    << 1
+                                                   << "protocolVersion"
+                                                   << 1
                                                    << "members"
                                                    << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                             << "localhost:12345"
@@ -1774,6 +1887,8 @@ TEST(ReplSetConfig, ReplSetId) {
                                                   << "rs0"
                                                   << "version"
                                                   << 1
+                                                  << "protocolVersion"
+                                                  << 1
                                                   << "members"
                                                   << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                            << "localhost:12345"
@@ -1788,6 +1903,8 @@ TEST(ReplSetConfig, ReplSetId) {
     ASSERT_OK(configLocal.initialize(BSON("_id"
                                           << "rs0"
                                           << "version"
+                                          << 1
+                                          << "protocolVersion"
                                           << 1
                                           << "members"
                                           << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -1806,12 +1923,13 @@ TEST(ReplSetConfig, ReplSetId) {
                                           << "rs0"
                                           << "version"
                                           << 1
+                                          << "protocolVersion"
+                                          << 1
                                           << "members"
                                           << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                    << "localhost:12345"
                                                                    << "priority"
                                                                    << 1))),
-                                     true,
                                      defaultReplicaSetId));
     ASSERT_OK(configLocal.validate());
     ASSERT_TRUE(configLocal.hasReplicaSetId());
@@ -1821,6 +1939,8 @@ TEST(ReplSetConfig, ReplSetId) {
     status = configLocal.initialize(BSON("_id"
                                          << "rs0"
                                          << "version"
+                                         << 1
+                                         << "protocolVersion"
                                          << 1
                                          << "members"
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -1836,6 +1956,8 @@ TEST(ReplSetConfig, ReplSetId) {
     status = configLocal.initialize(BSON("_id"
                                          << "rs0"
                                          << "version"
+                                         << 1
+                                         << "protocolVersion"
                                          << 1
                                          << "members"
                                          << BSON_ARRAY(BSON("_id" << 0 << "host"

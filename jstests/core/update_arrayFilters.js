@@ -1,13 +1,15 @@
 // Cannot implicitly shard accessed collections because of collection existing when none
 // expected.
-// @tags: [assumes_no_implicit_collection_creation_after_drop]
+// @tags: [assumes_no_implicit_collection_creation_after_drop, requires_non_retryable_writes]
 
 // Tests for the arrayFilters option to update and findAndModify.
 (function() {
     "use strict";
 
-    let coll = db.update_arrayFilters;
+    const collName = "update_arrayFilters";
+    let coll = db[collName];
     coll.drop();
+    assert.commandWorked(db.createCollection(collName));
     let res;
 
     //
@@ -512,9 +514,9 @@
 
         // arrayFilters respect the collection default collation.
         coll.drop();
-        assert.commandWorked(db.createCollection("update_arrayFilters",
-                                                 {collation: {locale: "en_US", strength: 2}}));
-        coll = db.update_arrayFilters;
+        assert.commandWorked(
+            db.createCollection(collName, {collation: {locale: "en_US", strength: 2}}));
+        coll = db[collName];
         assert.writeOK(coll.insert({_id: 0, a: ["foo", "FOO"]}));
         assert.writeOK(
             coll.update({_id: 0}, {$set: {"a.$[i]": "bar"}}, {arrayFilters: [{i: "foo"}]}));
@@ -639,11 +641,12 @@
 
         res = coll.update({_id: 0}, {$set: {"a.$[I]": 1}}, {arrayFilters: [{"I": 0}]});
         assert.writeErrorWithCode(res, ErrorCodes.BadValue);
-        assert.neq(
-            -1,
-            res.getWriteError().errmsg.indexOf(
-                "Error parsing array filter: The top-level field name must be an alphanumeric string beginning with a lowercase letter, found 'I'"),
-            "update failed for a reason other than bad array filter identifier");
+        assert(res.getWriteError().errmsg.startsWith("Error parsing array filter") &&
+                   res.getWriteError().errmsg.endsWith(
+                       "The top-level field name must be an alphanumeric " +
+                       "string beginning with a lowercase letter, found 'I'"),
+               "update failed for a reason other than bad array filter identifier: " +
+                   tojson(res.getWriteError()));
 
         assert.writeOK(coll.insert({_id: 0, a: [0], b: [{j: 0}]}));
         res = coll.update(

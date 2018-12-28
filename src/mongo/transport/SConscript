@@ -4,27 +4,15 @@ Import('env')
 
 env = env.Clone()
 
-env.CppUnitTest(
-    target='ingress_header_test',
-    source=[
-        'ingress_header_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
 env.Library(
     target='transport_layer_common',
     source=[
         'service_entry_point_utils.cpp',
         'session.cpp',
-        'ticket.cpp',
         'transport_layer.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/util/net/network',
-        '$BUILD_DIR/mongo/transport/message_compressor',
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -35,6 +23,9 @@ env.Library(
     ],
     LIBDEPS=[
         'transport_layer_common',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/util/net/network',
     ],
 )
 
@@ -58,9 +49,7 @@ tlEnv.Library(
 tlEnv.Library(
     target='transport_layer',
     source=[
-        'ticket_asio.cpp',
         'transport_layer_asio.cpp',
-        'transport_layer_legacy.cpp',
     ],
     LIBDEPS=[
         'transport_layer_common',
@@ -71,6 +60,51 @@ tlEnv.Library(
         '$BUILD_DIR/mongo/db/stats/counters',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/util/net/ssl_manager',
+        '$BUILD_DIR/third_party/shim_asio',
+    ],
+)
+
+# This library will initialize an egress transport layer in a mongo initializer
+# for C++ tests that require networking.
+env.Library(
+    target='transport_layer_egress_init',
+    source=[
+        'transport_layer_egress_init.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        'transport_layer',
+    ]
+)
+
+tlEnv.CppUnitTest(
+    target='transport_layer_asio_test',
+    source=[
+        'transport_layer_asio_test.cpp',
+    ],
+    LIBDEPS=[
+        'transport_layer',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/rpc/protocol',
+        '$BUILD_DIR/mongo/util/net/socket',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/third_party/shim_asio',
+    ],
+)
+
+tlEnv.CppIntegrationTest(
+    target='transport_layer_asio_integration_test',
+    source=[
+        'transport_layer_asio_integration_test.cpp',
+    ],
+    LIBDEPS=[
+        'transport_layer_egress_init',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/client/async_client',
+        '$BUILD_DIR/mongo/executor/task_executor_interface',
+        '$BUILD_DIR/mongo/util/net/network',
+        '$BUILD_DIR/mongo/util/version_impl',
         '$BUILD_DIR/third_party/shim_asio',
     ],
 )
@@ -79,13 +113,29 @@ tlEnv.Library(
     target='service_executor',
     source=[
         'service_executor_adaptive.cpp',
-        'service_executor_synchronous.cpp'
+        'service_executor_reserved.cpp',
+        'service_executor_synchronous.cpp',
+        'thread_idle_callback.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/service_context',
     ],
     LIBDEPS_PRIVATE=[
         "$BUILD_DIR/mongo/util/processinfo",
+        '$BUILD_DIR/third_party/shim_asio',
+        'transport_layer_common',
+    ],
+)
+
+tlEnv.CppUnitTest(
+    target='service_executor_test',
+    source=[
+        'service_executor_test.cpp',
+    ],
+    LIBDEPS=[
+        'service_executor',
+        '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/unittest/unittest',
         '$BUILD_DIR/third_party/shim_asio',
     ],
 )
@@ -108,17 +158,6 @@ tlEnv.Library(
 # )
 
 env.Library(
-    target='service_entry_point_test_suite',
-    source=[
-        'service_entry_point_test_suite.cpp',
-    ],
-    LIBDEPS=[
-        'transport_layer_common',
-        '$BUILD_DIR/mongo/unittest/unittest',
-    ],
-)
-
-env.Library(
     target='service_entry_point',
     source=[
         'service_entry_point_impl.cpp',
@@ -127,21 +166,27 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/auth/authentication_restriction',
         '$BUILD_DIR/mongo/db/server_options_core',
-        "$BUILD_DIR/mongo/db/service_context",
+        '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/stats/counters',
-        "$BUILD_DIR/mongo/util/processinfo",
+        '$BUILD_DIR/mongo/rpc/protocol',
+        '$BUILD_DIR/mongo/util/processinfo',
+        'service_executor',
         'transport_layer_common',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/transport/message_compressor',
     ],
 )
 
 env.CppUnitTest(
-    target='service_entry_point_mock_test',
+    target='max_conns_override_test',
     source=[
-        'service_entry_point_mock.cpp',
-        'service_entry_point_mock_test.cpp',
+        'max_conns_override_test.cpp',
     ],
     LIBDEPS=[
-        'service_entry_point_test_suite',
+        'service_entry_point',
+        'transport_layer_mock',
+        '$BUILD_DIR/mongo/unittest/unittest'
     ],
 )
 
@@ -156,27 +201,14 @@ env.CppUnitTest(
         'transport_layer_mock',
         '$BUILD_DIR/mongo/db/dbmessage',
         '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/rpc/command_reply',
-        '$BUILD_DIR/mongo/rpc/command_request',
+        '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/mongo/unittest/unittest',
         '$BUILD_DIR/mongo/util/clock_source_mock',
-        '$BUILD_DIR/mongo/util/decorable',
     ],
 )
-
-env.CppUnitTest(
-    target='transport_layer_mock_test',
-    source=[
-        'transport_layer_mock_test.cpp',
-    ],
-    LIBDEPS=[
-        'transport_layer_mock',
-    ],
-)
-
 
 zlibEnv = env.Clone()
-zlibEnv.InjectThirdPartyIncludePaths(libraries=['zlib', 'snappy'])
+zlibEnv.InjectThirdPartyIncludePaths(libraries=['zlib', 'zstd', 'snappy'])
 zlibEnv.Library(
     target='message_compressor',
     source=[
@@ -185,13 +217,14 @@ zlibEnv.Library(
         'message_compressor_registry.cpp',
         'message_compressor_snappy.cpp',
         'message_compressor_zlib.cpp',
+        'message_compressor_zstd.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/util/decorable',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
         '$BUILD_DIR/third_party/shim_snappy',
         '$BUILD_DIR/third_party/shim_zlib',
+        '$BUILD_DIR/third_party/shim_zstd',
     ]
 )
 
@@ -204,17 +237,5 @@ env.CppUnitTest(
     LIBDEPS=[
         'message_compressor',
     ]
-)
-
-env.CppUnitTest(
-    target='transport_layer_legacy_test',
-    source=[
-        'transport_layer_legacy_test.cpp',
-    ],
-    LIBDEPS=[
-        'transport_layer',
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
-    ],
 )
 

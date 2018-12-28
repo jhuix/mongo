@@ -1,3 +1,11 @@
+// @tags: [
+//     requires_non_retryable_commands,
+//     requires_fastcount,
+//
+//     # applyOps uses the oplog that require replication support
+//     requires_replication,
+// ]
+
 (function() {
     "use strict";
 
@@ -204,82 +212,6 @@
     }),
                          "Excessively nested applyOps should be rejected");
 
-    // Missing 'o' field value in an operation of type 'i' on 'system.indexes' collection.
-    assert.commandFailedWithCode(
-        db.adminCommand({applyOps: [{op: 'i', ns: db.getName() + '.system.indexes'}]}),
-        ErrorCodes.NoSuchKey,
-        'applyOps should fail on system.indexes insert operation without "o" field');
-
-    // Non-object 'o' field value in an operation of type 'i' on 'system.indexes' collection.
-    assert.commandFailedWithCode(
-        db.adminCommand({applyOps: [{op: 'i', ns: db.getName() + '.system.indexes', o: 'bar'}]}),
-        ErrorCodes.TypeMismatch,
-        'applyOps should fail on system.indexes insert operation with non-object "o" field');
-
-    // Missing 'ns' field in index spec.
-    assert.commandFailedWithCode(
-        db.adminCommand({
-            applyOps: [{
-                op: 'i',
-                ns: db.getName() + '.system.indexes',
-                o: {
-                    key: {a: 1},
-                    name: 'a_1',
-                }
-            }]
-        }),
-        ErrorCodes.NoSuchKey,
-        'applyOps should fail on system.indexes insert operation with missing index namespace');
-
-    // Non-string 'ns' field in index spec.
-    assert.commandFailedWithCode(
-        db.adminCommand({
-            applyOps: [{
-                op: 'i',
-                ns: db.getName() + '.system.indexes',
-                o: {
-                    ns: 12345,
-                    key: {a: 1},
-                    name: 'a_1',
-                }
-            }]
-        }),
-        ErrorCodes.TypeMismatch,
-        'applyOps should fail on system.indexes insert operation with non-string index namespace');
-
-    // Invalid 'ns' field in index spec.
-    assert.commandFailedWithCode(
-        db.adminCommand({
-            applyOps: [{
-                op: 'i',
-                ns: db.getName() + '.system.indexes',
-                o: {
-                    ns: 'invalid_namespace',
-                    key: {a: 1},
-                    name: 'a_1',
-                }
-            }]
-        }),
-        ErrorCodes.InvalidNamespace,
-        'applyOps should fail on system.indexes insert operation with invalid index namespace');
-
-    // Inconsistent database name in index spec namespace.
-    assert.commandFailedWithCode(
-        db.adminCommand({
-            applyOps: [{
-                op: 'i',
-                ns: db.getName() + '.system.indexes',
-                o: {
-                    ns: 'baddbprefix' + t.getFullName(),
-                    key: {a: 1},
-                    name: 'a_1',
-                }
-            }]
-        }),
-        ErrorCodes.InvalidNamespace,
-        'applyOps should fail on system.indexes insert operation with index namespace containing ' +
-            'inconsistent database name');
-
     // Valid 'ns' field value in unknown operation type 'x'.
     assert.commandFailed(
         db.adminCommand({applyOps: [{op: 'x', ns: t.getFullName()}]}),
@@ -289,7 +221,8 @@
 
     /**
      * Test function for running CRUD operations on non-existent namespaces using various
-     * combinations of invalid namespaces (collection/database), allowAtomic and alwaysUpsert.
+     * combinations of invalid namespaces (collection/database), allowAtomic and alwaysUpsert,
+     * and nesting.
      *
      * Leave 'expectedErrorCode' undefined if this command is expected to run successfully.
      */
@@ -298,19 +231,23 @@
         const t2 = db.getSiblingDB('apply_ops1_no_such_db').getCollection('t');
         [t, t2].forEach(coll => {
             const op = {op: optype, ns: coll.getFullName(), o: o, o2: o2};
-            [false, true].forEach(allowAtomic => {
-                [false, true].forEach(alwaysUpsert => {
-                    const cmd = {
-                        applyOps: [op],
-                        allowAtomic: allowAtomic,
-                        alwaysUpsert: alwaysUpsert
-                    };
-                    jsTestLog('Testing applyOps on non-existent namespace: ' + tojson(cmd));
-                    if (expectedErrorCode === ErrorCodes.OK) {
-                        assert.commandWorked(db.adminCommand(cmd));
-                    } else {
-                        assert.commandFailedWithCode(db.adminCommand(cmd), expectedErrorCode);
-                    }
+            [false, true].forEach(nested => {
+                const opToRun =
+                    nested ? {op: 'c', ns: 'test.$cmd', o: {applyOps: [op]}, o2: {}} : op;
+                [false, true].forEach(allowAtomic => {
+                    [false, true].forEach(alwaysUpsert => {
+                        const cmd = {
+                            applyOps: [opToRun],
+                            allowAtomic: allowAtomic,
+                            alwaysUpsert: alwaysUpsert
+                        };
+                        jsTestLog('Testing applyOps on non-existent namespace: ' + tojson(cmd));
+                        if (expectedErrorCode === ErrorCodes.OK) {
+                            assert.commandWorked(db.adminCommand(cmd));
+                        } else {
+                            assert.commandFailedWithCode(db.adminCommand(cmd), expectedErrorCode);
+                        }
+                    });
                 });
             });
         });
@@ -428,7 +365,10 @@
     assert.eq(true, res.results[1], "Valid update failed");
 
     // Ops with transaction numbers are valid.
-    var lsid = {id: UUID()};
+    const lsid = {
+        "id": UUID("3eea4a58-6018-40b6-8743-6a55783bf902"),
+        "uid": BinData(0, "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=")
+    };
     res = db.runCommand({
         applyOps: [
             {
@@ -437,7 +377,7 @@
               o: {_id: 7, x: 24},
               lsid: lsid,
               txnNumber: NumberLong(1),
-              stmdId: 0
+              stmtId: NumberInt(0)
             },
             {
               op: "u",
@@ -446,7 +386,7 @@
               o: {$set: {x: 25}},
               lsid: lsid,
               txnNumber: NumberLong(1),
-              stmdId: 1
+              stmtId: NumberInt(1)
             },
             {
               op: "d",
@@ -454,7 +394,7 @@
               o: {_id: 7},
               lsid: lsid,
               txnNumber: NumberLong(2),
-              stmdId: 0
+              stmtId: NumberInt(0)
             },
         ]
     });
@@ -463,77 +403,18 @@
     assert.eq(true, res.results[1], "Valid update with transaction number failed");
     assert.eq(true, res.results[2], "Valid delete with transaction number failed");
 
-    // Foreground index build.
-    res = assert.commandWorked(db.adminCommand({
-        applyOps: [{
-            "op": "i",
-            "ns": db.getName() + ".system.indexes",
-            "o": {
-                ns: t.getFullName(),
-                key: {a: 1},
-                name: "a_1",
-            }
-        }]
-    }));
-    assert.eq(1, res.applied, "Incorrect number of operations applied");
-    assert.eq(true, res.results[0], "Foreground index creation failed");
-    var allIndexes = t.getIndexes();
-    var spec = GetIndexHelpers.findByName(allIndexes, "a_1");
-    assert.neq(null, spec, "Foreground index 'a_1' not found: " + tojson(allIndexes));
-    assert.eq(1, spec.v, "Expected v=1 index to be built since 'v' field was omitted");
-
-    // Background indexes are created in the foreground when processed by applyOps.
-    res = assert.commandWorked(db.adminCommand({
-        applyOps: [{
-            "op": "i",
-            "ns": db.getName() + ".system.indexes",
-            "o": {
-                ns: t.getFullName(),
-                key: {b: 1},
-                name: "b_1",
-                background: true,
-            }
-        }]
-    }));
-    assert.eq(1, res.applied, "Incorrect number of operations applied");
-    assert.eq(true, res.results[0], "Background index creation failed");
-    allIndexes = t.getIndexes();
-    spec = GetIndexHelpers.findByName(allIndexes, "b_1");
-    assert.neq(null, spec, "Background index 'b_1' not found: " + tojson(allIndexes));
-    assert.eq(1, spec.v, "Expected v=1 index to be built since 'v' field was omitted");
-
-    // Foreground v=2 index build.
-    res = assert.commandWorked(db.adminCommand({
-        applyOps: [{
-            "op": "i",
-            "ns": db.getName() + ".system.indexes",
-            "o": {
-                ns: t.getFullName(),
-                key: {c: 1},
-                name: "c_1",
-                v: 2,
-            }
-        }]
-    }));
-    assert.eq(1, res.applied, "Incorrect number of operations applied");
-    assert.eq(true, res.results[0], "Foreground v=2 index creation failed");
-    allIndexes = t.getIndexes();
-    spec = GetIndexHelpers.findByName(allIndexes, "c_1");
-    assert.neq(null, spec, "Foreground index 'c_1' not found: " + tojson(allIndexes));
-    assert.eq(2, spec.v, "Expected v=2 index to be built");
-
-    // When applying a "u" (update) op, we default to 'ModifierInterface' update semantics, and
-    // $set operations get performed in user order.
+    // When applying a "u" (update) op, we default to 'UpdateNode' update semantics, and $set
+    // operations add new fields in lexicographic order.
     res = assert.commandWorked(db.adminCommand({
         applyOps: [
             {"op": "i", "ns": t.getFullName(), "o": {_id: 6}},
             {"op": "u", "ns": t.getFullName(), "o2": {_id: 6}, "o": {$set: {z: 1, a: 2}}}
         ]
     }));
-    assert.eq(t.findOne({_id: 6}), {_id: 6, z: 1, a: 2});
+    assert.eq(t.findOne({_id: 6}), {_id: 6, a: 2, z: 1});  // Note: 'a' and 'z' have been sorted.
 
-    // When we explicitly specify {$v: 0}, we should also get 'ModifierInterface' update semantics.
-    res = assert.commandWorked(db.adminCommand({
+    // 'ModifierInterface' semantics are not supported, so an update with {$v: 0} should fail.
+    res = assert.commandFailed(db.adminCommand({
         applyOps: [
             {"op": "i", "ns": t.getFullName(), "o": {_id: 7}},
             {
@@ -544,7 +425,7 @@
             }
         ]
     }));
-    assert.eq(t.findOne({_id: 7}), {_id: 7, z: 1, a: 2});
+    assert.eq(res.code, 40682);
 
     // When we explicitly specify {$v: 1}, we should get 'UpdateNode' update semantics, and $set
     // operations get performed in lexicographic order.

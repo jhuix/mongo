@@ -172,4 +172,43 @@
     ixscan = getAggPlanStage(explain, "IXSCAN");
     assert.neq(null, ixscan, tojson(explain));
     assert.eq({"a.b.c": 1}, ixscan.keyPattern, tojson(ixscan));
+
+    // Test that we correctly match on the subfield of a renamed field. Here, a match on "x.b.c"
+    // follows an "a" to "x" rename. When we move the match stage in front of the rename, the match
+    // should also get rewritten to use "a.b.c" as its filter.
+    pipeline = [{$project: {x: "$a"}}, {$match: {"x.b.c": 1}}];
+    assert.eq([{_id: 0, x: [{b: [{c: 1}, {c: 2}]}, {b: [{c: 3}, {c: 4}]}]}],
+              coll.aggregate(pipeline).toArray());
+    explain = coll.explain().aggregate(pipeline);
+    ixscan = getAggPlanStage(explain, "IXSCAN");
+    assert.neq(null, ixscan, tojson(explain));
+    assert.eq({"a.b.c": 1}, ixscan.keyPattern, tojson(ixscan));
+
+    // Test that we correctly match on the subfield of a renamed field when the rename results from
+    // a $map operation. Here, a match on "d.e.c" follows an "a.b" to "d.e" rename. When we move the
+    // match stage in front of the renaming $map operation, the match should also get rewritten to
+    // use "a.b.c" as its filter.
+    pipeline = [
+        {$project: {d: {$map: {input: "$a", as: "iter", in : {e: "$$iter.b"}}}}},
+        {$match: {"d.e.c": 7}}
+    ];
+    assert.eq([{_id: 1, d: [{e: [{c: 5}, {c: 6}]}, {e: [{c: 7}, {c: 8}]}]}],
+              coll.aggregate(pipeline).toArray());
+    explain = coll.explain().aggregate(pipeline);
+    ixscan = getAggPlanStage(explain, "IXSCAN");
+    assert.neq(null, ixscan, tojson(explain));
+    assert.eq({"a.b.c": 1}, ixscan.keyPattern, tojson(ixscan));
+
+    // Test multiple renames. Designed to reproduce SERVER-32690.
+    pipeline = [
+        {$_internalInhibitOptimization: {}},
+        {$project: {x: "$x", y: "$x"}},
+        {$match: {y: 1, w: 1}}
+    ];
+    assert.eq([], coll.aggregate(pipeline).toArray());
+    explain = coll.explain().aggregate(pipeline);
+    // We expect that the $match stage has been split into two, since one predicate has an
+    // applicable rename that allows swapping, while the other does not.
+    let matchStages = getAggPlanStages(explain, "$match");
+    assert.eq(2, matchStages.length);
 }());

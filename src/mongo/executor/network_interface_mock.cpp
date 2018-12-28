@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -51,7 +53,7 @@ using ResponseStatus = TaskExecutor::ResponseStatus;
 NetworkInterfaceMock::NetworkInterfaceMock()
     : _waitingToRunMask(0),
       _currentlyRunning(kNoThread),
-      _now(fassertStatusOK(18653, dateFromISOString("2014-08-01T00:00:00Z"))),
+      _now(fassert(18653, dateFromISOString("2014-08-01T00:00:00Z"))),
       _hasStarted(false),
       _inShutdown(false),
       _executorNextWakeupDate(Date_t::max()) {}
@@ -113,7 +115,8 @@ std::string NetworkInterfaceMock::getHostName() {
 
 Status NetworkInterfaceMock::startCommand(const CallbackHandle& cbHandle,
                                           RemoteCommandRequest& request,
-                                          const RemoteCommandCompletionFn& onFinish) {
+                                          RemoteCommandCompletionFn&& onFinish,
+                                          const transport::BatonHandle& baton) {
     if (inShutdown()) {
         return {ErrorCodes::ShutdownInProgress, "NetworkInterfaceMock shutdown in progress"};
     }
@@ -121,7 +124,7 @@ Status NetworkInterfaceMock::startCommand(const CallbackHandle& cbHandle,
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     const Date_t now = _now_inlock();
-    auto op = NetworkOperation(cbHandle, request, now, onFinish);
+    auto op = NetworkOperation(cbHandle, request, now, std::move(onFinish));
 
     // If we don't have a hook, or we have already 'connected' to this host, enqueue the op.
     if (!_hook || _connections.count(request.target)) {
@@ -145,7 +148,8 @@ void NetworkInterfaceMock::setHandshakeReplyForHost(
     }
 }
 
-void NetworkInterfaceMock::cancelCommand(const CallbackHandle& cbHandle) {
+void NetworkInterfaceMock::cancelCommand(const CallbackHandle& cbHandle,
+                                         const transport::BatonHandle& baton) {
     invariant(!inShutdown());
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -161,7 +165,9 @@ void NetworkInterfaceMock::_interruptWithResponse_inlock(
     const CallbackHandle& cbHandle,
     const std::vector<NetworkOperationList*> queuesToCheck,
     const ResponseStatus& response) {
-    auto matchFn = stdx::bind(&NetworkOperation::isForCallback, stdx::placeholders::_1, cbHandle);
+
+    auto matchFn = [&cbHandle](const auto& ops) { return ops.isForCallback(cbHandle); };
+
     for (auto list : queuesToCheck) {
         auto noi = std::find_if(list->begin(), list->end(), matchFn);
         if (noi == list->end()) {
@@ -173,7 +179,9 @@ void NetworkInterfaceMock::_interruptWithResponse_inlock(
     }
 }
 
-Status NetworkInterfaceMock::setAlarm(const Date_t when, const stdx::function<void()>& action) {
+Status NetworkInterfaceMock::setAlarm(const Date_t when,
+                                      unique_function<void()> action,
+                                      const transport::BatonHandle& baton) {
     if (inShutdown()) {
         return {ErrorCodes::ShutdownInProgress, "NetworkInterfaceMock shutdown in progress"};
     }
@@ -185,7 +193,7 @@ Status NetworkInterfaceMock::setAlarm(const Date_t when, const stdx::function<vo
         action();
         return Status::OK();
     }
-    _alarms.emplace(when, action);
+    _alarms.emplace(when, std::move(action));
 
     return Status::OK();
 }
@@ -225,6 +233,8 @@ void NetworkInterfaceMock::shutdown() {
     _waitingToRunMask |= kExecutorThread;  // Prevents network thread from scheduling.
     lk.unlock();
     for (NetworkOperationIterator iter = todo.begin(); iter != todo.end(); ++iter) {
+        warning() << "Mock network interface shutting down with outstanding request: "
+                  << iter->getRequest();
         iter->setResponse(
             now, {ErrorCodes::ShutdownInProgress, "Shutting down mock network", Milliseconds(0)});
         iter->finishResponse();
@@ -289,10 +299,20 @@ NetworkInterfaceMock::NetworkOperationIterator NetworkInterfaceMock::getNextRead
 }
 
 NetworkInterfaceMock::NetworkOperationIterator NetworkInterfaceMock::getFrontOfUnscheduledQueue() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    return getNthUnscheduledRequest(0);
+}
+
+NetworkInterfaceMock::NetworkOperationIterator NetworkInterfaceMock::getNthUnscheduledRequest(
+    size_t n) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     invariant(_currentlyRunning == kNetworkThread);
     invariant(_hasReadyRequests_inlock());
-    return _unscheduled.begin();
+
+    // Linear time, but it's just for testing so no big deal.
+    invariant(_unscheduled.size() > n);
+    auto it = _unscheduled.begin();
+    std::advance(it, n);
+    return it;
 }
 
 void NetworkInterfaceMock::scheduleResponse(NetworkOperationIterator noi,
@@ -310,7 +330,7 @@ void NetworkInterfaceMock::scheduleResponse(NetworkOperationIterator noi,
     if (_metadataHook && response.isOK()) {
         _metadataHook
             ->readReplyMetadata(
-                noi->getRequest().opCtx, noi->getRequest().target.toString(), response.metadata)
+                noi->getRequest().opCtx, noi->getRequest().target.toString(), response.data)
             .transitional_ignore();
     }
 
@@ -319,8 +339,7 @@ void NetworkInterfaceMock::scheduleResponse(NetworkOperationIterator noi,
 }
 
 RemoteCommandRequest NetworkInterfaceMock::scheduleSuccessfulResponse(const BSONObj& response) {
-    BSONObj metadata;
-    return scheduleSuccessfulResponse(RemoteCommandResponse(response, metadata, Milliseconds(0)));
+    return scheduleSuccessfulResponse(RemoteCommandResponse(response, Milliseconds(0)));
 }
 
 RemoteCommandRequest NetworkInterfaceMock::scheduleSuccessfulResponse(
@@ -441,18 +460,22 @@ void NetworkInterfaceMock::_enqueueOperation_inlock(
                              return a.getNextConsiderationDate() < b.getNextConsiderationDate();
                          });
 
+    const auto timeout = op.getRequest().timeout;
+    auto cbh = op.getCallbackHandle();
+
     _unscheduled.emplace(insertBefore, std::move(op));
 
-    if (op.getRequest().timeout != RemoteCommandRequest::kNoTimeout) {
-        invariant(op.getRequest().timeout >= Milliseconds(0));
-        ResponseStatus rs(ErrorCodes::NetworkTimeout, "Network timeout", Milliseconds(0));
+    if (timeout != RemoteCommandRequest::kNoTimeout) {
+        invariant(timeout >= Milliseconds(0));
+        ResponseStatus rs(
+            ErrorCodes::NetworkInterfaceExceededTimeLimit, "Network timeout", Milliseconds(0));
         std::vector<NetworkOperationList*> queuesToCheck{&_unscheduled, &_blackHoled, &_scheduled};
-        auto action = stdx::bind(&NetworkInterfaceMock::_interruptWithResponse_inlock,
-                                 this,
-                                 op.getCallbackHandle(),
-                                 queuesToCheck,
-                                 rs);
-        _alarms.emplace(_now_inlock() + op.getRequest().timeout, action);
+        _alarms.emplace(_now_inlock() + timeout, [
+            this,
+            cbh = std::move(cbh),
+            queuesToCheck = std::move(queuesToCheck),
+            rs = std::move(rs)
+        ] { _interruptWithResponse_inlock(cbh, queuesToCheck, rs); });
     }
 }
 
@@ -465,9 +488,9 @@ void NetworkInterfaceMock::_connectThenEnqueueOperation_inlock(const HostAndPort
 
     auto handshakeReply = (handshakeReplyIter != std::end(_handshakeReplies))
         ? handshakeReplyIter->second
-        : RemoteCommandResponse(BSONObj(), BSONObj(), Milliseconds(0));
+        : RemoteCommandResponse(BSONObj(), Milliseconds(0));
 
-    auto valid = _hook->validateHost(target, handshakeReply);
+    auto valid = _hook->validateHost(target, op.getRequest().cmdObj, handshakeReply);
     if (!valid.isOK()) {
         op.setResponse(_now_inlock(), valid);
         op.finishResponse();
@@ -487,13 +510,14 @@ void NetworkInterfaceMock::_connectThenEnqueueOperation_inlock(const HostAndPort
 
     if (!hookPostconnectCommand) {
         // If we don't have a post connect command, enqueue the actual command.
-        _enqueueOperation_inlock(std::move(op));
         _connections.emplace(op.getRequest().target);
+        _enqueueOperation_inlock(std::move(op));
         return;
     }
 
+    auto cbh = op.getCallbackHandle();
     // The completion handler for the postconnect command schedules the original command.
-    auto postconnectCompletionHandler = [this, op](ResponseStatus rs) mutable {
+    auto postconnectCompletionHandler = [ this, op = std::move(op) ](ResponseStatus rs) mutable {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         if (!rs.isOK()) {
             op.setResponse(_now_inlock(), rs);
@@ -509,11 +533,11 @@ void NetworkInterfaceMock::_connectThenEnqueueOperation_inlock(const HostAndPort
             return;
         }
 
-        _enqueueOperation_inlock(std::move(op));
         _connections.emplace(op.getRequest().target);
+        _enqueueOperation_inlock(std::move(op));
     };
 
-    auto postconnectOp = NetworkOperation(op.getCallbackHandle(),
+    auto postconnectOp = NetworkOperation(cbh,
                                           std::move(*hookPostconnectCommand),
                                           _now_inlock(),
                                           std::move(postconnectCompletionHandler));
@@ -546,7 +570,7 @@ void NetworkInterfaceMock::signalWorkAvailable() {
 
 void NetworkInterfaceMock::_runReadyNetworkOperations_inlock(stdx::unique_lock<stdx::mutex>* lk) {
     while (!_alarms.empty() && _now_inlock() >= _alarms.top().when) {
-        auto fn = _alarms.top().action;
+        auto fn = std::move(_alarms.top().action);
         _alarms.pop();
         lk->unlock();
         fn();
@@ -554,7 +578,7 @@ void NetworkInterfaceMock::_runReadyNetworkOperations_inlock(stdx::unique_lock<s
     }
     while (!_scheduled.empty() && _scheduled.front().getResponseDate() <= _now_inlock()) {
         invariant(_currentlyRunning == kNetworkThread);
-        NetworkOperation op = _scheduled.front();
+        NetworkOperation op = std::move(_scheduled.front());
         _scheduled.pop_front();
         _waitingToRunMask |= kExecutorThread;
         lk->unlock();
@@ -620,16 +644,14 @@ NetworkInterfaceMock::NetworkOperation::NetworkOperation()
 NetworkInterfaceMock::NetworkOperation::NetworkOperation(const CallbackHandle& cbHandle,
                                                          const RemoteCommandRequest& theRequest,
                                                          Date_t theRequestDate,
-                                                         const RemoteCommandCompletionFn& onFinish)
+                                                         RemoteCommandCompletionFn onFinish)
     : _requestDate(theRequestDate),
       _nextConsiderationDate(theRequestDate),
       _responseDate(),
       _cbHandle(cbHandle),
       _request(theRequest),
       _response(kUnsetResponse),
-      _onFinish(onFinish) {}
-
-NetworkInterfaceMock::NetworkOperation::~NetworkOperation() {}
+      _onFinish(std::move(onFinish)) {}
 
 std::string NetworkInterfaceMock::NetworkOperation::getDiagnosticString() const {
     return str::stream() << "NetworkOperation -- request:'" << _request.toString()

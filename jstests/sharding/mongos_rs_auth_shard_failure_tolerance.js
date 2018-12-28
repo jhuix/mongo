@@ -15,6 +15,18 @@
 // shard does not have a primary.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
+// Replica set nodes started with --shardsvr do not enable key generation until they are added to a
+// sharded cluster and reject commands with gossiped clusterTime from users without the
+// advanceClusterTime privilege. This causes ShardingTest setup to fail because the shell briefly
+// authenticates as __system and recieves clusterTime metadata then will fail trying to gossip that
+// time later in setup.
+//
+// TODO SERVER-32672: remove this flag.
+TestData.skipGossipingClusterTime = true;
+
+// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+TestData.disableImplicitSessions = true;
+
 var options = {rs: true, rsOptions: {nodes: 2}, keyFile: "jstests/libs/key1"};
 
 var st = new ShardingTest({shards: 3, mongos: 1, other: options});
@@ -42,12 +54,13 @@ var collUnsharded = mongos.getCollection("fooUnsharded.barUnsharded");
 // Create the unsharded database with shard0 primary
 assert.writeOK(collUnsharded.insert({some: "doc"}));
 assert.writeOK(collUnsharded.remove({}));
-printjson(
+assert.commandWorked(
     admin.runCommand({movePrimary: collUnsharded.getDB().toString(), to: st.shard0.shardName}));
 
 // Create the sharded database with shard1 primary
 assert.commandWorked(admin.runCommand({enableSharding: collSharded.getDB().toString()}));
-printjson(admin.runCommand({movePrimary: collSharded.getDB().toString(), to: st.shard1.shardName}));
+assert.commandWorked(
+    admin.runCommand({movePrimary: collSharded.getDB().toString(), to: st.shard1.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: collSharded.toString(), key: {_id: 1}}));
 assert.commandWorked(admin.runCommand({split: collSharded.toString(), middle: {_id: 0}}));
 assert.commandWorked(admin.runCommand(

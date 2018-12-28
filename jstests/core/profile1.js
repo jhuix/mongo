@@ -1,3 +1,12 @@
+// @tags: [
+//   creates_and_authenticates_user,
+//   does_not_support_stepdowns,
+//   requires_capped,
+//   requires_collstats,
+//   requires_non_retryable_commands,
+//   requires_profiling,
+// ]
+
 (function() {
     "use strict";
     function profileCursor(query) {
@@ -35,7 +44,6 @@
         // With pre-created system.profile (capped)
         db.runCommand({profile: 0});
         db.getCollection("system.profile").drop();
-        assert(!db.getLastError(), "Z");
         assert.eq(0, db.runCommand({profile: -1}).was, "A");
 
         // Create 32MB profile (capped) collection

@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -60,31 +62,15 @@ using DocumentSourceLookUpTest = AggregationContextFixture;
 const long long kDefaultMaxCacheSize = internalDocumentSourceLookupCacheSizeBytes.load();
 const auto kExplain = ExplainOptions::Verbosity::kQueryPlanner;
 
-// Allow tests to temporarily switch to a different FCV.
-class EnsureFCV {
-public:
-    using Version = ServerGlobalParams::FeatureCompatibility::Version;
-    EnsureFCV(Version version)
-        : _origVersion(serverGlobalParams.featureCompatibility.getVersion()) {
-        serverGlobalParams.featureCompatibility.setVersion(version);
-    }
-    ~EnsureFCV() {
-        serverGlobalParams.featureCompatibility.setVersion(_origVersion);
-    }
-
-private:
-    const Version _origVersion;
-};
-
 // For tests which need to run in a replica set context.
 class ReplDocumentSourceLookUpTest : public DocumentSourceLookUpTest {
 public:
     void setUp() override {
+        Test::setUp();  // Will establish a feature compatibility version.
         auto service = getExpCtx()->opCtx->getServiceContext();
         repl::ReplSettings settings;
 
         settings.setReplSetString("lookupTestSet/node1:12345");
-        settings.setMajorityReadConcernEnabled(true);
 
         repl::StorageInterface::set(service, stdx::make_unique<repl::StorageInterfaceMock>());
         auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(service, settings);
@@ -101,7 +87,7 @@ public:
 TEST_F(DocumentSourceLookUpTest, PreservesParentPipelineLetVariables) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     auto varId = expCtx->variablesParseState.defineVariable("foo");
     expCtx->variables.setValue(varId, Value(123));
@@ -125,7 +111,7 @@ TEST_F(DocumentSourceLookUpTest, PreservesParentPipelineLetVariables) {
 TEST_F(DocumentSourceLookUpTest, ShouldTruncateOutputSortOnAsField) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "a");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     intrusive_ptr<DocumentSourceMock> source = DocumentSourceMock::create();
     source->sorts = {BSON("a" << 1 << "d.e" << 1 << "c" << 1)};
@@ -148,7 +134,7 @@ TEST_F(DocumentSourceLookUpTest, ShouldTruncateOutputSortOnAsField) {
 TEST_F(DocumentSourceLookUpTest, ShouldTruncateOutputSortOnSuffixOfAsField) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "a");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     intrusive_ptr<DocumentSourceMock> source = DocumentSourceMock::create();
     source->sorts = {BSON("a" << 1 << "d.e" << 1 << "c" << 1)};
@@ -171,7 +157,7 @@ TEST_F(DocumentSourceLookUpTest, ShouldTruncateOutputSortOnSuffixOfAsField) {
 TEST_F(DocumentSourceLookUpTest, AcceptsPipelineSyntax) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     auto docSource = DocumentSourceLookUp::createFromBson(
         BSON("$lookup" << BSON("from"
@@ -189,7 +175,7 @@ TEST_F(DocumentSourceLookUpTest, AcceptsPipelineSyntax) {
 TEST_F(DocumentSourceLookUpTest, AcceptsPipelineWithLetSyntax) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     auto docSource = DocumentSourceLookUp::createFromBson(
         BSON("$lookup" << BSON("from"
@@ -207,6 +193,50 @@ TEST_F(DocumentSourceLookUpTest, AcceptsPipelineWithLetSyntax) {
         expCtx);
     auto lookup = static_cast<DocumentSourceLookUp*>(docSource.get());
     ASSERT_TRUE(lookup->wasConstructedWithPipelineSyntax());
+}
+
+TEST_F(DocumentSourceLookUpTest, LookupEmptyPipelineDoesntUseDiskAndIsOKInATransaction) {
+    auto expCtx = getExpCtx();
+    NamespaceString fromNs("test", "coll");
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
+
+    auto docSource = DocumentSourceLookUp::createFromBson(
+        BSON("$lookup" << BSON("from" << fromNs.coll().toString() << "pipeline" << BSONArray()
+                                      << "as"
+                                      << "as"))
+            .firstElement(),
+        expCtx);
+    auto lookup = static_cast<DocumentSourceLookUp*>(docSource.get());
+
+    ASSERT_TRUE(lookup->wasConstructedWithPipelineSyntax());
+    ASSERT(lookup->constraints(Pipeline::SplitState::kUnsplit).diskRequirement ==
+           DocumentSource::DiskUseRequirement::kNoDiskUse);
+    ASSERT(lookup->constraints(Pipeline::SplitState::kUnsplit).transactionRequirement ==
+           DocumentSource::TransactionRequirement::kAllowed);
+}
+
+TEST_F(DocumentSourceLookUpTest, LookupWithChildStagesInheritsDiskUseRequirement) {
+    auto expCtx = getExpCtx();
+    NamespaceString fromNs("test", "coll");
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
+
+    auto docSource =
+        DocumentSourceLookUp::createFromBson(BSON("$lookup" << BSON("from"
+                                                                    << "coll"
+                                                                    << "pipeline"
+                                                                    << BSON_ARRAY(BSON("$out"
+                                                                                       << "target"))
+                                                                    << "as"
+                                                                    << "as"))
+                                                 .firstElement(),
+                                             expCtx);
+    auto lookup = static_cast<DocumentSourceLookUp*>(docSource.get());
+
+    ASSERT_TRUE(lookup->wasConstructedWithPipelineSyntax());
+    ASSERT(lookup->constraints(Pipeline::SplitState::kUnsplit).diskRequirement ==
+           DocumentSource::DiskUseRequirement::kWritesPersistentData);
+    ASSERT(lookup->constraints(Pipeline::SplitState::kUnsplit).transactionRequirement ==
+           DocumentSource::TransactionRequirement::kNotAllowed);
 }
 
 TEST_F(DocumentSourceLookUpTest, LiteParsedDocumentSourceLookupContainsExpectedNamespaces) {
@@ -238,13 +268,30 @@ TEST_F(DocumentSourceLookUpTest, LiteParsedDocumentSourceLookupContainsExpectedN
     ASSERT_EQ(2ul, namespaceSet.size());
 }
 
-TEST_F(ReplDocumentSourceLookUpTest, RejectsPipelineWithChangeStreamStage) {
-    // Temporarily set FCV to 3.6 for $changeStream.
-    EnsureFCV ensureFCV(EnsureFCV::Version::k36);
-
+TEST_F(DocumentSourceLookUpTest, RejectLookupWhenDepthLimitIsExceeded) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
+
+    expCtx->subPipelineDepth = DocumentSourceLookUp::kMaxSubPipelineDepth;
+
+    ASSERT_THROWS_CODE(DocumentSourceLookUp::createFromBson(
+                           BSON("$lookup" << BSON("from"
+                                                  << "coll"
+                                                  << "pipeline"
+                                                  << BSON_ARRAY(BSON("$match" << BSON("x" << 1)))
+                                                  << "as"
+                                                  << "as"))
+                               .firstElement(),
+                           expCtx),
+                       AssertionException,
+                       ErrorCodes::MaxSubPipelineDepthExceeded);
+}
+
+TEST_F(ReplDocumentSourceLookUpTest, RejectsPipelineWithChangeStreamStage) {
+    auto expCtx = getExpCtx();
+    NamespaceString fromNs("test", "coll");
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // Verify that attempting to create a $lookup pipeline containing a $changeStream stage fails.
     ASSERT_THROWS_CODE(
@@ -257,12 +304,9 @@ TEST_F(ReplDocumentSourceLookUpTest, RejectsPipelineWithChangeStreamStage) {
 }
 
 TEST_F(ReplDocumentSourceLookUpTest, RejectsSubPipelineWithChangeStreamStage) {
-    // Temporarily set FCV to 3.6 for $changeStream.
-    EnsureFCV ensureFCV(EnsureFCV::Version::k36);
-
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // Verify that attempting to create a sub-$lookup pipeline containing a $changeStream stage
     // fails at parse time, even if the outer pipeline does not have a $changeStream stage.
@@ -279,7 +323,7 @@ TEST_F(ReplDocumentSourceLookUpTest, RejectsSubPipelineWithChangeStreamStage) {
 TEST_F(DocumentSourceLookUpTest, RejectsLocalFieldForeignFieldWhenPipelineIsSpecified) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     try {
         auto lookupStage = DocumentSourceLookUp::createFromBson(
@@ -308,7 +352,7 @@ TEST_F(DocumentSourceLookUpTest, RejectsLocalFieldForeignFieldWhenPipelineIsSpec
 TEST_F(DocumentSourceLookUpTest, RejectsLocalFieldForeignFieldWhenLetIsSpecified) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     ASSERT_THROWS_CODE(DocumentSourceLookUp::createFromBson(BSON("$lookup" << BSON("from"
                                                                                    << "coll"
@@ -330,7 +374,7 @@ TEST_F(DocumentSourceLookUpTest, RejectsLocalFieldForeignFieldWhenLetIsSpecified
 TEST_F(DocumentSourceLookUpTest, RejectsInvalidLetVariableName) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     ASSERT_THROWS_CODE(DocumentSourceLookUp::createFromBson(
                            BSON("$lookup" << BSON("from"
@@ -381,7 +425,7 @@ TEST_F(DocumentSourceLookUpTest, RejectsInvalidLetVariableName) {
 TEST_F(DocumentSourceLookUpTest, ShouldBeAbleToReParseSerializedStage) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     auto lookupStage = DocumentSourceLookUp::createFromBson(
         BSON("$lookup" << BSON("from"
@@ -489,50 +533,49 @@ TEST(MakeMatchStageFromInput, ArrayValueWithRegexUsesOrQuery) {
  * pipeline will be removed, simulating the pipeline changes which occur when
  * PipelineD::prepareCursorSource absorbs stages into the PlanExecutor.
  */
-class MockMongoProcessInterface final : public StubMongoProcessInterface {
+class MockMongoInterface final : public StubMongoProcessInterface {
 public:
-    MockMongoProcessInterface(deque<DocumentSource::GetNextResult> mockResults,
-                              bool removeLeadingQueryStages = false)
+    MockMongoInterface(deque<DocumentSource::GetNextResult> mockResults,
+                       bool removeLeadingQueryStages = false)
         : _mockResults(std::move(mockResults)),
           _removeLeadingQueryStages(removeLeadingQueryStages) {}
 
-    bool isSharded(const NamespaceString& ns) final {
+    bool isSharded(OperationContext* opCtx, const NamespaceString& ns) final {
         return false;
     }
 
-    StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> makePipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
         const std::vector<BSONObj>& rawPipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const MakePipelineOptions opts) final {
-        auto pipeline = Pipeline::parse(rawPipeline, expCtx);
-        if (!pipeline.isOK()) {
-            return pipeline.getStatus();
-        }
+        auto pipeline = uassertStatusOK(Pipeline::parse(rawPipeline, expCtx));
 
         if (opts.optimize) {
-            pipeline.getValue()->optimizePipeline();
+            pipeline->optimizePipeline();
         }
 
         if (opts.attachCursorSource) {
-            uassertStatusOK(attachCursorSourceToPipeline(expCtx, pipeline.getValue().get()));
+            pipeline = attachCursorSourceToPipeline(expCtx, pipeline.release());
         }
 
         return pipeline;
     }
 
-    Status attachCursorSourceToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                        Pipeline* pipeline) final {
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) final {
+        std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
+                                                            PipelineDeleter(expCtx->opCtx));
+
         while (_removeLeadingQueryStages && !pipeline->getSources().empty()) {
-            if (pipeline->popFrontWithCriteria("$match") ||
-                pipeline->popFrontWithCriteria("$sort") ||
-                pipeline->popFrontWithCriteria("$project")) {
+            if (pipeline->popFrontWithName("$match") || pipeline->popFrontWithName("$sort") ||
+                pipeline->popFrontWithName("$project")) {
                 continue;
             }
             break;
         }
 
         pipeline->addInitialSource(DocumentSourceMock::create(_mockResults));
-        return Status::OK();
+        return pipeline;
     }
 
 private:
@@ -543,7 +586,7 @@ private:
 TEST_F(DocumentSourceLookUpTest, ShouldPropagatePauses) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "foreign");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // Set up the $lookup stage.
     auto lookupSpec = Document{{"$lookup",
@@ -567,8 +610,8 @@ TEST_F(DocumentSourceLookUpTest, ShouldPropagatePauses) {
     // Mock out the foreign collection.
     deque<DocumentSource::GetNextResult> mockForeignContents{Document{{"_id", 0}},
                                                              Document{{"_id", 1}}};
-    lookup->injectMongoProcessInterface(
-        std::make_shared<MockMongoProcessInterface>(std::move(mockForeignContents)));
+    expCtx->mongoProcessInterface =
+        std::make_shared<MockMongoInterface>(std::move(mockForeignContents));
 
     auto next = lookup->getNext();
     ASSERT_TRUE(next.isAdvanced());
@@ -594,7 +637,7 @@ TEST_F(DocumentSourceLookUpTest, ShouldPropagatePauses) {
 TEST_F(DocumentSourceLookUpTest, ShouldPropagatePausesWhileUnwinding) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "foreign");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // Set up the $lookup stage.
     auto lookupSpec = Document{{"$lookup",
@@ -622,8 +665,8 @@ TEST_F(DocumentSourceLookUpTest, ShouldPropagatePausesWhileUnwinding) {
     // Mock out the foreign collection.
     deque<DocumentSource::GetNextResult> mockForeignContents{Document{{"_id", 0}},
                                                              Document{{"_id", 1}}};
-    lookup->injectMongoProcessInterface(
-        std::make_shared<MockMongoProcessInterface>(std::move(mockForeignContents)));
+    expCtx->mongoProcessInterface =
+        std::make_shared<MockMongoInterface>(std::move(mockForeignContents));
 
     auto next = lookup->getNext();
     ASSERT_TRUE(next.isAdvanced());
@@ -647,7 +690,7 @@ TEST_F(DocumentSourceLookUpTest, ShouldPropagatePausesWhileUnwinding) {
 TEST_F(DocumentSourceLookUpTest, LookupReportsAsFieldIsModified) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "foreign");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // Set up the $lookup stage.
     auto lookupSpec = Document{{"$lookup",
@@ -669,7 +712,7 @@ TEST_F(DocumentSourceLookUpTest, LookupReportsAsFieldIsModified) {
 TEST_F(DocumentSourceLookUpTest, LookupReportsFieldsModifiedByAbsorbedUnwind) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "foreign");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // Set up the $lookup stage.
     auto lookupSpec = Document{{"$lookup",
@@ -702,7 +745,7 @@ BSONObj sequentialCacheStageObj(const StringData status = "kBuilding"_sd,
 TEST_F(DocumentSourceLookUpTest, ShouldCacheNonCorrelatedSubPipelinePrefix) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     auto docSource = DocumentSourceLookUp::createFromBson(
         fromjson("{$lookup: {let: {var1: '$_id'}, pipeline: [{$match: {x:1}}, {$sort: {x: 1}}, "
@@ -713,16 +756,16 @@ TEST_F(DocumentSourceLookUpTest, ShouldCacheNonCorrelatedSubPipelinePrefix) {
     auto lookupStage = static_cast<DocumentSourceLookUp*>(docSource.get());
     ASSERT(lookupStage);
 
-    lookupStage->injectMongoProcessInterface(
-        std::shared_ptr<MockMongoProcessInterface>(new MockMongoProcessInterface({})));
+    expCtx->mongoProcessInterface =
+        std::make_shared<MockMongoInterface>(std::deque<DocumentSource::GetNextResult>{});
 
     auto subPipeline = lookupStage->getSubPipeline_forTest(DOC("_id" << 5));
     ASSERT(subPipeline);
 
-    auto expectedPipe =
-        fromjson(str::stream() << "[{mock: {}}, {$match: {x:1}}, {$sort: {sortKey: {x: 1}}}, "
-                               << sequentialCacheStageObj()
-                               << ", {$addFields: {varField: {$const: 5} }}]");
+    auto expectedPipe = fromjson(
+        str::stream() << "[{mock: {}}, {$match: {x:{$eq: 1}}}, {$sort: {sortKey: {x: 1}}}, "
+                      << sequentialCacheStageObj()
+                      << ", {$addFields: {varField: {$const: 5} }}]");
 
     ASSERT_VALUE_EQ(Value(subPipeline->writeExplainOps(kExplain)), Value(BSONArray(expectedPipe)));
 }
@@ -731,7 +774,7 @@ TEST_F(DocumentSourceLookUpTest,
        ShouldDiscoverVariablesReferencedInFacetPipelineAfterAnExhaustiveAllStage) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // In the $facet stage here, the correlated $match stage comes after a $group stage which
     // returns EXHAUSTIVE_ALL for its dependencies. Verify that we continue enumerating the $facet
@@ -747,21 +790,18 @@ TEST_F(DocumentSourceLookUpTest,
     auto lookupStage = static_cast<DocumentSourceLookUp*>(docSource.get());
     ASSERT(lookupStage);
 
-    lookupStage->injectMongoProcessInterface(
-        std::shared_ptr<MockMongoProcessInterface>(new MockMongoProcessInterface({})));
+    expCtx->mongoProcessInterface =
+        std::make_shared<MockMongoInterface>(std::deque<DocumentSource::GetNextResult>{});
 
     auto subPipeline = lookupStage->getSubPipeline_forTest(DOC("_id" << 5));
     ASSERT(subPipeline);
 
-    // TODO: The '$$var1' in this expression actually gets optimized to a constant expression with
-    // value 5, but the explain output does not reflect that change. SERVER-31292 will make that
-    // optimization visible here, so we will need to replace '$$var1' with a $const expression for
-    // this test to pass.
-    auto expectedPipe =
-        fromjson(str::stream() << "[{mock: {}}, {$match: {x:1}}, {$sort: {sortKey: {x: 1}}}, "
-                               << sequentialCacheStageObj()
-                               << ", {$facet: {facetPipe: [{$group: {_id: '$_id'}}, {$match: "
-                                  "{$expr: {$eq: ['$_id', '$$var1']}}}]}}]");
+    auto expectedPipe = fromjson(
+        str::stream() << "[{mock: {}}, {$match: {x:{$eq: 1}}}, {$sort: {sortKey: {x: 1}}}, "
+                      << sequentialCacheStageObj()
+                      << ", {$facet: {facetPipe: [{$group: {_id: '$_id'}}, {$match: {$and: "
+                         "[{_id: {$_internalExprEq: 5}}, {$expr: {$eq: "
+                         "['$_id', {$const: 5}]}}]}}]}}]");
 
     ASSERT_VALUE_EQ(Value(subPipeline->writeExplainOps(kExplain)), Value(BSONArray(expectedPipe)));
 }
@@ -769,7 +809,7 @@ TEST_F(DocumentSourceLookUpTest,
 TEST_F(DocumentSourceLookUpTest, ExprEmbeddedInMatchExpressionShouldBeOptimized) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // This pipeline includes a $match stage that itself includes a $expr expression.
     auto docSource = DocumentSourceLookUp::createFromBson(
@@ -781,8 +821,8 @@ TEST_F(DocumentSourceLookUpTest, ExprEmbeddedInMatchExpressionShouldBeOptimized)
     auto lookupStage = static_cast<DocumentSourceLookUp*>(docSource.get());
     ASSERT(lookupStage);
 
-    lookupStage->injectMongoProcessInterface(
-        std::shared_ptr<MockMongoProcessInterface>(new MockMongoProcessInterface({})));
+    expCtx->mongoProcessInterface =
+        std::make_shared<MockMongoInterface>(std::deque<DocumentSource::GetNextResult>{});
 
     auto subPipeline = lookupStage->getSubPipeline_forTest(DOC("_id" << 5));
     ASSERT(subPipeline);
@@ -799,7 +839,7 @@ TEST_F(DocumentSourceLookUpTest, ExprEmbeddedInMatchExpressionShouldBeOptimized)
     matchSource.getMatchExpression()->serialize(&builder);
     auto serializedMatch = builder.obj();
     auto expectedMatch =
-        fromjson("{$and: [{_id: {$eq: 5}}, {$expr: {$eq: ['$_id', {$const: 5}]}}]}");
+        fromjson("{$and: [{_id: {$_internalExprEq: 5}}, {$expr: {$eq: ['$_id', {$const: 5}]}}]}");
 
     ASSERT_VALUE_EQ(Value(serializedMatch), Value(expectedMatch));
 }
@@ -808,7 +848,7 @@ TEST_F(DocumentSourceLookUpTest,
        ShouldIgnoreLocalVariablesShadowingLetVariablesWhenFindingNonCorrelatedPrefix) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // The $project stage defines a local variable with the same name as the $lookup 'let' variable.
     // Verify that the $project is identified as non-correlated and the cache is placed after it.
@@ -823,18 +863,18 @@ TEST_F(DocumentSourceLookUpTest,
     auto lookupStage = static_cast<DocumentSourceLookUp*>(docSource.get());
     ASSERT(lookupStage);
 
-    lookupStage->injectMongoProcessInterface(
-        std::shared_ptr<MockMongoProcessInterface>(new MockMongoProcessInterface({})));
+    expCtx->mongoProcessInterface =
+        std::make_shared<MockMongoInterface>(std::deque<DocumentSource::GetNextResult>{});
 
     auto subPipeline = lookupStage->getSubPipeline_forTest(DOC("_id" << 5));
     ASSERT(subPipeline);
 
     auto expectedPipe = fromjson(
-        str::stream()
-        << "[{mock: {}}, {$match: {x: 1}}, {$sort: {sortKey: {x: 1}}}, {$project: {_id: false, "
-           "projectedField: {$let: {vars: {var1: {$const: 'abc'}}, in: '$$var1'}}}},"
-        << sequentialCacheStageObj()
-        << ", {$addFields: {varField: {$sum: ['$x', {$const: 5}]}}}]");
+        str::stream() << "[{mock: {}}, {$match: {x: {$eq: 1}}}, {$sort: {sortKey: {x: 1}}}, "
+                         "{$project: {_id: false, "
+                         "projectedField: {$let: {vars: {var1: {$const: 'abc'}}, in: '$$var1'}}}},"
+                      << sequentialCacheStageObj()
+                      << ", {$addFields: {varField: {$sum: ['$x', {$const: 5}]}}}]");
 
     ASSERT_VALUE_EQ(Value(subPipeline->writeExplainOps(kExplain)), Value(BSONArray(expectedPipe)));
 }
@@ -842,7 +882,7 @@ TEST_F(DocumentSourceLookUpTest,
 TEST_F(DocumentSourceLookUpTest, ShouldInsertCacheBeforeCorrelatedNestedLookup) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // Create a $lookup stage whose pipeline contains nested $lookups. The third-level $lookup
     // refers to a 'let' variable defined in the top-level $lookup. Verify that the second-level
@@ -858,19 +898,19 @@ TEST_F(DocumentSourceLookUpTest, ShouldInsertCacheBeforeCorrelatedNestedLookup) 
     auto lookupStage = static_cast<DocumentSourceLookUp*>(docSource.get());
     ASSERT(lookupStage);
 
-    lookupStage->injectMongoProcessInterface(
-        std::shared_ptr<MockMongoProcessInterface>(new MockMongoProcessInterface({})));
+    expCtx->mongoProcessInterface =
+        std::make_shared<MockMongoInterface>(std::deque<DocumentSource::GetNextResult>{});
 
     auto subPipeline = lookupStage->getSubPipeline_forTest(DOC("_id" << 5));
     ASSERT(subPipeline);
 
-    auto expectedPipe =
-        fromjson(str::stream() << "[{mock: {}}, {$match: {x:1}}, {$sort: {sortKey: {x: 1}}}, "
-                               << sequentialCacheStageObj()
-                               << ", {$lookup: {from: 'coll', as: 'subas', let: {}, pipeline: "
-                                  "[{$match: {x: 1}}, {$lookup: {from: 'coll', as: 'subsubas', "
-                                  "pipeline: [{$match: {$expr: {$eq: ['$y', '$$var1']}}}]}}]}}, "
-                                  "{$addFields: {varField: {$const: 5}}}]");
+    auto expectedPipe = fromjson(
+        str::stream() << "[{mock: {}}, {$match: {x:{$eq: 1}}}, {$sort: {sortKey: {x: 1}}}, "
+                      << sequentialCacheStageObj()
+                      << ", {$lookup: {from: 'coll', as: 'subas', let: {}, pipeline: "
+                         "[{$match: {x: 1}}, {$lookup: {from: 'coll', as: 'subsubas', "
+                         "pipeline: [{$match: {$expr: {$eq: ['$y', '$$var1']}}}]}}]}}, "
+                         "{$addFields: {varField: {$const: 5}}}]");
 
     ASSERT_VALUE_EQ(Value(subPipeline->writeExplainOps(kExplain)), Value(BSONArray(expectedPipe)));
 }
@@ -879,7 +919,7 @@ TEST_F(DocumentSourceLookUpTest,
        ShouldIgnoreNestedLookupLetVariablesShadowingOuterLookupLetVariablesWhenFindingPrefix) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // The nested $lookup stage defines a 'let' variable with the same name as the top-level 'let'.
     // Verify the nested $lookup is identified as non-correlated and the cache is placed after it.
@@ -894,18 +934,18 @@ TEST_F(DocumentSourceLookUpTest,
     auto lookupStage = static_cast<DocumentSourceLookUp*>(docSource.get());
     ASSERT(lookupStage);
 
-    lookupStage->injectMongoProcessInterface(
-        std::shared_ptr<MockMongoProcessInterface>(new MockMongoProcessInterface({})));
+    expCtx->mongoProcessInterface =
+        std::make_shared<MockMongoInterface>(std::deque<DocumentSource::GetNextResult>{});
 
     auto subPipeline = lookupStage->getSubPipeline_forTest(DOC("_id" << 5));
     ASSERT(subPipeline);
 
-    auto expectedPipe =
-        fromjson(str::stream() << "[{mock: {}}, {$match: {x:1}}, {$sort: {sortKey: {x: 1}}}, "
-                                  "{$lookup: {from: 'coll', as: 'subas', let: {var1: '$y'}, "
-                                  "pipeline: [{$match: {$expr: { $eq: ['$z', '$$var1']}}}]}}, "
-                               << sequentialCacheStageObj()
-                               << ", {$addFields: {varField: {$const: 5} }}]");
+    auto expectedPipe = fromjson(
+        str::stream() << "[{mock: {}}, {$match: {x:{$eq: 1}}}, {$sort: {sortKey: {x: 1}}}, "
+                         "{$lookup: {from: 'coll', as: 'subas', let: {var1: '$y'}, "
+                         "pipeline: [{$match: {$expr: { $eq: ['$z', '$$var1']}}}]}}, "
+                      << sequentialCacheStageObj()
+                      << ", {$addFields: {varField: {$const: 5} }}]");
 
     ASSERT_VALUE_EQ(Value(subPipeline->writeExplainOps(kExplain)), Value(BSONArray(expectedPipe)));
 }
@@ -913,7 +953,7 @@ TEST_F(DocumentSourceLookUpTest,
 TEST_F(DocumentSourceLookUpTest, ShouldCacheEntirePipelineIfNonCorrelated) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     auto docSource = DocumentSourceLookUp::createFromBson(
         fromjson("{$lookup: {let: {}, pipeline: [{$match: {x:1}}, {$sort: {x: 1}}, {$lookup: "
@@ -925,19 +965,19 @@ TEST_F(DocumentSourceLookUpTest, ShouldCacheEntirePipelineIfNonCorrelated) {
     auto lookupStage = static_cast<DocumentSourceLookUp*>(docSource.get());
     ASSERT(lookupStage);
 
-    lookupStage->injectMongoProcessInterface(
-        std::shared_ptr<MockMongoProcessInterface>(new MockMongoProcessInterface({})));
+    expCtx->mongoProcessInterface =
+        std::make_shared<MockMongoInterface>(std::deque<DocumentSource::GetNextResult>{});
 
     auto subPipeline = lookupStage->getSubPipeline_forTest(DOC("_id" << 5));
     ASSERT(subPipeline);
 
-    auto expectedPipe =
-        fromjson(str::stream()
-                 << "[{mock: {}}, {$match: {x:1}}, {$sort: {sortKey: {x: 1}}}, {$lookup: {from: "
-                    "'coll', as: 'subas', let: {}, pipeline: [{$match: {y: 5}}]}}, {$addFields: "
-                    "{constField: {$const: 5}}}, "
-                 << sequentialCacheStageObj()
-                 << "]");
+    auto expectedPipe = fromjson(
+        str::stream()
+        << "[{mock: {}}, {$match: {x:{$eq: 1}}}, {$sort: {sortKey: {x: 1}}}, {$lookup: {from: "
+           "'coll', as: 'subas', let: {}, pipeline: [{$match: {y: 5}}]}}, {$addFields: "
+           "{constField: {$const: 5}}}, "
+        << sequentialCacheStageObj()
+        << "]");
 
     ASSERT_VALUE_EQ(Value(subPipeline->writeExplainOps(kExplain)), Value(BSONArray(expectedPipe)));
 }
@@ -946,7 +986,7 @@ TEST_F(DocumentSourceLookUpTest,
        ShouldReplaceNonCorrelatedPrefixWithCacheAfterFirstSubPipelineIteration) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     auto docSource = DocumentSourceLookUp::createFromBson(
         fromjson(
@@ -967,8 +1007,7 @@ TEST_F(DocumentSourceLookUpTest,
     deque<DocumentSource::GetNextResult> mockForeignContents{
         Document{{"x", 0}}, Document{{"x", 1}}, Document{{"x", 2}}};
 
-    lookupStage->injectMongoProcessInterface(
-        std::make_shared<MockMongoProcessInterface>(mockForeignContents));
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockForeignContents);
 
     // Confirm that the empty 'kBuilding' cache is placed just before the correlated $addFields.
     auto subPipeline = lookupStage->getSubPipeline_forTest(DOC("_id" << 0));
@@ -1021,7 +1060,7 @@ TEST_F(DocumentSourceLookUpTest,
        ShouldAbandonCacheIfMaxSizeIsExceededAfterFirstSubPipelineIteration) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     // Ensure the cache is abandoned after the first iteration by setting its max size to 0.
     size_t maxCacheSizeBytes = 0;
@@ -1044,8 +1083,7 @@ TEST_F(DocumentSourceLookUpTest,
     deque<DocumentSource::GetNextResult> mockForeignContents{Document{{"x", 0}},
                                                              Document{{"x", 1}}};
 
-    lookupStage->injectMongoProcessInterface(
-        std::make_shared<MockMongoProcessInterface>(mockForeignContents));
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockForeignContents);
 
     // Confirm that the empty 'kBuilding' cache is placed just before the correlated $addFields.
     auto subPipeline = lookupStage->getSubPipeline_forTest(DOC("_id" << 0));
@@ -1087,7 +1125,7 @@ TEST_F(DocumentSourceLookUpTest,
 TEST_F(DocumentSourceLookUpTest, ShouldNotCacheIfCorrelatedStageIsAbsorbedIntoPlanExecutor) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
-    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+    expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
 
     auto docSource = DocumentSourceLookUp::createFromBson(
         fromjson("{$lookup: {let: {var1: '$_id'}, pipeline: [{$match: {$expr: { $gte: ['$x', "
@@ -1101,8 +1139,8 @@ TEST_F(DocumentSourceLookUpTest, ShouldNotCacheIfCorrelatedStageIsAbsorbedIntoPl
 
     const bool removeLeadingQueryStages = true;
 
-    lookupStage->injectMongoProcessInterface(std::shared_ptr<MockMongoProcessInterface>(
-        new MockMongoProcessInterface({}, removeLeadingQueryStages)));
+    expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(
+        std::deque<DocumentSource::GetNextResult>{}, removeLeadingQueryStages);
 
     auto subPipeline = lookupStage->getSubPipeline_forTest(DOC("_id" << 0));
     ASSERT(subPipeline);

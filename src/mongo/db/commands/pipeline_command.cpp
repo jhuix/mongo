@@ -1,29 +1,31 @@
+
 /**
- * Copyright (c) 2011-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -44,68 +46,96 @@ bool isMergePipeline(const std::vector<BSONObj>& pipeline) {
     return pipeline[0].hasField("$mergeCursors");
 }
 
-class PipelineCommand : public BasicCommand {
+class PipelineCommand final : public Command {
 public:
-    PipelineCommand() : BasicCommand("aggregate") {}
+    PipelineCommand() : Command("aggregate") {}
 
-    void help(std::stringstream& help) const override {
-        help << "Runs the aggregation command. See http://dochub.mongodb.org/core/aggregation for "
-                "more details.";
+    std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
+                                             const OpMsgRequest& opMsgRequest) override {
+        // TODO: Parsing to a Pipeline and/or AggregationRequest here.
+        return std::make_unique<Invocation>(this, opMsgRequest);
     }
 
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return Pipeline::aggSupportsWriteConcern(cmd);
+    class Invocation final : public CommandInvocation {
+    public:
+        Invocation(Command* cmd, const OpMsgRequest& request)
+            : CommandInvocation(cmd),
+              _request(request),
+              _dbName(request.getDatabase().toString()) {}
+
+    private:
+        bool supportsWriteConcern() const override {
+            return Pipeline::aggSupportsWriteConcern(this->_request.body);
+        }
+
+        bool supportsReadConcern(repl::ReadConcernLevel level) const override {
+            // Aggregations that are run directly against a collection allow any read concern.
+            // Otherwise, if the aggregate is collectionless then the read concern must be 'local'
+            // (e.g. $currentOp). The exception to this is a $changeStream on a whole database,
+            // which is
+            // considered collectionless but must be read concern 'majority'. Further read concern
+            // validation is done one the pipeline is parsed.
+            return level == repl::ReadConcernLevel::kLocalReadConcern ||
+                level == repl::ReadConcernLevel::kMajorityReadConcern ||
+                !AggregationRequest::parseNs(_dbName, _request.body).isCollectionlessAggregateNS();
+        }
+
+        bool allowsSpeculativeMajorityReads() const override {
+            // Currently only change stream aggregation queries are allowed to use speculative
+            // majority. The aggregation command itself will check this internally and fail if
+            // necessary.
+            return true;
+        }
+
+        void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
+            const auto aggregationRequest = uassertStatusOK(
+                AggregationRequest::parseFromBSON(_dbName, _request.body, boost::none));
+
+            uassertStatusOK(runAggregate(opCtx,
+                                         aggregationRequest.getNamespaceString(),
+                                         aggregationRequest,
+                                         _request.body,
+                                         reply));
+        }
+
+        NamespaceString ns() const override {
+            return AggregationRequest::parseNs(_dbName, _request.body);
+        }
+
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     rpc::ReplyBuilderInterface* result) override {
+            const auto aggregationRequest = uassertStatusOK(
+                AggregationRequest::parseFromBSON(_dbName, _request.body, verbosity));
+
+            uassertStatusOK(runAggregate(opCtx,
+                                         aggregationRequest.getNamespaceString(),
+                                         aggregationRequest,
+                                         _request.body,
+                                         result));
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            const auto nss = ns();
+            uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
+                                ->checkAuthForAggregate(nss, _request.body, false));
+        }
+
+        const OpMsgRequest& _request;
+        const std::string _dbName;
+    };
+
+    std::string help() const override {
+        return "Runs the aggregation command. See http://dochub.mongodb.org/core/aggregation for "
+               "more details.";
     }
 
-    bool slaveOk() const override {
-        return false;
-    }
-
-    bool slaveOverrideOk() const override {
-        return true;
-    }
-
-    bool supportsNonLocalReadConcern(const std::string& dbName,
-                                     const BSONObj& cmdObj) const override {
-        return !AggregationRequest::parseNs(dbName, cmdObj).isCollectionlessAggregateNS();
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kOptIn;
     }
 
     ReadWriteType getReadWriteType() const {
         return ReadWriteType::kRead;
-    }
-
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) override {
-        const NamespaceString nss(AggregationRequest::parseNs(dbname, cmdObj));
-        return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj, false);
-    }
-
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        const auto aggregationRequest =
-            uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, boost::none));
-
-        return appendCommandStatus(result,
-                                   runAggregate(opCtx,
-                                                aggregationRequest.getNamespaceString(),
-                                                aggregationRequest,
-                                                cmdObj,
-                                                result));
-    }
-
-    Status explain(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
-                   ExplainOptions::Verbosity verbosity,
-                   BSONObjBuilder* out) const override {
-        const auto aggregationRequest =
-            uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, verbosity));
-
-        return runAggregate(
-            opCtx, aggregationRequest.getNamespaceString(), aggregationRequest, cmdObj, *out);
     }
 
 } pipelineCmd;

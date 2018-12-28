@@ -1,29 +1,31 @@
+
 /**
- * Copyright (c) 2012-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
@@ -33,29 +35,32 @@
 #include "mongo/db/pipeline/pipeline_d.h"
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/fetch.h"
-#include "mongo/db/exec/index_iterator.h"
 #include "mongo/db/exec/multi_iterator.h"
+#include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/shard_filter.h"
+#include "mongo/db/exec/trial_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/write_ops_exec.h"
+#include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
+#include "mongo/db/pipeline/document_source_geo_near.h"
+#include "mongo/db/pipeline/document_source_geo_near_cursor.h"
+#include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_match.h"
-#include "mongo/db/pipeline/document_source_merge_cursors.h"
 #include "mongo/db/pipeline/document_source_sample.h"
 #include "mongo/db/pipeline/document_source_sample_from_random_cursor.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
@@ -68,16 +73,19 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/stats/fill_locker_info.h"
-#include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/query/document_source_merge_cursors.h"
+#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/sock.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -86,338 +94,75 @@ using boost::intrusive_ptr;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using write_ops::Insert;
 
 namespace {
-class MongodProcessInterface final
-    : public DocumentSourceNeedsMongoProcessInterface::MongoProcessInterface {
-public:
-    MongodProcessInterface(const intrusive_ptr<ExpressionContext>& ctx)
-        : _ctx(ctx), _client(ctx->opCtx) {}
-
-    void setOperationContext(OperationContext* opCtx) {
-        invariant(_ctx->opCtx == opCtx);
-        _client.setOpCtx(opCtx);
-    }
-
-    DBClientBase* directClient() final {
-        return &_client;
-    }
-
-    bool isSharded(const NamespaceString& nss) final {
-        AutoGetCollectionForReadCommand autoColl(_ctx->opCtx, nss);
-        // TODO SERVER-24960: Use CollectionShardingState::collectionIsSharded() to confirm sharding
-        // state.
-        auto css = CollectionShardingState::get(_ctx->opCtx, nss);
-        return bool(css->getMetadata());
-    }
-
-    BSONObj insert(const NamespaceString& ns, const std::vector<BSONObj>& objs) final {
-        boost::optional<DisableDocumentValidation> maybeDisableValidation;
-        if (_ctx->bypassDocumentValidation)
-            maybeDisableValidation.emplace(_ctx->opCtx);
-
-        _client.insert(ns.ns(), objs);
-        return _client.getLastErrorDetailed();
-    }
-
-    CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
-                                          const NamespaceString& ns) final {
-        AutoGetCollectionForReadCommand autoColl(opCtx, ns);
-
-        Collection* collection = autoColl.getCollection();
-        if (!collection) {
-            LOG(2) << "Collection not found on index stats retrieval: " << ns.ns();
-            return CollectionIndexUsageMap();
-        }
-
-        return collection->infoCache()->getIndexUsageStats();
-    }
-
-    void appendLatencyStats(const NamespaceString& nss,
-                            bool includeHistograms,
-                            BSONObjBuilder* builder) const final {
-        Top::get(_ctx->opCtx->getServiceContext())
-            .appendLatencyStats(nss.ns(), includeHistograms, builder);
-    }
-
-    Status appendStorageStats(const NamespaceString& nss,
-                              const BSONObj& param,
-                              BSONObjBuilder* builder) const final {
-        return appendCollectionStorageStats(_ctx->opCtx, nss, param, builder);
-    }
-
-    Status appendRecordCount(const NamespaceString& nss, BSONObjBuilder* builder) const final {
-        return appendCollectionRecordCount(_ctx->opCtx, nss, builder);
-    }
-
-    BSONObj getCollectionOptions(const NamespaceString& nss) final {
-        const auto infos =
-            _client.getCollectionInfos(nss.db().toString(), BSON("name" << nss.coll()));
-        return infos.empty() ? BSONObj() : infos.front().getObjectField("options").getOwned();
-    }
-
-    Status renameIfOptionsAndIndexesHaveNotChanged(
-        const BSONObj& renameCommandObj,
-        const NamespaceString& targetNs,
-        const BSONObj& originalCollectionOptions,
-        const std::list<BSONObj>& originalIndexes) final {
-        Lock::GlobalWrite globalLock(_ctx->opCtx);
-
-        if (SimpleBSONObjComparator::kInstance.evaluate(originalCollectionOptions !=
-                                                        getCollectionOptions(targetNs))) {
-            return {ErrorCodes::CommandFailed,
-                    str::stream() << "collection options of target collection " << targetNs.ns()
-                                  << " changed during processing. Original options: "
-                                  << originalCollectionOptions
-                                  << ", new options: "
-                                  << getCollectionOptions(targetNs)};
-        }
-
-        auto currentIndexes = _client.getIndexSpecs(targetNs.ns());
-        if (originalIndexes.size() != currentIndexes.size() ||
-            !std::equal(originalIndexes.begin(),
-                        originalIndexes.end(),
-                        currentIndexes.begin(),
-                        SimpleBSONObjComparator::kInstance.makeEqualTo())) {
-            return {ErrorCodes::CommandFailed,
-                    str::stream() << "indexes of target collection " << targetNs.ns()
-                                  << " changed during processing."};
-        }
-
-        BSONObj info;
-        bool ok = _client.runCommand("admin", renameCommandObj, info);
-        return ok ? Status::OK() : Status{ErrorCodes::CommandFailed,
-                                          str::stream() << "renameCollection failed: " << info};
-    }
-
-    StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> makePipeline(
-        const std::vector<BSONObj>& rawPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const MakePipelineOptions opts) final {
-        // 'expCtx' may represent the settings for an aggregation pipeline on a different namespace
-        // than the DocumentSource this MongodProcessInterface is injected into, but both
-        // ExpressionContext instances should still have the same OperationContext.
-        invariant(_ctx->opCtx == expCtx->opCtx);
-
-        auto pipeline = Pipeline::parse(rawPipeline, expCtx);
-        if (!pipeline.isOK()) {
-            return pipeline.getStatus();
-        }
-
-        if (opts.optimize) {
-            pipeline.getValue()->optimizePipeline();
-        }
-
-        Status cursorStatus = Status::OK();
-
-        if (opts.attachCursorSource) {
-            cursorStatus = attachCursorSourceToPipeline(expCtx, pipeline.getValue().get());
-        } else if (opts.forceInjectMongoProcessInterface) {
-            PipelineD::injectMongodInterface(pipeline.getValue().get());
-        }
-
-        return cursorStatus.isOK() ? std::move(pipeline) : cursorStatus;
-    }
-
-    Status attachCursorSourceToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                        Pipeline* pipeline) final {
-        invariant(_ctx->opCtx == expCtx->opCtx);
-        invariant(pipeline->getSources().empty() ||
-                  !dynamic_cast<DocumentSourceCursor*>(pipeline->getSources().front().get()));
-
-        boost::optional<AutoGetCollectionForReadCommand> autoColl;
-        if (expCtx->uuid) {
-            autoColl.emplace(expCtx->opCtx, expCtx->ns.db(), *expCtx->uuid);
-            if (autoColl->getCollection() == nullptr) {
-                // The UUID doesn't exist anymore.
-                return {ErrorCodes::NamespaceNotFound,
-                        "No namespace with UUID " + expCtx->uuid->toString()};
-            }
-        } else {
-            autoColl.emplace(expCtx->opCtx, expCtx->ns);
-        }
-
-        // makePipeline() is only called to perform secondary aggregation requests and expects the
-        // collection representing the document source to be not-sharded. We confirm sharding state
-        // here to avoid taking a collection lock elsewhere for this purpose alone.
-        // TODO SERVER-27616: This check is incorrect in that we don't acquire a collection cursor
-        // until after we release the lock, leaving room for a collection to be sharded inbetween.
-        // TODO SERVER-24960: Use CollectionShardingState::collectionIsSharded() to confirm sharding
-        // state.
-        auto css = CollectionShardingState::get(_ctx->opCtx, expCtx->ns);
-        uassert(4567,
-                str::stream() << "from collection (" << expCtx->ns.ns() << ") cannot be sharded",
-                !bool(css->getMetadata()));
-
-        PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline);
-
-        return Status::OK();
-    }
-
-    std::vector<BSONObj> getCurrentOps(CurrentOpConnectionsMode connMode,
-                                       CurrentOpUserMode userMode,
-                                       CurrentOpTruncateMode truncateMode) const {
-        AuthorizationSession* ctxAuth = AuthorizationSession::get(_ctx->opCtx->getClient());
-
-        const std::string hostName = getHostNameCachedAndPort();
-
-        std::vector<BSONObj> ops;
-
-        for (ServiceContext::LockedClientsCursor cursor(
-                 _ctx->opCtx->getClient()->getServiceContext());
-             Client* client = cursor.next();) {
-            invariant(client);
-
-            stdx::lock_guard<Client> lk(*client);
-
-            // If auth is disabled, ignore the allUsers parameter.
-            if (ctxAuth->getAuthorizationManager().isAuthEnabled() &&
-                userMode == CurrentOpUserMode::kExcludeOthers &&
-                !ctxAuth->isCoauthorizedWithClient(client)) {
-                continue;
-            }
-
-            const OperationContext* clientOpCtx = client->getOperationContext();
-
-            if (!clientOpCtx && connMode == CurrentOpConnectionsMode::kExcludeIdle) {
-                continue;
-            }
-
-            BSONObjBuilder infoBuilder;
-
-            infoBuilder.append("host", hostName);
-
-            client->reportState(infoBuilder);
-
-            const auto& clientMetadata =
-                ClientMetadataIsMasterState::get(client).getClientMetadata();
-
-            if (clientMetadata) {
-                auto appName = clientMetadata.get().getApplicationName();
-                if (!appName.empty()) {
-                    infoBuilder.append("appName", appName);
-                }
-
-                auto clientMetadataDocument = clientMetadata.get().getDocument();
-                infoBuilder.append("clientMetadata", clientMetadataDocument);
-            }
-
-            // Fill out the rest of the BSONObj with opCtx specific details.
-            infoBuilder.appendBool("active", static_cast<bool>(clientOpCtx));
-            infoBuilder.append(
-                "currentOpTime",
-                _ctx->opCtx->getServiceContext()->getPreciseClockSource()->now().toString());
-
-            if (clientOpCtx) {
-                infoBuilder.append("opid", clientOpCtx->getOpID());
-                if (clientOpCtx->isKillPending()) {
-                    infoBuilder.append("killPending", true);
-                }
-
-                if (clientOpCtx->getLogicalSessionId()) {
-                    BSONObjBuilder bob(infoBuilder.subobjStart("lsid"));
-                    clientOpCtx->getLogicalSessionId()->serialize(&bob);
-                }
-
-                CurOp::get(clientOpCtx)
-                    ->reportState(&infoBuilder,
-                                  (truncateMode == CurrentOpTruncateMode::kTruncateOps));
-
-                Locker::LockerInfo lockerInfo;
-                clientOpCtx->lockState()->getLockerInfo(&lockerInfo);
-                fillLockerInfo(lockerInfo, infoBuilder);
-            }
-
-            ops.emplace_back(infoBuilder.obj());
-        }
-
-        return ops;
-    }
-
-    std::string getShardName(OperationContext* opCtx) const {
-        if (ShardingState::get(opCtx)->enabled()) {
-            return ShardingState::get(opCtx)->getShardName();
-        }
-
-        return std::string();
-    }
-
-private:
-    intrusive_ptr<ExpressionContext> _ctx;
-    DBDirectClient _client;
-};
-
 /**
  * Returns a PlanExecutor which uses a random cursor to sample documents if successful. Returns {}
  * if the storage engine doesn't support random cursors, or if 'sampleSize' is a large enough
  * percentage of the collection.
  */
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorExecutor(
-    Collection* collection, OperationContext* opCtx, long long sampleSize, long long numRecords) {
-    double kMaxSampleRatioForRandCursor = 0.05;
+    Collection* coll, OperationContext* opCtx, long long sampleSize, long long numRecords) {
+    // Verify that we are already under a collection lock. We avoid taking locks ourselves in this
+    // function because double-locking forces any PlanExecutor we create to adopt a NO_YIELD policy.
+    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns().ns(), MODE_IS));
+
+    static const double kMaxSampleRatioForRandCursor = 0.05;
     if (sampleSize > numRecords * kMaxSampleRatioForRandCursor || numRecords <= 100) {
         return {nullptr};
     }
 
-    // Attempt to get a random cursor from the RecordStore. If the RecordStore does not support
-    // random cursors, attempt to get one from the _id index.
-    std::unique_ptr<RecordCursor> rsRandCursor =
-        collection->getRecordStore()->getRandomCursor(opCtx);
-
-    auto ws = stdx::make_unique<WorkingSet>();
-    std::unique_ptr<PlanStage> stage;
-
-    if (rsRandCursor) {
-        stage = stdx::make_unique<MultiIteratorStage>(opCtx, ws.get(), collection);
-        static_cast<MultiIteratorStage*>(stage.get())->addIterator(std::move(rsRandCursor));
-
-    } else {
-        auto indexCatalog = collection->getIndexCatalog();
-        auto indexDescriptor = indexCatalog->findIdIndex(opCtx);
-
-        if (!indexDescriptor) {
-            // There was no _id index.
-            return {nullptr};
-        }
-
-        IndexAccessMethod* idIam = indexCatalog->getIndex(indexDescriptor);
-        auto idxRandCursor = idIam->newRandomCursor(opCtx);
-
-        if (!idxRandCursor) {
-            // Storage engine does not support any type of random cursor.
-            return {nullptr};
-        }
-
-        auto idxIterator = stdx::make_unique<IndexIteratorStage>(opCtx,
-                                                                 ws.get(),
-                                                                 collection,
-                                                                 idIam,
-                                                                 indexDescriptor->keyPattern(),
-                                                                 std::move(idxRandCursor));
-        stage = stdx::make_unique<FetchStage>(
-            opCtx, ws.get(), idxIterator.release(), nullptr, collection);
+    // Attempt to get a random cursor from the RecordStore.
+    auto rsRandCursor = coll->getRecordStore()->getRandomCursor(opCtx);
+    if (!rsRandCursor) {
+        // The storage engine has no random cursor support.
+        return {nullptr};
     }
 
-    {
-        AutoGetCollectionForRead autoColl(opCtx, collection->ns());
+    // Build a MultiIteratorStage and pass it the random-sampling RecordCursor.
+    auto ws = std::make_unique<WorkingSet>();
+    std::unique_ptr<PlanStage> root = std::make_unique<MultiIteratorStage>(opCtx, ws.get(), coll);
+    static_cast<MultiIteratorStage*>(root.get())->addIterator(std::move(rsRandCursor));
 
-        // If we're in a sharded environment, we need to filter out documents we don't own.
-        if (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, collection->ns().ns())) {
-            auto shardFilterStage = stdx::make_unique<ShardFilterStage>(
-                opCtx,
-                CollectionShardingState::get(opCtx, collection->ns())->getMetadata(),
-                ws.get(),
-                stage.release());
-            return PlanExecutor::make(opCtx,
-                                      std::move(ws),
-                                      std::move(shardFilterStage),
-                                      collection,
-                                      PlanExecutor::YIELD_AUTO);
-        }
+    // Determine whether this collection is sharded. If so, retrieve its sharding metadata.
+    boost::optional<ScopedCollectionMetadata> shardMetadata =
+        (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, coll->ns().ns())
+             ? CollectionShardingState::get(opCtx, coll->ns())->getMetadataForOperation(opCtx)
+             : boost::optional<ScopedCollectionMetadata>{});
+
+    // Because 'numRecords' includes orphan documents, our initial decision to optimize the $sample
+    // cursor may have been mistaken. For sharded collections, build a TRIAL plan that will switch
+    // to a collection scan if the ratio of orphaned to owned documents encountered over the first
+    // 100 works() is such that we would have chosen not to optimize.
+    if (shardMetadata && (*shardMetadata)->isSharded()) {
+        // The ratio of owned to orphaned documents must be at least equal to the ratio between the
+        // requested sampleSize and the maximum permitted sampleSize for the original constraints to
+        // be satisfied. For instance, if there are 200 documents and the sampleSize is 5, then at
+        // least (5 / (200*0.05)) = (5/10) = 50% of those documents must be owned. If less than 5%
+        // of the documents in the collection are owned, we default to the backup plan.
+        static const size_t kMaxPresampleSize = 100;
+        const auto minWorkAdvancedRatio = std::max(
+            sampleSize / (numRecords * kMaxSampleRatioForRandCursor), kMaxSampleRatioForRandCursor);
+        // The trial plan is SHARDING_FILTER-MULTI_ITERATOR.
+        auto randomCursorPlan =
+            std::make_unique<ShardFilterStage>(opCtx, *shardMetadata, ws.get(), root.release());
+        // The backup plan is SHARDING_FILTER-COLLSCAN.
+        std::unique_ptr<PlanStage> collScanPlan = std::make_unique<CollectionScan>(
+            opCtx, coll, CollectionScanParams{}, ws.get(), nullptr);
+        collScanPlan = std::make_unique<ShardFilterStage>(
+            opCtx, *shardMetadata, ws.get(), collScanPlan.release());
+        // Place a TRIAL stage at the root of the plan tree, and pass it the trial and backup plans.
+        root = std::make_unique<TrialStage>(opCtx,
+                                            ws.get(),
+                                            std::move(randomCursorPlan),
+                                            std::move(collScanPlan),
+                                            kMaxPresampleSize,
+                                            minWorkAdvancedRatio);
     }
 
     return PlanExecutor::make(
-        opCtx, std::move(ws), std::move(stage), collection, PlanExecutor::YIELD_AUTO);
+        opCtx, std::move(ws), std::move(root), coll, PlanExecutor::YIELD_AUTO);
 }
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExecutor(
@@ -429,8 +174,10 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     BSONObj queryObj,
     BSONObj projectionObj,
     BSONObj sortObj,
+    boost::optional<std::string> groupIdForDistinctScan,
     const AggregationRequest* aggRequest,
-    const size_t plannerOpts) {
+    const size_t plannerOpts,
+    const MatchExpressionParser::AllowedFeatureSet& matcherFeatures) {
     auto qr = stdx::make_unique<QueryRequest>(nss);
     qr->setTailableMode(pExpCtx->tailableMode);
     qr->setOplogReplay(oplogReplay);
@@ -455,7 +202,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     const ExtensionsCallbackReal extensionsCallback(pExpCtx->opCtx, &nss);
 
     auto cq = CanonicalQuery::canonicalize(
-        opCtx, std::move(qr), pExpCtx, extensionsCallback, Pipeline::kAllowedMatcherFeatures);
+        opCtx, std::move(qr), pExpCtx, extensionsCallback, matcherFeatures);
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of
@@ -466,8 +213,30 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
         return {cq.getStatus()};
     }
 
-    return getExecutorFind(
-        opCtx, collection, nss, std::move(cq.getValue()), PlanExecutor::YIELD_AUTO, plannerOpts);
+    if (groupIdForDistinctScan) {
+        // When the pipeline includes a $group that groups by a single field
+        // (groupIdForDistinctScan), we use getExecutorDistinct() to attempt to get an executor that
+        // uses a DISTINCT_SCAN to scan exactly one document for each group. When that's not
+        // possible, we return nullptr, and the caller is responsible for trying again without
+        // passing a 'groupIdForDistinctScan' value.
+        ParsedDistinct parsedDistinct(std::move(cq.getValue()), *groupIdForDistinctScan);
+        auto distinctExecutor =
+            getExecutorDistinct(opCtx,
+                                collection,
+                                plannerOpts | QueryPlannerParams::STRICT_DISTINCT_ONLY,
+                                &parsedDistinct);
+        if (!distinctExecutor.isOK()) {
+            return distinctExecutor.getStatus().withContext(
+                "Unable to use distinct scan to optimize $group stage");
+        } else if (!distinctExecutor.getValue()) {
+            return {ErrorCodes::OperationFailed,
+                    "Unable to use distinct scan to optimize $group stage"};
+        } else {
+            return distinctExecutor;
+        }
+    }
+
+    return getExecutorFind(opCtx, collection, nss, std::move(cq.getValue()), plannerOpts);
 }
 
 BSONObj removeSortKeyMetaProjection(BSONObj projectionObj) {
@@ -476,17 +245,51 @@ BSONObj removeSortKeyMetaProjection(BSONObj projectionObj) {
     }
     return projectionObj.removeField(Document::metaFieldSortKey);
 }
-}  // namespace
 
-void PipelineD::injectMongodInterface(Pipeline* pipeline) {
-    for (auto&& source : pipeline->_sources) {
-        if (auto needsMongod =
-                dynamic_cast<DocumentSourceNeedsMongoProcessInterface*>(source.get())) {
-            needsMongod->injectMongoProcessInterface(
-                std::make_shared<MongodProcessInterface>(pipeline->getContext()));
+/**
+ * Examines the indexes in 'collection' and returns the field name of a geo-indexed field suitable
+ * for use in $geoNear. 2d indexes are given priority over 2dsphere indexes.
+ *
+ * The 'collection' is required to exist. Throws if no usable 2d or 2dsphere index could be found.
+ */
+StringData extractGeoNearFieldFromIndexes(OperationContext* opCtx, Collection* collection) {
+    invariant(collection);
+
+    std::vector<const IndexDescriptor*> idxs;
+    collection->getIndexCatalog()->findIndexByType(opCtx, IndexNames::GEO_2D, idxs);
+    uassert(ErrorCodes::IndexNotFound,
+            str::stream() << "There is more than one 2d index on " << collection->ns().ns()
+                          << "; unsure which to use for $geoNear",
+            idxs.size() <= 1U);
+    if (idxs.size() == 1U) {
+        for (auto&& elem : idxs.front()->keyPattern()) {
+            if (elem.type() == BSONType::String && elem.valueStringData() == IndexNames::GEO_2D) {
+                return elem.fieldNameStringData();
+            }
+        }
+        MONGO_UNREACHABLE;
+    }
+
+    // If there are no 2d indexes, look for a 2dsphere index.
+    idxs.clear();
+    collection->getIndexCatalog()->findIndexByType(opCtx, IndexNames::GEO_2DSPHERE, idxs);
+    uassert(ErrorCodes::IndexNotFound,
+            "$geoNear requires a 2d or 2dsphere index, but none were found",
+            !idxs.empty());
+    uassert(ErrorCodes::IndexNotFound,
+            str::stream() << "There is more than one 2dsphere index on " << collection->ns().ns()
+                          << "; unsure which to use for $geoNear",
+            idxs.size() <= 1U);
+
+    invariant(idxs.size() == 1U);
+    for (auto&& elem : idxs.front()->keyPattern()) {
+        if (elem.type() == BSONType::String && elem.valueStringData() == IndexNames::GEO_2DSPHERE) {
+            return elem.fieldNameStringData();
         }
     }
+    MONGO_UNREACHABLE;
 }
+}  // namespace
 
 void PipelineD::prepareCursorSource(Collection* collection,
                                     const NamespaceString& nss,
@@ -496,9 +299,6 @@ void PipelineD::prepareCursorSource(Collection* collection,
 
     // We will be modifying the source vector as we go.
     Pipeline::SourceContainer& sources = pipeline->_sources;
-
-    // Inject a MongodProcessInterface to sources that need them.
-    injectMongodInterface(pipeline);
 
     if (!sources.empty() && !sources.front()->constraints().requiresInputDocSource) {
         return;
@@ -516,22 +316,85 @@ void PipelineD::prepareCursorSource(Collection* collection,
             auto exec = uassertStatusOK(
                 createRandomCursorExecutor(collection, expCtx->opCtx, sampleSize, numRecords));
             if (exec) {
-                // Replace $sample stage with $sampleFromRandomCursor stage.
-                sources.pop_front();
-                std::string idString = collection->ns().isOplog() ? "ts" : "_id";
-                sources.emplace_front(DocumentSourceSampleFromRandomCursor::create(
-                    expCtx, sampleSize, idString, numRecords));
+                // For sharded collections, the root of the plan tree is a TrialStage that may have
+                // chosen either a random-sampling cursor trial plan or a COLLSCAN backup plan. We
+                // can only optimize the $sample aggregation stage if the trial plan was chosen.
+                auto* trialStage = (exec->getRootStage()->stageType() == StageType::STAGE_TRIAL
+                                        ? static_cast<TrialStage*>(exec->getRootStage())
+                                        : nullptr);
+                if (!trialStage || !trialStage->pickedBackupPlan()) {
+                    // Replace $sample stage with $sampleFromRandomCursor stage.
+                    pipeline->popFront();
+                    std::string idString = collection->ns().isOplog() ? "ts" : "_id";
+                    pipeline->addInitialSource(DocumentSourceSampleFromRandomCursor::create(
+                        expCtx, sampleSize, idString, numRecords));
+                }
 
                 addCursorSource(
-                    collection,
                     pipeline,
-                    expCtx,
-                    std::move(exec),
+                    DocumentSourceCursor::create(collection, std::move(exec), expCtx),
                     pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata));
                 return;
             }
         }
     }
+
+    // If the first stage is $geoNear, prepare a special DocumentSourceGeoNearCursor stage;
+    // otherwise, create a generic DocumentSourceCursor.
+    const auto geoNearStage =
+        sources.empty() ? nullptr : dynamic_cast<DocumentSourceGeoNear*>(sources.front().get());
+    if (geoNearStage) {
+        prepareGeoNearCursorSource(collection, nss, aggRequest, pipeline);
+    } else {
+        prepareGenericCursorSource(collection, nss, aggRequest, pipeline);
+    }
+}
+
+namespace {
+
+/**
+ * Look for $sort, $group at the beginning of the pipeline, potentially returning either or both.
+ * Returns nullptr for any of the stages that are not found. Note that we are not looking for the
+ * opposite pattern ($group, $sort). In that case, this function will return only the $group stage.
+ *
+ * This function will not return the $group in the case that there is an initial $sort with
+ * intermediate stages that separate it from the $group (e.g.: $sort, $limit, $group). That includes
+ * the case of a $sort with a non-null value for getLimitSrc(), indicating that there was previously
+ * a $limit stage that was optimized away.
+ */
+std::pair<boost::intrusive_ptr<DocumentSourceSort>, boost::intrusive_ptr<DocumentSourceGroup>>
+getSortAndGroupStagesFromPipeline(const Pipeline::SourceContainer& sources) {
+    boost::intrusive_ptr<DocumentSourceSort> sortStage = nullptr;
+    boost::intrusive_ptr<DocumentSourceGroup> groupStage = nullptr;
+
+    auto sourcesIt = sources.begin();
+    if (sourcesIt != sources.end()) {
+        sortStage = dynamic_cast<DocumentSourceSort*>(sourcesIt->get());
+        if (sortStage) {
+            if (!sortStage->getLimitSrc()) {
+                ++sourcesIt;
+            } else {
+                // This $sort stage was previously followed by a $limit stage.
+                sourcesIt = sources.end();
+            }
+        }
+    }
+
+    if (sourcesIt != sources.end()) {
+        groupStage = dynamic_cast<DocumentSourceGroup*>(sourcesIt->get());
+    }
+
+    return std::make_pair(sortStage, groupStage);
+}
+
+}  // namespace
+
+void PipelineD::prepareGenericCursorSource(Collection* collection,
+                                           const NamespaceString& nss,
+                                           const AggregationRequest* aggRequest,
+                                           Pipeline* pipeline) {
+    Pipeline::SourceContainer& sources = pipeline->_sources;
+    auto expCtx = pipeline->getContext();
 
     // Look for an initial match. This works whether we got an initial query or not. If not, it
     // results in a "{}" query, which will be what we want in that case.
@@ -546,7 +409,7 @@ void PipelineD::prepareCursorSource(Collection* collection,
             sources.pop_front();
         } else {
             // A $geoNear stage, the only other stage that can produce an initial query, is also
-            // a valid initial stage and will be handled above.
+            // a valid initial stage. However, we should be in prepareGeoNearCursorSource() instead.
             MONGO_UNREACHABLE;
         }
     }
@@ -558,19 +421,21 @@ void PipelineD::prepareCursorSource(Collection* collection,
 
     BSONObj projForQuery = deps.toProjection();
 
-    // Look for an initial sort; we'll try to add this to the Cursor we create. If we're successful
-    // in doing that, we'll remove the $sort from the pipeline, because the documents will already
-    // come sorted in the specified order as a result of the index scan.
-    intrusive_ptr<DocumentSourceSort> sortStage;
+    boost::intrusive_ptr<DocumentSourceSort> sortStage;
+    boost::intrusive_ptr<DocumentSourceGroup> groupStage;
+    std::tie(sortStage, groupStage) = getSortAndGroupStagesFromPipeline(pipeline->_sources);
+
     BSONObj sortObj;
-    if (!sources.empty()) {
-        sortStage = dynamic_cast<DocumentSourceSort*>(sources.front().get());
-        if (sortStage) {
-            sortObj = sortStage
-                          ->sortKeyPattern(
-                              DocumentSourceSort::SortKeySerialization::kForPipelineSerialization)
-                          .toBson();
-        }
+    if (sortStage) {
+        sortObj = sortStage
+                      ->sortKeyPattern(
+                          DocumentSourceSort::SortKeySerialization::kForPipelineSerialization)
+                      .toBson();
+    }
+
+    std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage;
+    if (groupStage) {
+        rewrittenGroupStage = groupStage->rewriteGroupAsTransformOnFirstDocument();
     }
 
     // Create the PlanExecutor.
@@ -581,9 +446,11 @@ void PipelineD::prepareCursorSource(Collection* collection,
                                                 expCtx,
                                                 oplogReplay,
                                                 sortStage,
+                                                std::move(rewrittenGroupStage),
                                                 deps,
                                                 queryObj,
                                                 aggRequest,
+                                                Pipeline::kAllowedMatcherFeatures,
                                                 &sortObj,
                                                 &projForQuery));
 
@@ -598,8 +465,72 @@ void PipelineD::prepareCursorSource(Collection* collection,
         }
     }
 
-    addCursorSource(
-        collection, pipeline, expCtx, std::move(exec), deps, queryObj, sortObj, projForQuery);
+    addCursorSource(pipeline,
+                    DocumentSourceCursor::create(collection, std::move(exec), expCtx),
+                    deps,
+                    queryObj,
+                    sortObj,
+                    projForQuery);
+}
+
+void PipelineD::prepareGeoNearCursorSource(Collection* collection,
+                                           const NamespaceString& nss,
+                                           const AggregationRequest* aggRequest,
+                                           Pipeline* pipeline) {
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "$geoNear requires a geo index to run, but " << nss.ns()
+                          << " does not exist",
+            collection);
+
+    Pipeline::SourceContainer& sources = pipeline->_sources;
+    auto expCtx = pipeline->getContext();
+    const auto geoNearStage = dynamic_cast<DocumentSourceGeoNear*>(sources.front().get());
+    invariant(geoNearStage);
+
+    auto deps = pipeline->getDependencies(DepsTracker::kAllGeoNearDataAvailable);
+
+    // If the user specified a "key" field, use that field to satisfy the "near" query. Otherwise,
+    // look for a geo-indexed field in 'collection' that can.
+    auto nearFieldName =
+        (geoNearStage->getKeyField() ? geoNearStage->getKeyField()->fullPath()
+                                     : extractGeoNearFieldFromIndexes(expCtx->opCtx, collection))
+            .toString();
+
+    // Create a PlanExecutor whose query is the "near" predicate on 'nearFieldName' combined with
+    // the optional "query" argument in the $geoNear stage.
+    BSONObj fullQuery = geoNearStage->asNearQuery(nearFieldName);
+    BSONObj proj = deps.toProjection();
+    BSONObj sortFromQuerySystem;
+    auto exec = uassertStatusOK(prepareExecutor(expCtx->opCtx,
+                                                collection,
+                                                nss,
+                                                pipeline,
+                                                expCtx,
+                                                false,   /* oplogReplay */
+                                                nullptr, /* sortStage */
+                                                nullptr, /* rewrittenGroupStage */
+                                                deps,
+                                                std::move(fullQuery),
+                                                aggRequest,
+                                                Pipeline::kGeoNearMatcherFeatures,
+                                                &sortFromQuerySystem,
+                                                &proj));
+
+    invariant(sortFromQuerySystem.isEmpty(),
+              str::stream() << "Unexpectedly got the following sort from the query system: "
+                            << sortFromQuerySystem.jsonString());
+
+    auto geoNearCursor =
+        DocumentSourceGeoNearCursor::create(collection,
+                                            std::move(exec),
+                                            expCtx,
+                                            geoNearStage->getDistanceField(),
+                                            geoNearStage->getLocationField(),
+                                            geoNearStage->getDistanceMultiplier().value_or(1.0));
+
+    // Remove the initial $geoNear; it will be replaced by $geoNearCursor.
+    sources.pop_front();
+    addCursorSource(pipeline, std::move(geoNearCursor), std::move(deps));
 }
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prepareExecutor(
@@ -609,10 +540,12 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     Pipeline* pipeline,
     const intrusive_ptr<ExpressionContext>& expCtx,
     bool oplogReplay,
-    const intrusive_ptr<DocumentSourceSort>& sortStage,
+    const boost::intrusive_ptr<DocumentSourceSort>& sortStage,
+    std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage,
     const DepsTracker& deps,
     const BSONObj& queryObj,
     const AggregationRequest* aggRequest,
+    const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
     BSONObj* sortObj,
     BSONObj* projectionObj) {
     // The query system has the potential to use an index to provide a non-blocking sort and/or to
@@ -641,21 +574,72 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
         plannerOpts |= QueryPlannerParams::IS_COUNT;
     }
 
-    // The only way to get a text score or the sort key is to let the query system handle the
-    // projection. In all other cases, unless the query system can do an index-covered projection
-    // and avoid going to the raw record at all, it is faster to have ParsedDeps filter the fields
-    // we need.
-    if (!deps.getNeedTextScore() && !deps.getNeedSortKey()) {
-        plannerOpts |= QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
+    if (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage()) {
+        invariant(expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData);
+        plannerOpts |= QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
     }
 
-    if (expCtx->needsMerge && expCtx->tailableMode == TailableMode::kTailableAndAwaitData) {
-        plannerOpts |= QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
+    if (rewrittenGroupStage) {
+        BSONObj emptySort;
+
+        // See if the query system can handle the $group and $sort stage using a DISTINCT_SCAN
+        // (SERVER-9507). Note that passing the empty projection (as we do for some of the
+        // attemptToGetExecutor() calls below) causes getExecutorDistinct() to ignore some otherwise
+        // valid DISTINCT_SCAN plans, so we pass the projection and exclude the
+        // NO_UNCOVERED_PROJECTIONS planner parameter.
+        auto swExecutorGrouped = attemptToGetExecutor(opCtx,
+                                                      collection,
+                                                      nss,
+                                                      expCtx,
+                                                      oplogReplay,
+                                                      queryObj,
+                                                      *projectionObj,
+                                                      sortObj ? *sortObj : emptySort,
+                                                      rewrittenGroupStage->groupId(),
+                                                      aggRequest,
+                                                      plannerOpts,
+                                                      matcherFeatures);
+
+        if (swExecutorGrouped.isOK()) {
+            // Any $limit stage before the $group stage should make the pipeline ineligible for this
+            // optimization.
+            invariant(!sortStage || !sortStage->getLimitSrc());
+
+            // We remove the $sort and $group stages that begin the pipeline, because the executor
+            // will handle the sort, and the groupTransform (added below) will handle the $group
+            // stage.
+            pipeline->popFrontWithName(DocumentSourceSort::kStageName);
+            pipeline->popFrontWithName(DocumentSourceGroup::kStageName);
+
+            boost::intrusive_ptr<DocumentSource> groupTransform(
+                new DocumentSourceSingleDocumentTransformation(
+                    expCtx,
+                    std::move(rewrittenGroupStage),
+                    "$groupByDistinctScan",
+                    false /* independentOfAnyCollection */));
+            pipeline->addInitialSource(groupTransform);
+
+            return swExecutorGrouped;
+        } else if (swExecutorGrouped == ErrorCodes::QueryPlanKilled) {
+            return {ErrorCodes::OperationFailed,
+                    str::stream() << "Failed to determine whether query system can provide a "
+                                     "DISTINCT_SCAN grouping: "
+                                  << swExecutorGrouped.getStatus().toString()};
+        }
     }
 
     const BSONObj emptyProjection;
     const BSONObj metaSortProjection = BSON("$meta"
                                             << "sortKey");
+
+    // The only way to get meta information (e.g. the text score) is to let the query system handle
+    // the projection. In all other cases, unless the query system can do an index-covered
+    // projection and avoid going to the raw record at all, it is faster to have ParsedDeps filter
+    // the fields we need.
+    if (!deps.getNeedsAnyMetadata()) {
+        plannerOpts |= QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
+    }
+
     if (sortStage) {
         // See if the query system can provide a non-blocking sort.
         auto swExecutorSort =
@@ -667,21 +651,26 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                  queryObj,
                                  expCtx->needsMerge ? metaSortProjection : emptyProjection,
                                  *sortObj,
+                                 boost::none, /* groupIdForDistinctScan */
                                  aggRequest,
-                                 plannerOpts);
+                                 plannerOpts,
+                                 matcherFeatures);
 
         if (swExecutorSort.isOK()) {
             // Success! Now see if the query system can also cover the projection.
-            auto swExecutorSortAndProj = attemptToGetExecutor(opCtx,
-                                                              collection,
-                                                              nss,
-                                                              expCtx,
-                                                              oplogReplay,
-                                                              queryObj,
-                                                              *projectionObj,
-                                                              *sortObj,
-                                                              aggRequest,
-                                                              plannerOpts);
+            auto swExecutorSortAndProj =
+                attemptToGetExecutor(opCtx,
+                                     collection,
+                                     nss,
+                                     expCtx,
+                                     oplogReplay,
+                                     queryObj,
+                                     *projectionObj,
+                                     *sortObj,
+                                     boost::none, /* groupIdForDistinctScan */
+                                     aggRequest,
+                                     plannerOpts,
+                                     matcherFeatures);
 
             std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
             if (swExecutorSortAndProj.isOK()) {
@@ -721,7 +710,9 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     // sort.
     dassert(sortObj->isEmpty());
     *projectionObj = removeSortKeyMetaProjection(*projectionObj);
-    if (deps.getNeedSortKey() && !deps.getNeedTextScore()) {
+    const auto metadataRequired = deps.getAllRequiredMetadataTypes();
+    if (metadataRequired.size() == 1 &&
+        metadataRequired.front() == DepsTracker::MetadataType::SORT_KEY) {
         // A sort key requirement would have prevented us from being able to add this parameter
         // before, but now we know the query system won't cover the sort, so we will be able to
         // compute the sort key ourselves during the $sort stage, and thus don't need a query
@@ -738,8 +729,10 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                                queryObj,
                                                *projectionObj,
                                                *sortObj,
+                                               boost::none, /* groupIdForDistinctScan */
                                                aggRequest,
-                                               plannerOpts);
+                                               plannerOpts,
+                                               matcherFeatures);
     if (swExecutorProj.isOK()) {
         // Success! We have a covered projection.
         return std::move(swExecutorProj.getValue());
@@ -761,35 +754,26 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                 queryObj,
                                 *projectionObj,
                                 *sortObj,
+                                boost::none, /* groupIdForDistinctScan */
                                 aggRequest,
-                                plannerOpts);
+                                plannerOpts,
+                                matcherFeatures);
 }
 
-void PipelineD::addCursorSource(Collection* collection,
-                                Pipeline* pipeline,
-                                const intrusive_ptr<ExpressionContext>& expCtx,
-                                unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+void PipelineD::addCursorSource(Pipeline* pipeline,
+                                boost::intrusive_ptr<DocumentSourceCursor> cursor,
                                 DepsTracker deps,
                                 const BSONObj& queryObj,
                                 const BSONObj& sortObj,
                                 const BSONObj& projectionObj) {
-    // DocumentSourceCursor expects a yielding PlanExecutor that has had its state saved.
-    exec->saveState();
-
-    // Put the PlanExecutor into a DocumentSourceCursor and add it to the front of the pipeline.
-    intrusive_ptr<DocumentSourceCursor> pSource =
-        DocumentSourceCursor::create(collection, std::move(exec), expCtx);
-
-    // Note the query, sort, and projection for explain.
-    pSource->setQuery(queryObj);
-    pSource->setSort(sortObj);
-
+    cursor->setQuery(queryObj);
+    cursor->setSort(sortObj);
     if (deps.hasNoRequirements()) {
-        pSource->shouldProduceEmptyDocs();
+        cursor->shouldProduceEmptyDocs();
     }
 
     if (!projectionObj.isEmpty()) {
-        pSource->setProjection(projectionObj, boost::none);
+        cursor->setProjection(projectionObj, boost::none);
     } else {
         // There may be fewer dependencies now if the sort was covered.
         if (!sortObj.isEmpty()) {
@@ -798,13 +782,9 @@ void PipelineD::addCursorSource(Collection* collection,
                                                  : DepsTracker::MetadataAvailable::kNoMetadata);
         }
 
-        pSource->setProjection(deps.toProjection(), deps.toParsedDeps());
+        cursor->setProjection(deps.toProjection(), deps.toParsedDeps());
     }
-
-    // Add the initial DocumentSourceCursor to the front of the pipeline. Then optimize again in
-    // case the new stage can be absorbed with the first stages of the pipeline.
-    pipeline->addInitialSource(pSource);
-    pipeline->optimizePipeline();
+    pipeline->addInitialSource(std::move(cursor));
 }
 
 Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {
@@ -815,32 +795,35 @@ Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {
     return Timestamp();
 }
 
-std::string PipelineD::getPlanSummaryStr(const Pipeline* pPipeline) {
+std::string PipelineD::getPlanSummaryStr(const Pipeline* pipeline) {
     if (auto docSourceCursor =
-            dynamic_cast<DocumentSourceCursor*>(pPipeline->_sources.front().get())) {
+            dynamic_cast<DocumentSourceCursor*>(pipeline->_sources.front().get())) {
         return docSourceCursor->getPlanSummaryStr();
     }
 
     return "";
 }
 
-void PipelineD::getPlanSummaryStats(const Pipeline* pPipeline, PlanSummaryStats* statsOut) {
+void PipelineD::getPlanSummaryStats(const Pipeline* pipeline, PlanSummaryStats* statsOut) {
     invariant(statsOut);
 
     if (auto docSourceCursor =
-            dynamic_cast<DocumentSourceCursor*>(pPipeline->_sources.front().get())) {
+            dynamic_cast<DocumentSourceCursor*>(pipeline->_sources.front().get())) {
         *statsOut = docSourceCursor->getPlanSummaryStats();
     }
 
     bool hasSortStage{false};
-    for (auto&& source : pPipeline->_sources) {
-        if (dynamic_cast<DocumentSourceSort*>(source.get())) {
+    bool usedDisk{false};
+    for (auto&& source : pipeline->_sources) {
+        if (dynamic_cast<DocumentSourceSort*>(source.get()))
             hasSortStage = true;
-            break;
-        }
-    }
 
+        usedDisk = usedDisk || source->usedDisk();
+        if (usedDisk && hasSortStage)
+            break;
+    }
     statsOut->hasSortStage = hasSortStage;
+    statsOut->usedDisk = usedDisk;
 }
 
 }  // namespace mongo

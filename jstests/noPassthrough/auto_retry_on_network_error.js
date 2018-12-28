@@ -1,9 +1,17 @@
 /**
  * Tests that the auto_retry_on_network_error.js override automatically retries commands on network
  * errors for commands run under a session.
+ * @tags: [requires_replication]
  */
 (function() {
     "use strict";
+
+    load("jstests/libs/retryable_writes_util.js");
+
+    if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
+        jsTestLog("Retryable writes are not supported, skipping test");
+        return;
+    }
 
     load("jstests/libs/override_methods/auto_retry_on_network_error.js");
     load("jstests/replsets/rslib.js");
@@ -35,7 +43,10 @@
 
     const rst = new ReplSetTest({nodes: 1});
     rst.startSet();
-    rst.initiate();
+
+    // awaitLastStableRecoveryTimestamp runs an 'appendOplogNote' command which is not retryable.
+    rst.initiateWithAnyNodeAsPrimary(
+        null, "replSetInitiate", {doNotWaitForStableRecoveryTimestamp: true});
 
     const dbName = "test";
     const collName = "auto_retry";

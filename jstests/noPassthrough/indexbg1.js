@@ -1,8 +1,12 @@
 // Test background index creation
+// @tags: [SERVER-32709]
 
 (function() {
     "use strict";
-    const conn = MongoRunner.runMongod({smallfiles: "", nojournal: ""});
+
+    load("jstests/noPassthrough/libs/index_build.js");
+
+    const conn = MongoRunner.runMongod({nojournal: ""});
     assert.neq(null, conn, "mongod failed to start.");
     var db = conn.getDB("test");
     var baseName = "jstests_indexbg1";
@@ -56,9 +60,7 @@
         try {
             // wait for indexing to start
             print("wait for indexing to start");
-            assert.soon(function() {
-                return 2 === t.getIndexes().length;
-            }, "no index created", 30000, 50);
+            IndexBuildTest.waitForIndexBuildToStart(db);
             print("started.");
             sleep(1000);  // there is a race between when the index build shows up in curop and
             // when it first attempts to grab a write lock.

@@ -1,4 +1,13 @@
 // Validates cases where index scans are aborted due to the collection being dropped (SERVER-4400)
+//
+// Drop and other sharding commands can conflict with LockBusy errors in a sharding passthrough
+// suite. This is because drop against a mongos takes distlocks, whereas drop against a mongod does
+// not. Due to the huge number of parallel drops in this test, the other thead is very likely to be
+// starved frequently.
+// Note: this tag can be safely removed once PM-697 is complete and replaces distlocks with a
+// LockManager that has a fairness policy, which distlocks lack.
+// @tags: [assumes_against_mongod_not_mongos, requires_non_retryable_writes]
+
 (function() {
     'use strict';
 
@@ -13,12 +22,14 @@
 
     for (var i = 0; i < 100; ++i) {
         coll.drop();
-        coll.ensureIndex({a: 1});
-        coll.ensureIndex({b: 1});
+        assert.commandWorked(coll.ensureIndex({a: 1}));
+        assert.commandWorked(coll.ensureIndex({b: 1}));
 
+        var bulk = coll.initializeUnorderedBulkOp();
         for (var j = 0; j < 100; ++j) {
-            coll.save({a: j, b: j});
+            bulk.insert({a: j, b: j});
         }
+        assert.commandWorked(bulk.execute());
 
         try {
             var m = i % 5;

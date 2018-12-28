@@ -1,8 +1,15 @@
-// Auth tests for the $listSessions aggregation pipeline.
+/**
+ * Auth tests for the $listSessions aggregation pipeline.
+ * @tags: [requires_sharding]
+ */
 
 (function() {
     'use strict';
     load('jstests/aggregation/extras/utils.js');
+
+    // This test makes assertions about the number of sessions, which are not compatible with
+    // implicit sessions.
+    TestData.disableImplicitSessions = true;
 
     function runListSessionsTest(mongod) {
         assert(mongod);
@@ -69,8 +76,13 @@
     runListSessionsTest(mongod);
     MongoRunner.stopMongod(mongod);
 
-    const st =
-        new ShardingTest({shards: 1, mongos: 1, config: 1, other: {keyFile: 'jstests/libs/key1'}});
+    // TODO: Remove 'shardAsReplicaSet: false' when SERVER-32672 is fixed.
+    const st = new ShardingTest({
+        shards: 1,
+        mongos: 1,
+        config: 1,
+        other: {keyFile: 'jstests/libs/key1', shardAsReplicaSet: false}
+    });
     runListSessionsTest(st.s0);
     st.stop();
 })();

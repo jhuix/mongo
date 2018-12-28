@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -36,8 +38,8 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -59,28 +61,28 @@ class CheckShardingIndex : public ErrmsgCommandDeprecated {
 public:
     CheckShardingIndex() : ErrmsgCommandDeprecated("checkShardingIndex") {}
 
-    virtual void help(std::stringstream& help) const {
-        help << "Internal command.\n";
+    std::string help() const override {
+        return "Internal command.\n";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
     virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool errmsgRun(OperationContext* opCtx,
@@ -116,7 +118,7 @@ public:
             return false;
         }
 
-        IndexDescriptor* idx =
+        const IndexDescriptor* idx =
             collection->getIndexCatalog()->findShardKeyPrefixedIndex(opCtx,
                                                                      keyPattern,
                                                                      true);  // requireSingleKey
@@ -148,7 +150,7 @@ public:
         // this index.
         // NOTE A local copy of 'missingField' is made because indices may be
         // invalidated during a db lock yield.
-        BSONObj missingFieldObj = IndexLegacy::getMissingField(opCtx, collection, idx->infoObj());
+        BSONObj missingFieldObj = IndexLegacy::getMissingField(collection, idx->infoObj());
         BSONElement missingField = missingFieldObj.firstElement();
 
         // for now, the only check is that all shard keys are filled
@@ -190,8 +192,9 @@ public:
                     continue;
 
                 const string msg = str::stream()
-                    << "found missing value in key " << redact(currKey)
-                    << " for doc: " << (obj.hasField("_id") ? redact(obj) : redact(obj["_id"]));
+                    << "There are documents which have missing or incomplete shard key fields ("
+                    << redact(currKey) << "). Please ensure that all documents in the collection "
+                                          "include all fields from the shard key.";
                 log() << "checkShardingIndex for '" << nss.toString() << "' failed: " << msg;
 
                 errmsg = msg;
@@ -200,11 +203,8 @@ public:
         }
 
         if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream() << "Executor error while checking sharding index: "
-                                     << WorkingSetCommon::toStatusString(currKey)));
+            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(currKey).withContext(
+                "Executor error while checking sharding index"));
         }
 
         return true;

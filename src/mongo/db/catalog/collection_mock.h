@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,45 +31,32 @@
 #pragma once
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog.h"
 
 namespace mongo {
 
 /**
  * This class comprises a mock Collection for use by UUIDCatalog unit tests.
  */
-class CollectionMock : virtual public Collection::Impl,
-                       virtual CappedCallback,
-                       virtual UpdateNotifier {
+class CollectionMock : public Collection {
 public:
-    CollectionMock(const NamespaceString& ns) : _ns(ns) {}
+    CollectionMock(const NamespaceString& ns) : CollectionMock(ns, {}) {}
+    CollectionMock(const NamespaceString& ns, std::unique_ptr<IndexCatalog> indexCatalog)
+        : _ns(ns), _indexCatalog(std::move(indexCatalog)) {}
     ~CollectionMock() = default;
 
     void init(OperationContext* opCtx) {
         std::abort();
     }
 
-private:
-    DatabaseCatalogEntry* dbce() const {
-        std::abort();
-    }
-
-    CollectionCatalogEntry* details() const {
-        std::abort();
-    }
-
-    Status aboutToDeleteCapped(OperationContext* opCtx, const RecordId& loc, RecordData data) {
-        std::abort();
-    }
-
-    Status recordStoreGoingToUpdateInPlace(OperationContext* opCtx, const RecordId& loc) {
-        std::abort();
-    }
-    const NamespaceString _ns;
-
-public:
     const NamespaceString& ns() const {
         return _ns;
     }
+
+    void setNs(NamespaceString nss) final {
+        _ns = std::move(nss);
+    }
+
     bool ok() const {
         std::abort();
     }
@@ -85,16 +74,11 @@ public:
     const CollectionInfoCache* infoCache() const {
         std::abort();
     }
-
-    void refreshUUID(OperationContext* opCtx) {
-        std::abort();
-    }
-
     const IndexCatalog* getIndexCatalog() const {
-        std::abort();
+        return _indexCatalog.get();
     }
     IndexCatalog* getIndexCatalog() {
-        std::abort();
+        return _indexCatalog.get();
     }
 
     const RecordStore* getRecordStore() const {
@@ -112,11 +96,11 @@ public:
         std::abort();
     }
 
-    Snapshotted<BSONObj> docFor(OperationContext* opCtx, const RecordId& loc) const {
+    Snapshotted<BSONObj> docFor(OperationContext* opCtx, RecordId loc) const {
         std::abort();
     }
 
-    bool findDoc(OperationContext* opCtx, const RecordId& loc, Snapshotted<BSONObj>* out) const {
+    bool findDoc(OperationContext* opCtx, RecordId loc, Snapshotted<BSONObj>* out) const {
         std::abort();
     }
 
@@ -124,13 +108,9 @@ public:
         std::abort();
     }
 
-    std::vector<std::unique_ptr<RecordCursor>> getManyCursors(OperationContext* opCtx) const {
-        std::abort();
-    }
-
     void deleteDocument(OperationContext* opCtx,
                         StmtId stmtId,
-                        const RecordId& loc,
+                        RecordId loc,
                         OpDebug* opDebug,
                         bool fromMigrate,
                         bool noWarn,
@@ -142,7 +122,6 @@ public:
                            std::vector<InsertStatement>::const_iterator begin,
                            std::vector<InsertStatement>::const_iterator end,
                            OpDebug* opDebug,
-                           bool enforceQuota,
                            bool fromMigrate) {
         std::abort();
     }
@@ -150,7 +129,6 @@ public:
     Status insertDocument(OperationContext* opCtx,
                           const InsertStatement& doc,
                           OpDebug* opDebug,
-                          bool enforceQuota,
                           bool fromMigrate) {
         std::abort();
     }
@@ -162,21 +140,19 @@ public:
         std::abort();
     }
 
-    Status insertDocument(OperationContext* opCtx,
-                          const BSONObj& doc,
-                          const std::vector<MultiIndexBlock*>& indexBlocks,
-                          bool enforceQuota) {
+    Status insertDocumentForBulkLoader(OperationContext* opCtx,
+                                       const BSONObj& doc,
+                                       const OnRecordInsertedFn& onRecordInserted) {
         std::abort();
     }
 
     RecordId updateDocument(OperationContext* opCtx,
-                            const RecordId& oldLocation,
+                            RecordId oldLocation,
                             const Snapshotted<BSONObj>& oldDoc,
                             const BSONObj& newDoc,
-                            bool enforceQuota,
                             bool indexesAffected,
                             OpDebug* opDebug,
-                            OplogUpdateEntryArgs* args) {
+                            CollectionUpdateArgs* args) {
         std::abort();
     }
 
@@ -185,17 +161,14 @@ public:
     }
 
     StatusWith<RecordData> updateDocumentWithDamages(OperationContext* opCtx,
-                                                     const RecordId& loc,
+                                                     RecordId loc,
                                                      const Snapshotted<RecordData>& oldRec,
                                                      const char* damageSource,
                                                      const mutablebson::DamageVector& damages,
-                                                     OplogUpdateEntryArgs* args) {
+                                                     CollectionUpdateArgs* args) {
         std::abort();
     }
 
-    StatusWith<CompactStats> compact(OperationContext* opCtx, const CompactOptions* options) {
-        std::abort();
-    }
     Status truncate(OperationContext* opCtx) {
         std::abort();
     }
@@ -223,7 +196,9 @@ public:
     StatusWithMatchExpression parseValidator(
         OperationContext* opCtx,
         const BSONObj& validator,
-        MatchExpressionParser::AllowedFeatureSet allowedFeatures) const {
+        MatchExpressionParser::AllowedFeatureSet allowedFeatures,
+        boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
+            maxFeatureCompatibilityVersion) const {
         std::abort();
     }
 
@@ -245,7 +220,18 @@ public:
         std::abort();
     }
 
+    Status updateValidator(OperationContext* opCtx,
+                           BSONObj newValidator,
+                           StringData newLevel,
+                           StringData newAction) {
+        std::abort();
+    }
+
     bool isCapped() const {
+        std::abort();
+    }
+
+    CappedCallback* getCappedCallback() {
         std::abort();
     }
 
@@ -261,19 +247,19 @@ public:
         std::abort();
     }
 
+    int averageObjectSize(OperationContext* const opCtx) const {
+        std::abort();
+    }
+
     uint64_t getIndexSize(OperationContext* opCtx, BSONObjBuilder* details, int scale) {
         std::abort();
     }
 
-    boost::optional<SnapshotName> getMinimumVisibleSnapshot() {
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() {
         std::abort();
     }
 
-    void setMinimumVisibleSnapshot(SnapshotName name) {
-        std::abort();
-    }
-
-    void notifyCappedWaitersIfNeeded() {
+    void setMinimumVisibleSnapshot(Timestamp name) {
         std::abort();
     }
 
@@ -281,15 +267,32 @@ public:
         std::abort();
     }
 
-    void informIndexObserver(OperationContext* opCtx,
-                             const IndexDescriptor* descriptor,
-                             const IndexKeyEntry& indexEntry,
-                             const ValidationOperation operation) const {
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
+        OperationContext* opCtx,
+        PlanExecutor::YieldPolicy yieldPolicy,
+        ScanDirection scanDirection) {
+        std::abort();
+    }
+
+    void establishOplogCollectionForLogging(OperationContext* opCtx) {
+        std::abort();
+    }
+
+    DatabaseCatalogEntry* dbce() const {
         std::abort();
     }
 
     OptionalCollectionUUID uuid() const {
+        return UUID::gen();
+    }
+
+    void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) {
         std::abort();
     }
+
+private:
+    NamespaceString _ns;
+    std::unique_ptr<IndexCatalog> _indexCatalog;
 };
+
 }  // namespace mongo

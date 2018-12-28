@@ -1,5 +1,17 @@
+// @tags: [requires_replication, requires_sharding]
 (function() {
     'use strict';
+
+    // This test makes assertions about the number of sessions, which are not compatible with
+    // implicit sessions.
+    TestData.disableImplicitSessions = true;
+
+    load("jstests/libs/retryable_writes_util.js");
+
+    if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
+        jsTestLog("Retryable writes are not supported, skipping test");
+        return;
+    }
 
     function Repl(lifetime) {
         this.rst = new ReplSetTest({
@@ -76,7 +88,7 @@
         for (var i = 0; i < nSessions; i++) {
             // make a session and get it to the collection
             var session = this.sessions[i];
-            session.getDatabase("test").test.save({a: 1});
+            assert.writeOK(session.getDatabase("test").test.save({a: 1}));
         }
 
         // Ensure a write flushes a transaction

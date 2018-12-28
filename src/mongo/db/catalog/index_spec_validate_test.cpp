@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,9 +39,13 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_test_service_context.h"
+#include "mongo/db/server_options.h"
+#include "mongo/unittest/ensure_fcv.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -48,8 +54,10 @@ namespace {
 using index_key_validate::validateIndexSpec;
 using index_key_validate::validateIdIndexSpec;
 using index_key_validate::validateIndexSpecCollation;
+using unittest::EnsureFCV;
 
 const NamespaceString kTestNamespace("test", "index_spec_validate");
+constexpr OperationContext* kDefaultOpCtx = nullptr;
 
 /**
  * Helper function used to return the fields of a BSONObj in a consistent order.
@@ -64,151 +72,130 @@ BSONObj sorted(const BSONObj& obj) {
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfKeyPatternIsNotAnObject) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::TypeMismatch,
-              validateIndexSpec(BSON("key" << 1 << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << 1 << "name"
                                            << "indexName"),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
     ASSERT_EQ(ErrorCodes::TypeMismatch,
-              validateIndexSpec(BSON("key"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key"
                                      << "not an object"
                                      << "name"
                                      << "indexName"),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
     ASSERT_EQ(ErrorCodes::TypeMismatch,
-              validateIndexSpec(BSON("key" << BSONArray() << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSONArray() << "name"
                                            << "indexName"),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfFieldRepeatedInKeyPattern) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::BadValue,
-              validateIndexSpec(BSON("key" << BSON("field" << 1 << "field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1 << "field" << 1) << "name"
                                            << "indexName"),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
     ASSERT_EQ(ErrorCodes::BadValue,
-              validateIndexSpec(BSON("key" << BSON("field" << 1 << "otherField" << -1 << "field"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1 << "otherField" << -1 << "field"
                                                            << "2dsphere")
                                            << "name"
                                            << "indexName"),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfKeyPatternIsNotPresent) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::FailedToParse,
-              validateIndexSpec(BSON("name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("name"
                                      << "indexName"),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfNameIsNotAString) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::TypeMismatch,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name" << 1),
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name" << 1),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfNameIsNotPresent) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
-    ASSERT_EQ(
-        ErrorCodes::FailedToParse,
-        validateIndexSpec(BSON("key" << BSON("field" << 1)), kTestNamespace, featureCompatibility));
+    ASSERT_EQ(ErrorCodes::FailedToParse,
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1)),
+                                kTestNamespace,
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfNamespaceIsNotAString) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::TypeMismatch,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "ns"
                                            << 1),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
     ASSERT_EQ(ErrorCodes::TypeMismatch,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "ns"
                                            << BSONObj()),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfNamespaceIsEmptyString) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::BadValue,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "ns"
                                            << ""),
                                 NamespaceString(),
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfNamespaceDoesNotMatch) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::BadValue,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "ns"
                                            << "some string"),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 
     // Verify that we reject the index specification when the "ns" field only contains the
     // collection name.
     ASSERT_EQ(ErrorCodes::BadValue,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "ns"
                                            << kTestNamespace.coll()),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsIndexSpecWithNamespaceFilledInIfItIsNotPresent) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
-    auto result = validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
                                                << "indexName"
                                                << "v"
                                                << 1),
                                     kTestNamespace,
-                                    featureCompatibility);
+                                    serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 
     // We don't care about the order of the fields in the resulting index specification.
@@ -221,22 +208,20 @@ TEST(IndexSpecValidateTest, ReturnsIndexSpecWithNamespaceFilledInIfItIsNotPresen
                       sorted(result.getValue()));
 
     // Verify that the index specification we returned is still considered valid.
-    ASSERT_OK(validateIndexSpec(result.getValue(), kTestNamespace, featureCompatibility));
+    ASSERT_OK(validateIndexSpec(
+        kDefaultOpCtx, result.getValue(), kTestNamespace, serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsIndexSpecUnchangedIfNamespaceAndVersionArePresent) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
-    auto result = validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
                                                << "indexName"
                                                << "ns"
                                                << kTestNamespace.ns()
                                                << "v"
                                                << 1),
                                     kTestNamespace,
-                                    featureCompatibility);
+                                    serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 
     // We don't care about the order of the fields in the resulting index specification.
@@ -250,82 +235,74 @@ TEST(IndexSpecValidateTest, ReturnsIndexSpecUnchangedIfNamespaceAndVersionArePre
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsNotANumber) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::TypeMismatch,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "v"
                                            << "not a number"),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
     ASSERT_EQ(ErrorCodes::TypeMismatch,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "v"
                                            << BSONObj()),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsNotRepresentableAsInt) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::BadValue,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "v"
                                            << 2.2),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
     ASSERT_EQ(ErrorCodes::BadValue,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "v"
                                            << std::nan("1")),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
     ASSERT_EQ(ErrorCodes::BadValue,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "v"
                                            << std::numeric_limits<double>::infinity()),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
     ASSERT_EQ(ErrorCodes::BadValue,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "v"
                                            << std::numeric_limits<long long>::max()),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsV0) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::CannotCreateIndex,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "v"
                                            << 0),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsUnsupported) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::CannotCreateIndex,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "v"
                                            << 3
@@ -333,28 +310,26 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsUnsupported) {
                                            << BSON("locale"
                                                    << "en")),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 
     ASSERT_EQ(ErrorCodes::CannotCreateIndex,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "v"
                                            << -3LL),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, AcceptsIndexVersionsThatAreAllowedForCreation) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
-    auto result = validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
                                                << "indexName"
                                                << "v"
                                                << 1),
                                     kTestNamespace,
-                                    featureCompatibility);
+                                    serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 
     // We don't care about the order of the fields in the resulting index specification.
@@ -366,12 +341,13 @@ TEST(IndexSpecValidateTest, AcceptsIndexVersionsThatAreAllowedForCreation) {
                                         << 1)),
                       sorted(result.getValue()));
 
-    result = validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+    result = validateIndexSpec(kDefaultOpCtx,
+                               BSON("key" << BSON("field" << 1) << "name"
                                           << "indexName"
                                           << "v"
                                           << 2LL),
                                kTestNamespace,
-                               featureCompatibility);
+                               serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 
     // We don't care about the order of the fields in the resulting index specification.
@@ -385,16 +361,13 @@ TEST(IndexSpecValidateTest, AcceptsIndexVersionsThatAreAllowedForCreation) {
 }
 
 TEST(IndexSpecValidateTest, DefaultIndexVersionIsV2) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
-    auto result = validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
                                                << "indexName"
                                                << "ns"
                                                << kTestNamespace.ns()),
                                     kTestNamespace,
-                                    featureCompatibility);
+                                    serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 
     // We don't care about the order of the fields in the resulting index specification.
@@ -407,20 +380,18 @@ TEST(IndexSpecValidateTest, DefaultIndexVersionIsV2) {
                       sorted(result.getValue()));
 
     // Verify that the index specification we returned is still considered valid.
-    ASSERT_OK(validateIndexSpec(result.getValue(), kTestNamespace, featureCompatibility));
+    ASSERT_OK(validateIndexSpec(
+        kDefaultOpCtx, result.getValue(), kTestNamespace, serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, AcceptsIndexVersionV1) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
-    auto result = validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
                                                << "indexName"
                                                << "v"
                                                << 1),
                                     kTestNamespace,
-                                    featureCompatibility);
+                                    serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 
     // We don't care about the order of the fields in the resulting index specification.
@@ -434,54 +405,47 @@ TEST(IndexSpecValidateTest, AcceptsIndexVersionV1) {
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsNotAnObject) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::TypeMismatch,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "collation"
                                            << 1),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
     ASSERT_EQ(ErrorCodes::TypeMismatch,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "collation"
                                            << "not an object"),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
     ASSERT_EQ(ErrorCodes::TypeMismatch,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "collation"
                                            << BSONArray()),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsEmpty) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::BadValue,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "collation"
                                            << BSONObj()),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsPresentAndVersionIsLessThanV2) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
     ASSERT_EQ(ErrorCodes::CannotCreateIndex,
-              validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+              validateIndexSpec(kDefaultOpCtx,
+                                BSON("key" << BSON("field" << 1) << "name"
                                            << "indexName"
                                            << "collation"
                                            << BSON("locale"
@@ -489,15 +453,12 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsPresentAndVersionIsLessTh
                                            << "v"
                                            << 1),
                                 kTestNamespace,
-                                featureCompatibility));
+                                serverGlobalParams.featureCompatibility));
 }
 
 TEST(IndexSpecValidateTest, AcceptsAnyNonEmptyObjectValueForCollation) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
-    auto result = validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
                                                << "indexName"
                                                << "v"
                                                << 2
@@ -505,7 +466,7 @@ TEST(IndexSpecValidateTest, AcceptsAnyNonEmptyObjectValueForCollation) {
                                                << BSON("locale"
                                                        << "simple")),
                                     kTestNamespace,
-                                    featureCompatibility);
+                                    serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 
     // We don't care about the order of the fields in the resulting index specification.
@@ -520,14 +481,15 @@ TEST(IndexSpecValidateTest, AcceptsAnyNonEmptyObjectValueForCollation) {
                                                 << "simple"))),
                       sorted(result.getValue()));
 
-    result = validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+    result = validateIndexSpec(kDefaultOpCtx,
+                               BSON("key" << BSON("field" << 1) << "name"
                                           << "indexName"
                                           << "v"
                                           << 2
                                           << "collation"
                                           << BSON("unknownCollationOption" << true)),
                                kTestNamespace,
-                               featureCompatibility);
+                               serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 
     // We don't care about the order of the fields in the resulting index specification.
@@ -543,11 +505,8 @@ TEST(IndexSpecValidateTest, AcceptsAnyNonEmptyObjectValueForCollation) {
 }
 
 TEST(IndexSpecValidateTest, AcceptsIndexSpecIfCollationIsPresentAndVersionIsEqualToV2) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
-    auto result = validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
                                                << "indexName"
                                                << "v"
                                                << 2
@@ -555,7 +514,7 @@ TEST(IndexSpecValidateTest, AcceptsIndexSpecIfCollationIsPresentAndVersionIsEqua
                                                << BSON("locale"
                                                        << "en")),
                                     kTestNamespace,
-                                    featureCompatibility);
+                                    serverGlobalParams.featureCompatibility);
     ASSERT_OK(result.getStatus());
 
     // We don't care about the order of the fields in the resulting index specification.
@@ -572,34 +531,28 @@ TEST(IndexSpecValidateTest, AcceptsIndexSpecIfCollationIsPresentAndVersionIsEqua
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfUnknownFieldIsPresentInSpecV2) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
-    auto result = validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
                                                << "indexName"
                                                << "v"
                                                << 2
                                                << "unknownField"
                                                << 1),
                                     kTestNamespace,
-                                    featureCompatibility);
+                                    serverGlobalParams.featureCompatibility);
     ASSERT_EQ(ErrorCodes::InvalidIndexSpecificationOption, result);
 }
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfUnknownFieldIsPresentInSpecV1) {
-    ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
-
-    auto result = validateIndexSpec(BSON("key" << BSON("field" << 1) << "name"
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
                                                << "indexName"
                                                << "v"
                                                << 1
                                                << "unknownField"
                                                << 1),
                                     kTestNamespace,
-                                    featureCompatibility);
+                                    serverGlobalParams.featureCompatibility);
     ASSERT_EQ(ErrorCodes::InvalidIndexSpecificationOption, result);
 }
 
@@ -822,6 +775,208 @@ TEST(IndexSpecCollationValidateTest, FillsInCollationFieldWithCollectionDefaultI
                                                 << "version"
                                                 << "mock_version"))),
                       sorted(result.getValue()));
+}
+
+TEST(IndexSpecPartialFilterTest, FailsIfPartialFilterIsNotAnObject) {
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"
+                                               << "partialFilterExpression"
+                                               << 1),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::TypeMismatch);
+}
+
+TEST(IndexSpecPartialFilterTest, FailsIfPartialFilterContainsBannedFeature) {
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"
+                                               << "partialFilterExpression"
+                                               << BSON("$jsonSchema" << BSONObj())),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::QueryFeatureNotAllowed);
+}
+
+TEST(IndexSpecPartialFilterTest, AcceptsValidPartialFilterExpression) {
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("field" << 1) << "name"
+                                               << "indexName"
+                                               << "partialFilterExpression"
+                                               << BSON("a" << 1)),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_OK(result.getStatus());
+}
+
+TEST(IndexSpecWildcard, SucceedsWithInclusion) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("a" << 1 << "b" << 1)),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_OK(result.getStatus());
+}
+
+TEST(IndexSpecWildcard, SucceedsWithExclusion) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("a" << 0 << "b" << 0)),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_OK(result.getStatus());
+}
+
+TEST(IndexSpecWildcard, SucceedsWithExclusionIncludingId) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("_id" << 1 << "a" << 0 << "b" << 0)),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_OK(result.getStatus());
+}
+
+TEST(IndexSpecWildcard, SucceedsWithInclusionExcludingId) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("_id" << 0 << "a" << 1 << "b" << 1)),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_OK(result.getStatus());
+}
+
+TEST(IndexSpecWildcard, FailsWithInclusionExcludingIdSubfield) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("_id.field" << 0 << "a" << 1 << "b" << 1)),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus().code(), 40179);
+}
+
+TEST(IndexSpecWildcard, FailsWithExclusionIncludingIdSubfield) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("_id.field" << 1 << "a" << 0 << "b" << 0)),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus().code(), 40178);
+}
+
+TEST(IndexSpecWildcard, FailsWithImproperFeatureCompatabilityVersion) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    serverGlobalParams.featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::CannotCreateIndex);
+}
+
+TEST(IndexSpecWildcard, FailsWithMixedProjection) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("a" << 1 << "b" << 0)),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus().code(), 40178);
+}
+
+TEST(IndexSpecWildcard, FailsWithComputedFieldsInProjection) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("a" << 1 << "b"
+                                                           << "string")),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
+}
+
+TEST(IndexSpecWildcard, FailsWhenProjectionPluginNotWildcard) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("a" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("a" << 1)),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+}
+
+TEST(IndexSpecWildcard, FailsWhenProjectionIsNotAnObject) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << 4),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::TypeMismatch);
+}
+
+TEST(IndexSpecWildcard, FailsWithEmptyProjection) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSONObj()),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
+}
+
+TEST(IndexSpecWildcard, FailsWhenInclusionWithSubpath) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("a.$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("a" << 1)),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
+}
+
+TEST(IndexSpecWildcard, FailsWhenExclusionWithSubpath) {
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+    auto result = validateIndexSpec(kDefaultOpCtx,
+                                    BSON("key" << BSON("a.$**" << 1) << "name"
+                                               << "indexName"
+                                               << "wildcardProjection"
+                                               << BSON("b" << 0)),
+                                    kTestNamespace,
+                                    serverGlobalParams.featureCompatibility);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
 }
 
 }  // namespace

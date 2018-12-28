@@ -1,9 +1,13 @@
 /**
  * Validates the operationTime value in the command response depends on the read/writeConcern of the
  * the read/write commmand that produced it.
+ * @tags: [requires_majority_read_concern]
  */
 (function() {
     "use strict";
+
+    // Skip db hash check because replication is stopped on secondaries.
+    TestData.skipCheckDBHashes = true;
 
     load("jstests/replsets/rslib.js");           // For startSetIfSupportsReadMajority.
     load("jstests/libs/write_concern_util.js");  // For stopReplicationOnSecondaries,
@@ -15,6 +19,7 @@
 
     if (!startSetIfSupportsReadMajority(replTest)) {
         jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
+        replTest.stopSet();
         return;
     }
     replTest.initiate();
@@ -39,7 +44,7 @@
         testDB.runCommand({insert: collectionName, documents: [localDoc], writeConcern: {w: 1}}));
     var localWriteOperationTime = res.operationTime;
 
-    assert(localWriteOperationTime > majorityWriteOperationTime);
+    assert.gt(localWriteOperationTime, majorityWriteOperationTime);
 
     res = assert.commandWorked(testDB.runCommand({
         find: collectionName,

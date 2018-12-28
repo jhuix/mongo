@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,14 +35,13 @@
 #include "mongo/db/query/find.h"
 
 #include "mongo/base/error_codes.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -52,7 +53,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner_params.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -73,7 +74,10 @@ using std::unique_ptr;
 using stdx::make_unique;
 
 // Failpoint for checking whether we've received a getmore.
-MONGO_FP_DECLARE(failReceivedGetmore);
+MONGO_FAIL_POINT_DEFINE(failReceivedGetmore);
+
+// Failpoint to keep a cursor pinned.
+MONGO_FAIL_POINT_DEFINE(legacyGetMoreWaitWithCursor)
 
 bool shouldSaveCursor(OperationContext* opCtx,
                       const Collection* collection,
@@ -164,8 +168,7 @@ namespace {
  *
  * Returns the number of documents in the batch in 'numResults', which must be initialized to
  * zero by the caller. Returns the final ExecState returned by the cursor in *state. Returns
- * whether or not to save the ClientCursor in 'shouldSaveCursor'. Returns the slave's time to
- * read until in 'slaveReadTill' (for master/slave).
+ * whether or not to save the ClientCursor in 'shouldSaveCursor'.
  *
  * Returns an OK status if the batch was successfully generated, and a non-OK status if the
  * PlanExecutor encounters a failure.
@@ -173,8 +176,7 @@ namespace {
 void generateBatch(int ntoreturn,
                    ClientCursor* cursor,
                    BufBuilder* bb,
-                   int* numResults,
-                   Timestamp* slaveReadTill,
+                   std::uint64_t* numResults,
                    PlanExecutor::ExecState* state) {
     PlanExecutor* exec = cursor->getExecutor();
 
@@ -192,25 +194,25 @@ void generateBatch(int ntoreturn,
 
         // Count the result.
         (*numResults)++;
-
-        // Possibly note slave's position in the oplog.
-        if (cursor->queryOptions() & QueryOption_OplogReplay) {
-            BSONElement e = obj["ts"];
-            if (BSONType::Date == e.type() || BSONType::bsonTimestamp == e.type()) {
-                *slaveReadTill = e.timestamp();
-            }
-        }
     }
 
     // Propagate any errors to the caller.
-    if (PlanExecutor::FAILURE == *state) {
-        error() << "getMore executor error, stats: " << redact(Explain::getWinningPlanStats(exec));
-        uasserted(17406, "getMore executor error: " + WorkingSetCommon::toStatusString(obj));
-    } else if (PlanExecutor::DEAD == *state) {
-        uasserted(ErrorCodes::QueryPlanKilled,
-                  str::stream() << "PlanExecutor killed: "
-                                << WorkingSetCommon::toStatusString(obj));
+    switch (*state) {
+        // Log an error message and then perform the same cleanup as DEAD.
+        case PlanExecutor::FAILURE:
+            error() << "getMore executor error, stats: "
+                    << redact(Explain::getWinningPlanStats(exec));
+        case PlanExecutor::DEAD: {
+            // We should always have a valid status object by this point.
+            auto status = WorkingSetCommon::getMemberObjectStatus(obj);
+            invariant(!status.isOK());
+            uassertStatusOK(status);
+        }
+        default:
+            return;
     }
+
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace
@@ -231,7 +233,7 @@ Message getMore(OperationContext* opCtx,
 
     // For testing, we may want to fail if we receive a getmore.
     if (MONGO_FAIL_POINT(failReceivedGetmore)) {
-        invariant(0);
+        MONGO_UNREACHABLE;
     }
 
     *exhaust = false;
@@ -255,6 +257,7 @@ Message getMore(OperationContext* opCtx,
     // Note that we acquire our locks before our ClientCursorPin, in order to ensure that the pin's
     // destructor is called before the lock's destructor (if there is one) so that the cursor
     // cleanup can occur under the lock.
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     boost::optional<AutoGetCollectionForRead> readLock;
     boost::optional<AutoStatsTracker> statsTracker;
     CursorManager* cursorManager;
@@ -269,7 +272,11 @@ Message getMore(OperationContext* opCtx,
             const auto profilingLevel = autoDb.getDb()
                 ? boost::optional<int>{autoDb.getDb()->getProfilingLevel()}
                 : boost::none;
-            statsTracker.emplace(opCtx, *nssForCurOp, Top::LockType::NotLocked, profilingLevel);
+            statsTracker.emplace(opCtx,
+                                 *nssForCurOp,
+                                 Top::LockType::NotLocked,
+                                 AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                 profilingLevel);
             auto view = autoDb.getDb()
                 ? autoDb.getDb()->getViewCatalog()->lookup(opCtx, nssForCurOp->ns())
                 : nullptr;
@@ -287,6 +294,7 @@ Message getMore(OperationContext* opCtx,
         statsTracker.emplace(opCtx,
                              nss,
                              Top::LockType::ReadLocked,
+                             AutoStatsTracker::LogMode::kUpdateTopAndCurop,
                              readLock->getDb() ? readLock->getDb()->getProfilingLevel()
                                                : doNotChangeProfilingLevel);
         Collection* collection = readLock->getCollection();
@@ -297,9 +305,8 @@ Message getMore(OperationContext* opCtx,
         // This checks to make sure the operation is allowed on a replicated node.  Since we are not
         // passing in a query object (necessary to check SlaveOK query option), we allow reads
         // whether we are PRIMARY or SECONDARY.
-        Status status =
-            repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor(opCtx, nss, true);
-        uassertStatusOK(status);
+        uassertStatusOK(
+            repl::ReplicationCoordinator::get(opCtx)->checkCanServeReadsFor(opCtx, nss, true));
     }
 
     LOG(5) << "Running getMore, cursorid: " << cursorid;
@@ -312,7 +319,7 @@ Message getMore(OperationContext* opCtx,
     // These are set in the QueryResult msg we return.
     int resultFlags = ResultFlag_AwaitCapable;
 
-    int numResults = 0;
+    std::uint64_t numResults = 0;
     int startingResult = 0;
 
     const int InitialBufSize =
@@ -326,7 +333,6 @@ Message getMore(OperationContext* opCtx,
             cursorid = 0;
             resultFlags = ResultFlag_CursorNotFound;
         } else {
-            invariant(ccPin == ErrorCodes::QueryPlanKilled || ccPin == ErrorCodes::Unauthorized);
             uassertStatusOK(ccPin.getStatus());
         }
     } else {
@@ -352,8 +358,14 @@ Message getMore(OperationContext* opCtx,
 
         *isCursorAuthorized = true;
 
-        if (cc->isReadCommitted())
-            uassertStatusOK(opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
+        const auto replicationMode = repl::ReplicationCoordinator::get(opCtx)->getReplicationMode();
+
+        if (replicationMode == repl::ReplicationCoordinator::modeReplSet &&
+            cc->getReadConcernArgs().getLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
+            opCtx->recoveryUnit()->setTimestampReadSource(
+                RecoveryUnit::ReadSource::kMajorityCommitted);
+            uassertStatusOK(opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot());
+        }
 
         uassert(40548,
                 "OP_GET_MORE operations are not supported on tailable aggregations. Only clients "
@@ -366,17 +378,13 @@ Message getMore(OperationContext* opCtx,
             uassert(40136,
                     "Illegal attempt to set operation deadline within DBDirectClient",
                     !opCtx->getClient()->isInDirectClient());
-            opCtx->setDeadlineAfterNowBy(cc->getLeftoverMaxTimeMicros());
+            opCtx->setDeadlineAfterNowBy(cc->getLeftoverMaxTimeMicros(),
+                                         ErrorCodes::MaxTimeMSExpired);
         }
         opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
-        cc->updateSlaveLocation(opCtx);
-
-        // If we're replaying the oplog, we save the last time that we read.
-        Timestamp slaveReadTill;
-
         // What number result are we starting at?  Used to fill out the reply.
-        startingResult = cc->pos();
+        startingResult = cc->nReturnedSoFar();
 
         uint64_t notifierVersion = 0;
         std::shared_ptr<CappedInsertNotifier> notifier;
@@ -395,7 +403,7 @@ Message getMore(OperationContext* opCtx,
 
         PlanExecutor* exec = cc->getExecutor();
         exec->reattachToOperationContext(opCtx);
-        uassertStatusOK(exec->restoreState());
+        exec->restoreState();
 
         auto planSummary = Explain::getPlanSummary(exec);
         {
@@ -407,6 +415,8 @@ Message getMore(OperationContext* opCtx,
             // command or upconverted legacy query in the originatingCommand field.
             curOp.setOpDescription_inlock(upconvertGetMoreEntry(nss, cursorid, ntoreturn));
             curOp.setOriginatingCommand_inlock(cc->getOriginatingCommandObj());
+            // Update the generic cursor in curOp.
+            curOp.setGenericCursor_inlock(cc->toGenericCursor());
         }
 
         PlanExecutor::ExecState state;
@@ -416,8 +426,12 @@ Message getMore(OperationContext* opCtx,
         // metrics, as they accumulate over the course of a cursor's lifetime.
         PlanSummaryStats preExecutionStats;
         Explain::getSummaryStats(*exec, &preExecutionStats);
+        if (MONGO_FAIL_POINT(legacyGetMoreWaitWithCursor)) {
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &legacyGetMoreWaitWithCursor, opCtx, "legacyGetMoreWaitWithCursor", nullptr);
+        }
 
-        generateBatch(ntoreturn, cc, &bb, &numResults, &slaveReadTill, &state);
+        generateBatch(ntoreturn, cc, &bb, &numResults, &state);
 
         // If this is an await data cursor, and we hit EOF without generating any results, then
         // we block waiting for new data to arrive.
@@ -430,17 +444,19 @@ Message getMore(OperationContext* opCtx,
             // the total operation latency.
             curOp.pauseTimer();
             Seconds timeout(1);
-            notifier->wait(notifierVersion, timeout);
+            notifier->waitUntil(notifierVersion,
+                                opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                                    timeout);
             notifier.reset();
             curOp.resumeTimer();
 
             // Reacquiring locks.
             readLock.emplace(opCtx, nss);
-            uassertStatusOK(exec->restoreState());
+            exec->restoreState();
 
             // We woke up because either the timed_wait expired, or there was more data. Either
             // way, attempt to generate another batch of results.
-            generateBatch(ntoreturn, cc, &bb, &numResults, &slaveReadTill, &state);
+            generateBatch(ntoreturn, cc, &bb, &numResults, &state);
         }
 
         PlanSummaryStats postExecutionStats;
@@ -477,16 +493,12 @@ Message getMore(OperationContext* opCtx,
                    << PlanExecutor::statestr(state);
         } else {
             // Continue caching the ClientCursor.
-            cc->incPos(numResults);
+            cc->incNReturnedSoFar(numResults);
+            cc->incNBatches();
             exec->saveState();
             exec->detachFromOperationContext();
             LOG(5) << "getMore saving client cursor ended with state "
                    << PlanExecutor::statestr(state);
-
-            // Possibly note slave's position in the oplog.
-            if ((cc->queryOptions() & QueryOption_OplogReplay) && !slaveReadTill.isNull()) {
-                cc->slaveReadTill(slaveReadTill);
-            }
 
             *exhaust = cc->queryOptions() & QueryOption_Exhaust;
 
@@ -524,54 +536,42 @@ std::string runQuery(OperationContext* opCtx,
     invariant(!nss.isCommand());
 
     // Set CurOp information.
-    beginQueryOp(opCtx, nss, q.query, q.ntoreturn, q.ntoskip);
+    const auto upconvertedQuery = upconvertQueryEntry(q.query, nss, q.ntoreturn, q.ntoskip);
+    beginQueryOp(opCtx, nss, upconvertedQuery, q.ntoreturn, q.ntoskip);
 
     // Parse the qm into a CanonicalQuery.
     const boost::intrusive_ptr<ExpressionContext> expCtx;
-    auto statusWithCQ =
+    auto cq = uassertStatusOKWithContext(
         CanonicalQuery::canonicalize(opCtx,
                                      q,
                                      expCtx,
                                      ExtensionsCallbackReal(opCtx, &nss),
-                                     MatchExpressionParser::kAllowAllSpecialFeatures);
-    if (!statusWithCQ.isOK()) {
-        uasserted(17287,
-                  str::stream() << "Can't canonicalize query: "
-                                << statusWithCQ.getStatus().toString());
-    }
-    unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+                                     MatchExpressionParser::kAllowAllSpecialFeatures),
+        "Can't canonicalize query");
     invariant(cq.get());
 
     LOG(5) << "Running query:\n" << redact(cq->toString());
     LOG(2) << "Running query: " << redact(cq->toStringShort());
 
     // Parse, canonicalize, plan, transcribe, and get a plan executor.
-    AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
-    Collection* collection = ctx.getCollection();
-
-    if (ctx.getView()) {
-        uasserted(ErrorCodes::CommandNotSupportedOnView,
-                  str::stream()
-                      << "Namespace "
-                      << nss.ns()
-                      << " is a view. Legacy find operations are not supported on views. "
-                      << "Only clients which support the find command can be used to query views.");
-    }
+    AutoGetCollectionForReadCommand ctx(opCtx, nss, AutoGetCollection::ViewMode::kViewsForbidden);
+    Collection* const collection = ctx.getCollection();
 
     {
         const QueryRequest& qr = cq->getQueryRequest();
 
-        // uassert if we are not on a primary, and not a secondary with SlaveOk query parameter set.
-        // TODO(SERVER-31293): Don't set slaveOk for reads with a read pref of "primary".
-        bool slaveOK = qr.isSlaveOk() || qr.hasReadPref();
-        Status serveReadsStatus =
-            repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor(opCtx, nss, slaveOK);
-        uassertStatusOK(serveReadsStatus);
+        // Allow the query to run on secondaries if the read preference permits it. If no read
+        // preference was specified, allow the query to run iff slaveOk has been set.
+        const bool slaveOK = qr.hasReadPref()
+            ? uassertStatusOK(ReadPreferenceSetting::fromContainingBSON(q.query))
+                  .canRunOnSecondary()
+            : qr.isSlaveOk();
+        uassertStatusOK(
+            repl::ReplicationCoordinator::get(opCtx)->checkCanServeReadsFor(opCtx, nss, slaveOK));
     }
 
     // We have a parsed query. Time to get the execution plan for it.
-    auto exec = uassertStatusOK(
-        getExecutorFind(opCtx, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO));
+    auto exec = uassertStatusOK(getExecutorLegacyFind(opCtx, collection, nss, std::move(cq)));
 
     const QueryRequest& qr = exec->getCanonicalQuery()->getQueryRequest();
 
@@ -607,7 +607,7 @@ std::string runQuery(OperationContext* opCtx,
         uassert(40116,
                 "Illegal attempt to set operation deadline within DBDirectClient",
                 !opCtx->getClient()->isInDirectClient());
-        opCtx->setDeadlineAfterNowBy(Milliseconds{qr.getMaxTimeMS()});
+        opCtx->setDeadlineAfterNowBy(Milliseconds{qr.getMaxTimeMS()}, ErrorCodes::MaxTimeMSExpired);
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
@@ -620,9 +620,6 @@ std::string runQuery(OperationContext* opCtx,
 
     // How many results have we obtained from the executor?
     int numResults = 0;
-
-    // If we're replaying the oplog, we save the last time that we read.
-    Timestamp slaveReadTill;
 
     BSONObj obj;
     PlanExecutor::ExecState state;
@@ -646,14 +643,6 @@ std::string runQuery(OperationContext* opCtx,
         // Count the result.
         ++numResults;
 
-        // Possibly note slave's position in the oplog.
-        if (qr.isOplogReplay()) {
-            BSONElement e = obj["ts"];
-            if (Date == e.type() || bsonTimestamp == e.type()) {
-                slaveReadTill = e.timestamp();
-            }
-        }
-
         if (FindCommon::enoughForFirstBatch(qr, numResults)) {
             LOG(5) << "Enough for first batch, wantMore=" << qr.wantMore()
                    << " ntoreturn=" << qr.getNToReturn().value_or(0)
@@ -666,7 +655,9 @@ std::string runQuery(OperationContext* opCtx,
     if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
         error() << "Plan executor error during find: " << PlanExecutor::statestr(state)
                 << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
-        uasserted(17144, "Executor error: " + WorkingSetCommon::toStatusString(obj));
+        uassertStatusOKWithContext(WorkingSetCommon::getMemberObjectStatus(obj),
+                                   "Executor error during OP_QUERY find");
+        MONGO_UNREACHABLE;
     }
 
     // Before saving the cursor, ensure that whatever plan we established happened with the expected
@@ -683,30 +674,27 @@ std::string runQuery(OperationContext* opCtx,
         exec->saveState();
         exec->detachFromOperationContext();
 
+        const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
         // Allocate a new ClientCursor and register it with the cursor manager.
         ClientCursorPin pinnedCursor = collection->getCursorManager()->registerCursor(
             opCtx,
             {std::move(exec),
              nss,
              AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-             opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
-             upconvertQueryEntry(q.query, qr.nss(), q.ntoreturn, q.ntoskip)});
+             readConcernArgs,
+             upconvertedQuery});
         ccId = pinnedCursor.getCursor()->cursorid();
 
         LOG(5) << "caching executor with cursorid " << ccId << " after returning " << numResults
                << " results";
 
         // TODO document
-        if (qr.isOplogReplay() && !slaveReadTill.isNull()) {
-            pinnedCursor.getCursor()->slaveReadTill(slaveReadTill);
-        }
-
-        // TODO document
         if (qr.isExhaust()) {
             curOp.debug().exhaust = true;
         }
 
-        pinnedCursor.getCursor()->setPos(numResults);
+        pinnedCursor.getCursor()->setNReturnedSoFar(numResults);
+        pinnedCursor.getCursor()->incNBatches();
 
         // We assume that cursors created through a DBDirectClient are always used from their
         // original OperationContext, so we do not need to move time to and from the cursor.

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -90,12 +92,14 @@ public:
     TaskExecutorWithFailureInScheduleRemoteCommand(executor::TaskExecutor* executor)
         : unittest::TaskExecutorProxy(executor) {}
     virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleRemoteCommand(
-        const executor::RemoteCommandRequest& request, const RemoteCommandCallbackFn& cb) override {
+        const executor::RemoteCommandRequest& request,
+        const RemoteCommandCallbackFn& cb,
+        const transport::BatonHandle& baton = nullptr) override {
         if (scheduleRemoteCommandFailPoint) {
             return Status(ErrorCodes::ShutdownInProgress,
                           "failed to send remote command - shutdown in progress");
         }
-        return getExecutor()->scheduleRemoteCommand(request, cb);
+        return getExecutor()->scheduleRemoteCommand(request, cb, baton);
     }
 
     bool scheduleRemoteCommandFailPoint = false;
@@ -176,7 +180,7 @@ TEST_F(RemoteCommandRetrySchedulerTest, MakeSingleShotRetryPolicy) {
     // Doesn't matter what "shouldRetryOnError()" returns since we won't be retrying the remote
     // command.
     for (int i = 0; i < int(ErrorCodes::MaxError); ++i) {
-        auto error = ErrorCodes::fromInt(i);
+        auto error = ErrorCodes::Error(i);
         ASSERT_FALSE(policy->shouldRetryOnError(error));
     }
 }
@@ -189,7 +193,7 @@ TEST_F(RemoteCommandRetrySchedulerTest, MakeRetryPolicy) {
     ASSERT_EQUALS(5U, policy->getMaximumAttempts());
     ASSERT_EQUALS(Milliseconds(100), policy->getMaximumResponseElapsedTotal());
     for (int i = 0; i < int(ErrorCodes::MaxError); ++i) {
-        auto error = ErrorCodes::fromInt(i);
+        auto error = ErrorCodes::Error(i);
         if (error == ErrorCodes::InternalError || error == ErrorCodes::FailedToParse ||
             error == ErrorCodes::InvalidNamespace) {
             ASSERT_TRUE(policy->shouldRetryOnError(error));
@@ -299,11 +303,24 @@ TEST_F(RemoteCommandRetrySchedulerTest, StartupFailsWhenExecutorIsShutDown) {
     ASSERT_FALSE(scheduler.isActive());
 }
 
+TEST_F(RemoteCommandRetrySchedulerTest, StartupFailsWhenSchedulerIsShutDown) {
+    auto callback = [](const executor::TaskExecutor::RemoteCommandCallbackArgs&) {};
+    auto policy = RemoteCommandRetryScheduler::makeNoRetryPolicy();
+
+    RemoteCommandRetryScheduler scheduler(&getExecutor(), request, callback, std::move(policy));
+    ASSERT_FALSE(scheduler.isActive());
+
+    scheduler.shutdown();
+
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, scheduler.startup());
+    ASSERT_FALSE(scheduler.isActive());
+}
+
 TEST_F(RemoteCommandRetrySchedulerTest,
        ShuttingDownExecutorAfterSchedulerStartupInvokesCallbackWithCallbackCanceledError) {
     CallbackResponseSaver callback;
     auto policy = RemoteCommandRetryScheduler::makeRetryPolicy(
-        10U, Milliseconds(1), {ErrorCodes::HostNotFound});
+        10U, Milliseconds(1), {ErrorCodes::HostUnreachable});
     RemoteCommandRetryScheduler scheduler(
         &getExecutor(), request, stdx::ref(callback), std::move(policy));
     start(&scheduler);
@@ -325,7 +342,7 @@ TEST_F(RemoteCommandRetrySchedulerTest,
        ShuttingDownSchedulerAfterSchedulerStartupInvokesCallbackWithCallbackCanceledError) {
     CallbackResponseSaver callback;
     auto policy = RemoteCommandRetryScheduler::makeRetryPolicy(
-        10U, Milliseconds(1), {ErrorCodes::HostNotFound});
+        10U, Milliseconds(1), {ErrorCodes::HostUnreachable});
     RemoteCommandRetryScheduler scheduler(
         &getExecutor(), request, stdx::ref(callback), std::move(policy));
     start(&scheduler);
@@ -349,27 +366,34 @@ TEST_F(RemoteCommandRetrySchedulerTest, SchedulerInvokesCallbackOnNonRetryableEr
     ResponseStatus rs(ErrorCodes::OperationFailed, "injected error", Milliseconds(0));
     processNetworkResponse(rs);
     checkCompletionStatus(&scheduler, callback, rs);
+
+    // Scheduler cannot be restarted once it has run to completion.
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, scheduler.startup());
 }
 
 TEST_F(RemoteCommandRetrySchedulerTest, SchedulerInvokesCallbackOnFirstSuccessfulResponse) {
     CallbackResponseSaver callback;
     auto policy = RemoteCommandRetryScheduler::makeRetryPolicy(
-        10U, Milliseconds(1), {ErrorCodes::HostNotFound});
+        10U, Milliseconds(1), {ErrorCodes::HostUnreachable});
     RemoteCommandRetryScheduler scheduler(
         &getExecutor(), request, stdx::ref(callback), std::move(policy));
     start(&scheduler);
 
     // Elapsed time in response is ignored on successful responses.
-    ResponseStatus response(BSON("ok" << 1 << "x" << 123), BSON("z" << 456), Milliseconds(100));
+    ResponseStatus response(BSON("ok" << 1 << "x" << 123 << "z" << 456), Milliseconds(100));
 
     processNetworkResponse(response);
     checkCompletionStatus(&scheduler, callback, response);
+
+    // Scheduler cannot be restarted once it has run to completion.
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, scheduler.startup());
+    ASSERT_FALSE(scheduler.isActive());
 }
 
 TEST_F(RemoteCommandRetrySchedulerTest, SchedulerIgnoresEmbeddedErrorInSuccessfulResponse) {
     CallbackResponseSaver callback;
     auto policy = RemoteCommandRetryScheduler::makeRetryPolicy(
-        10U, Milliseconds(1), {ErrorCodes::HostNotFound});
+        10U, Milliseconds(1), {ErrorCodes::HostUnreachable});
     RemoteCommandRetryScheduler scheduler(
         &getExecutor(), request, stdx::ref(callback), std::move(policy));
     start(&scheduler);
@@ -378,8 +402,9 @@ TEST_F(RemoteCommandRetrySchedulerTest, SchedulerIgnoresEmbeddedErrorInSuccessfu
     // This is the case with some commands (e.g. find) which do not always return errors using the
     // wire protocol.
     ResponseStatus response(BSON("ok" << 0 << "code" << int(ErrorCodes::FailedToParse) << "errmsg"
-                                      << "injected error"),
-                            BSON("z" << 456),
+                                      << "injected error"
+                                      << "z"
+                                      << 456),
                             Milliseconds(100));
 
     processNetworkResponse(response);
@@ -436,9 +461,99 @@ TEST_F(RemoteCommandRetrySchedulerTest, SchedulerShouldRetryUntilSuccessfulRespo
 
     processNetworkResponse({ErrorCodes::HostNotFound, "first", Milliseconds(0)});
 
-    ResponseStatus response(BSON("ok" << 1 << "x" << 123), BSON("z" << 456), Milliseconds(100));
+    ResponseStatus response(BSON("ok" << 1 << "x" << 123 << "z" << 456), Milliseconds(100));
     processNetworkResponse(response);
     checkCompletionStatus(&scheduler, callback, response);
+}
+
+/**
+ * Retry policy that shuts down the scheduler whenever it is consulted by the scheduler.
+ * Results from getMaximumAttempts() and shouldRetryOnError() must cause the scheduler
+ * to resend the request.
+ */
+class ShutdownSchedulerRetryPolicy : public RemoteCommandRetryScheduler::RetryPolicy {
+public:
+    std::size_t getMaximumAttempts() const override {
+        if (scheduler) {
+            scheduler->shutdown();
+        }
+        return 2U;
+    }
+    Milliseconds getMaximumResponseElapsedTotal() const override {
+        return executor::RemoteCommandRequest::kNoTimeout;
+    }
+    bool shouldRetryOnError(ErrorCodes::Error) const override {
+        if (scheduler) {
+            scheduler->shutdown();
+        }
+        return true;
+    }
+    std::string toString() const override {
+        return "";
+    }
+
+    // This must be set before starting the scheduler.
+    RemoteCommandRetryScheduler* scheduler = nullptr;
+};
+
+TEST_F(RemoteCommandRetrySchedulerTest,
+       SchedulerReturnsCallbackCanceledIfShutdownBeforeSendingRetryCommand) {
+    CallbackResponseSaver callback;
+    auto policy = stdx::make_unique<ShutdownSchedulerRetryPolicy>();
+    auto policyPtr = policy.get();
+    TaskExecutorWithFailureInScheduleRemoteCommand badExecutor(&getExecutor());
+    RemoteCommandRetryScheduler scheduler(
+        &badExecutor, request, stdx::ref(callback), std::move(policy));
+    policyPtr->scheduler = &scheduler;
+    start(&scheduler);
+
+    processNetworkResponse({ErrorCodes::HostNotFound, "first", Milliseconds(0)});
+
+    checkCompletionStatus(&scheduler,
+                          callback,
+                          {ErrorCodes::CallbackCanceled,
+                           "scheduler was shut down before retrying command",
+                           Milliseconds(0)});
+}
+
+bool sharedCallbackStateDestroyed = false;
+class SharedCallbackState {
+    MONGO_DISALLOW_COPYING(SharedCallbackState);
+
+public:
+    SharedCallbackState() {}
+    ~SharedCallbackState() {
+        sharedCallbackStateDestroyed = true;
+    }
+};
+
+TEST_F(RemoteCommandRetrySchedulerTest,
+       SchedulerResetsOnCompletionCallbackFunctionAfterCompletion) {
+    sharedCallbackStateDestroyed = false;
+    auto sharedCallbackData = std::make_shared<SharedCallbackState>();
+
+    Status result = getDetectableErrorStatus();
+    auto policy = RemoteCommandRetryScheduler::makeNoRetryPolicy();
+
+    RemoteCommandRetryScheduler scheduler(
+        &getExecutor(),
+        request,
+        [&result,
+         sharedCallbackData](const executor::TaskExecutor::RemoteCommandCallbackArgs& rcba) {
+            unittest::log() << "setting result to " << rcba.response.status;
+            result = rcba.response.status;
+        },
+        std::move(policy));
+    start(&scheduler);
+
+    sharedCallbackData.reset();
+    ASSERT_FALSE(sharedCallbackStateDestroyed);
+
+    processNetworkResponse({ErrorCodes::OperationFailed, "command failed", Milliseconds(0)});
+
+    scheduler.join();
+    ASSERT_EQUALS(ErrorCodes::OperationFailed, result);
+    ASSERT_TRUE(sharedCallbackStateDestroyed);
 }
 
 }  // namespace

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2010-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,6 +31,8 @@
 #pragma once
 
 #include "mongo/db/repl/optime.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -37,11 +41,9 @@ namespace mongo {
 
 class BalancerConfiguration;
 class CatalogCache;
-class ShardingCatalogClient;
 class ClusterCursorManager;
 class OperationContext;
 class ServiceContext;
-class ShardRegistry;
 
 namespace executor {
 struct ConnectionPoolStats;
@@ -82,6 +84,18 @@ public:
               executor::NetworkInterface* network);
 
     /**
+     * Used to check if sharding is initialized for usage of global sharding services. Protected by
+     * an atomic access guard.
+     */
+    bool isShardingInitialized() const;
+
+    /**
+     * Used to indicate the sharding initialization process is complete. Should only be called once
+     * in the lifetime of a server. Protected by an atomic access guard.
+     */
+    void setShardingInitialized();
+
+    /**
      * If the instance as which this sharding component is running (config/shard/mongos) uses
      * additional connection pools other than the default, this function will be present and can be
      * used to obtain statistics about them. Otherwise, the value will be unset.
@@ -107,6 +121,10 @@ public:
         return _catalogClient.get();
     }
 
+    /**
+     * Can return nullptr. For example, if this is a mongod that is not a shard server. This is
+     * always present on mongos after startup.
+     */
     CatalogCache* catalogCache() const {
         return _catalogCache.get();
     }
@@ -173,6 +191,8 @@ private:
 
     CustomConnectionPoolStatsFn _customConnectionPoolStatsFn;
 
+    AtomicBool _shardingInitialized{false};
+
     // Protects _configOpTime.
     mutable stdx::mutex _mutex;
 
@@ -185,9 +205,5 @@ private:
     // Can 'localhost' be used in shard addresses?
     bool _allowLocalShard{true};
 };
-
-// Reference to the global Grid instance. Do not use in new code. Use one of the Grid::get methods
-// instead.
-extern Grid grid;
 
 }  // namespace mongo

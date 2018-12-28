@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -37,7 +37,6 @@ static char home[1024];			/* Program working dir */
  * These two names for the URI and file system must be maintained in tandem.
  */
 static const char * const uri = "table:main";
-static const char * const fs_main = "main.wt";
 static bool compat;
 static bool inmem;
 
@@ -56,6 +55,8 @@ static bool inmem;
 #define	ENV_CONFIG_REC "log=(recover=on)"
 #define	MAX_VAL	4096
 
+static void handler(int)
+    WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 static void usage(void)
     WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 static void
@@ -80,8 +81,8 @@ thread_run(void *arg)
 	WT_RAND_STATE rnd;
 	WT_SESSION *session;
 	WT_THREAD_DATA *td;
-	uint64_t i;
 	size_t lsize;
+	uint64_t i;
 	char buf[MAX_VAL], kname[64], lgbuf[8];
 	char large[128*1024];
 
@@ -123,6 +124,8 @@ thread_run(void *arg)
 	/*
 	 * Write our portion of the key space until we're killed.
 	 */
+	printf("Thread %" PRIu32 " starts at %" PRIu64 "\n",
+	    td->id, td->start);
 	for (i = td->start; ; ++i) {
 		testutil_check(__wt_snprintf(
 		    kname, sizeof(kname), "%" PRIu64, i));
@@ -185,7 +188,7 @@ fill_db(uint32_t nth)
 	printf("Create %" PRIu32 " writer threads\n", nth);
 	for (i = 0; i < nth; ++i) {
 		td[i].conn = conn;
-		td[i].start = (UINT64_MAX / nth) * i;
+		td[i].start = WT_BILLION * (uint64_t)i;
 		td[i].id = i;
 		testutil_check(__wt_thread_create(
 		    NULL, &thr[i], thread_run, &td[i]));
@@ -197,7 +200,7 @@ fill_db(uint32_t nth)
 	 * it is killed.
 	 */
 	for (i = 0; i < nth; ++i)
-		testutil_check(__wt_thread_join(NULL, thr[i]));
+		testutil_check(__wt_thread_join(NULL, &thr[i]));
 	/*
 	 * NOTREACHED
 	 */
@@ -209,9 +212,24 @@ fill_db(uint32_t nth)
 extern int __wt_optind;
 extern char *__wt_optarg;
 
+static void
+handler(int sig)
+{
+	pid_t pid;
+
+	WT_UNUSED(sig);
+	pid = wait(NULL);
+	/*
+	 * The core file will indicate why the child exited. Choose EINVAL here.
+	 */
+	testutil_die(EINVAL,
+	    "Child process %" PRIu64 " abnormally exited", (uint64_t)pid);
+}
+
 int
 main(int argc, char *argv[])
 {
+	struct sigaction sa;
 	struct stat sb;
 	FILE *fp;
 	WT_CONNECTION *conn;
@@ -222,8 +240,8 @@ main(int argc, char *argv[])
 	uint64_t absent, count, key, last_key, middle;
 	uint32_t i, nth, timeout;
 	int ch, status, ret;
-	const char *working_dir;
 	char buf[1024], fname[64], kname[64];
+	const char *working_dir;
 	bool fatal, rand_th, rand_time, verify_only;
 
 	(void)testutil_set_progname(argv);
@@ -261,7 +279,6 @@ main(int argc, char *argv[])
 			usage();
 		}
 	argc -= __wt_optind;
-	argv += __wt_optind;
 	if (argc != 0)
 		usage();
 
@@ -293,11 +310,19 @@ main(int argc, char *argv[])
 		    compat ? "true" : "false", inmem ? "true" : "false");
 		printf("Parent: Create %" PRIu32
 		    " threads; sleep %" PRIu32 " seconds\n", nth, timeout);
+		printf("CONFIG: %s%s%s -h %s -T %" PRIu32 " -t %" PRIu32 "\n",
+		    progname,
+		    compat ? " -C" : "",
+		    inmem ? " -m" : "",
+		    working_dir, nth, timeout);
 		/*
 		 * Fork a child to insert as many items.  We will then randomly
 		 * kill the child, run recovery and make sure all items we wrote
 		 * exist after recovery runs.
 		 */
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = handler;
+		testutil_checksys(sigaction(SIGCHLD, &sa, NULL));
 		if ((pid = fork()) < 0)
 			testutil_die(errno, "fork");
 
@@ -310,16 +335,25 @@ main(int argc, char *argv[])
 		/*
 		 * Sleep for the configured amount of time before killing
 		 * the child.  Start the timeout from the time we notice that
-		 * the table has been created.  That allows the test to run
-		 * correctly on really slow machines.  Verify the process ID
-		 * still exists in case the child aborts for some reason we
-		 * don't stay in this loop forever.
+		 * the child workers have created their record files. That
+		 * allows the test to run correctly on really slow machines.
 		 */
-		testutil_check(__wt_snprintf(
-		    buf, sizeof(buf), "%s/%s", home, fs_main));
-		while (stat(buf, &sb) != 0 && kill(pid, 0) == 0)
-			sleep(1);
+		i = 0;
+		while (i < nth) {
+			/*
+			 * Wait for each record file to exist.
+			 */
+			testutil_check(__wt_snprintf(
+			    fname, sizeof(fname), RECORDS_FILE, i));
+			testutil_check(__wt_snprintf(
+			    buf, sizeof(buf),"%s/%s", home, fname));
+			while (stat(buf, &sb) != 0)
+				testutil_sleep_wait(1, pid);
+			++i;
+		}
 		sleep(timeout);
+		sa.sa_handler = SIG_DFL;
+		testutil_checksys(sigaction(SIGCHLD, &sa, NULL));
 
 		/*
 		 * !!! It should be plenty long enough to make sure more than
@@ -369,9 +403,13 @@ main(int argc, char *argv[])
 		 */
 		for (last_key = UINT64_MAX;; ++count, last_key = key) {
 			ret = fscanf(fp, "%" SCNu64 "\n", &key);
-			if (ret != EOF && ret != 1)
-				testutil_die(errno, "fscanf");
-			if (ret == EOF)
+			/*
+			 * Consider anything other than clear success in
+			 * getting the key to be EOF. We've seen file system
+			 * issues where the file ends with zeroes on a 4K
+			 * boundary and does not return EOF but a ret of zero.
+			 */
+			if (ret != 1)
 				break;
 			/*
 			 * If we're unlucky, the last line may be a partially

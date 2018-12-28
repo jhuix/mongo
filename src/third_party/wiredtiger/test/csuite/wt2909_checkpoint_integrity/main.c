@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -27,7 +27,6 @@
  */
 #include "test_util.h"
 
-#include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 
@@ -238,7 +237,7 @@ create_big_string(char **bigp)
 static void
 cursor_count_items(WT_CURSOR *cursor, uint64_t *countp)
 {
-	int ret;
+	WT_DECL_RET;
 
 	*countp = 0;
 
@@ -380,7 +379,7 @@ run_check_subtest_range(TEST_OPTS *opts, const char *debugger, bool close_test)
 	low = 0;
 	high = MAX_OP_RANGE;
 	mid = (low + high) / 2;
-	while (mid != low) {
+	while (low < mid - 5 || high > mid + 5) {
 		run_check_subtest(opts, debugger, mid, close_test,
 		    &nresults);
 		if (nresults > cutoff)
@@ -402,8 +401,9 @@ run_check_subtest_range(TEST_OPTS *opts, const char *debugger, bool close_test)
 
 	got_failure = false;
 	got_success = false;
-	for (nops = mid - 10; nops < mid + 10; nops++) {
-		for (i = 0; i < TESTS_PER_OP_VALUE; i++) {
+	for (i = 0;
+	    i < TESTS_PER_OP_VALUE && (!got_failure || !got_success); i++)
+		for (nops = mid - 10; nops < mid + 10; nops++) {
 			run_check_subtest(opts, debugger, nops,
 			    close_test, &nresults);
 			if (nresults > cutoff)
@@ -411,7 +411,7 @@ run_check_subtest_range(TEST_OPTS *opts, const char *debugger, bool close_test)
 			else
 				got_success = true;
 		}
-	}
+
 	/*
 	 * Check that it really ran with a crossover point.
 	 */
@@ -446,9 +446,9 @@ run_process(TEST_OPTS *opts, const char *prog, char *argv[], int *status)
 }
 
 /*
-* subtest_error_handler --
-*     Error event handler.
-*/
+ * subtest_error_handler --
+ *     Error event handler.
+ */
 static int
 subtest_error_handler(WT_EVENT_HANDLER *handler,
     WT_SESSION *session, int error, const char *message)
@@ -477,10 +477,10 @@ static WT_EVENT_HANDLER event_handler = {
 static void
 subtest_main(int argc, char *argv[], bool close_test)
 {
+	struct rlimit rlim;
 	TEST_OPTS *opts, _opts;
 	WT_SESSION *session;
 	char config[1024], filename[1024];
-	struct rlimit rlim;
 
 	opts = &_opts;
 	memset(opts, 0, sizeof(*opts));
@@ -535,7 +535,7 @@ subtest_main(int argc, char *argv[], bool close_test)
  * aware of when a failure may be expected due to the effects of the fail_fs.
  * This macro is used only in subtest_populate(), it uses local variables.
  */
-#define	CHECK(expr) {							\
+#define	CHECK(expr, failmode) {						\
 	int _ret;							\
 	_ret = expr;							\
 	if (_ret != 0) {						\
@@ -563,35 +563,35 @@ subtest_populate(TEST_OPTS *opts, bool close_test)
 	uint32_t rndint;
 	int key, v0, v1, v2;
 	char *big, *bigref;
-	bool failed, failmode;
+	bool failed;
 
-	failmode = failed = false;
+	failed = false;
 	__wt_random_init_seed(NULL, &rnd);
-	CHECK(create_big_string(&bigref));
+	CHECK(create_big_string(&bigref), false);
 	nrecords = opts->nrecords;
 
 	CHECK(opts->conn->open_session(
-	    opts->conn, NULL, NULL, &session));
+	    opts->conn, NULL, NULL, &session), false);
 
 	CHECK(session->open_cursor(session, "table:subtest", NULL,
-	    NULL, &maincur));
+	    NULL, &maincur), false);
 
 	CHECK(session->open_cursor(session, "table:subtest2", NULL,
-	    NULL, &maincur2));
+	    NULL, &maincur2), false);
 
 	for (i = 0; i < nrecords && !failed; i++) {
 		rndint = __wt_random(&rnd);
 		generate_key(i, &key);
 		generate_value(rndint, i, bigref, &v0, &v1, &v2, &big);
-		CHECK(session->begin_transaction(session, NULL));
+		CHECK(session->begin_transaction(session, NULL), false);
 		maincur->set_key(maincur, key);
 		maincur->set_value(maincur, v0, v1, v2, big);
-		CHECK(maincur->insert(maincur));
+		CHECK(maincur->insert(maincur), false);
 
 		maincur2->set_key(maincur2, key);
 		maincur2->set_value(maincur2, rndint);
-		CHECK(maincur2->insert(maincur2));
-		CHECK(session->commit_transaction(session, NULL));
+		CHECK(maincur2->insert(maincur2), false);
+		CHECK(session->commit_transaction(session, NULL), false);
 
 		if (i == 0)
 			/*
@@ -599,7 +599,7 @@ subtest_populate(TEST_OPTS *opts, bool close_test)
 			 * distinguish a clear failure from just not running
 			 * long enough.
 			 */
-			CHECK(session->checkpoint(session, NULL));
+			CHECK(session->checkpoint(session, NULL), false);
 
 		if ((i + 1) % VERBOSE_PRINT == 0 && opts->verbose)
 			printf("  %" PRIu64 "/%" PRIu64 "\n",
@@ -607,9 +607,8 @@ subtest_populate(TEST_OPTS *opts, bool close_test)
 		/* Attempt to isolate the failures to checkpointing. */
 		if (i == (nrecords/100)) {
 			enable_failures(opts->nops, 1000000);
-			failmode = true;  /* CHECK should expect failures. */
-			CHECK(session->checkpoint(session, NULL));
-			failmode = false;
+			/* CHECK should expect failures. */
+			CHECK(session->checkpoint(session, NULL), true);
 			disable_failures();
 			if (failed && opts->verbose)
 				printf("checkpoint failed (expected).\n");
@@ -631,9 +630,9 @@ subtest_populate(TEST_OPTS *opts, bool close_test)
 	}
 
 	free(bigref);
-	CHECK(maincur->close(maincur));
-	CHECK(maincur2->close(maincur2));
-	CHECK(session->close(session, NULL));
+	CHECK(maincur->close(maincur), false);
+	CHECK(maincur2->close(maincur2), false);
+	CHECK(session->close(session, NULL), false);
 }
 
 /*
@@ -648,10 +647,6 @@ main(int argc, char *argv[])
 	TEST_OPTS *opts, _opts;
 	uint64_t nresults;
 	const char *debugger;
-
-	/* Ignore unless requested */
-	if (!testutil_is_flag_set("TESTUTIL_ENABLE_LONG_TESTS"))
-		return (EXIT_SUCCESS);
 
 	opts = &_opts;
 	memset(opts, 0, sizeof(*opts));

@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -588,55 +588,47 @@ WT_THREAD_RET
 timestamp(void *arg)
 {
 	WT_CONNECTION *conn;
+	WT_DECL_RET;
 	WT_SESSION *session;
-	TINFO **tinfo_list, *tinfo;
-	time_t last, now;
-	uint64_t oldest_timestamp, usecs;
-	uint32_t i;
-	char config_buf[64];
+	char buf[64];
+	bool done;
 
-	tinfo_list = arg;
-
+	(void)(arg);
 	conn = g.wts_conn;
+
 	testutil_check(conn->open_session(conn, NULL, NULL, &session));
 
-	__wt_seconds((WT_SESSION_IMPL *)session, &last);
+	testutil_check(
+	    __wt_snprintf(buf, sizeof(buf), "%s", "oldest_timestamp="));
 
-	/*
-	 * Update the oldest timestamp every 100 transactions, but at least
-	 * once every 15 seconds.
-	 */
-	while (!g.workers_finished) {
-		/* Find the lowest committed timestamp. */
-		oldest_timestamp = UINT64_MAX;
-		for (i = 0; i < g.c_threads; ++i) {
-			tinfo = tinfo_list[i];
-			if (tinfo->timestamp != 0 &&
-			    tinfo->timestamp < oldest_timestamp)
-				oldest_timestamp = tinfo->timestamp;
-		}
+	/* Update the oldest timestamp at least once every 15 seconds. */
+	done = false;
+	do {
+		/*
+		 * Do a final bump of the oldest timestamp as part of shutting
+		 * down the worker threads, otherwise recent operations can
+		 * prevent verify from running.
+		 */
+		if (g.workers_finished)
+			done = true;
+		else
+			random_sleep(&g.rnd, 15);
 
 		/*
-		 * Don't get more than 100 transactions or more than 15 seconds
-		 * out of date.
+		 * Lock out transaction timestamp operations. The lock acts as a
+		 * barrier ensuring we've checked if the workers have finished,
+		 * we don't want that line reordered.
 		 */
-		if (oldest_timestamp >= g.timestamp ||
-		    g.timestamp - oldest_timestamp < 100) {
-			__wt_seconds((WT_SESSION_IMPL *)session, &now);
-			if (g.timestamp == 0 || difftime(now, last) < 15) {
-				__wt_sleep(1, 0);
-				continue;
-			}
-		}
+		testutil_check(pthread_rwlock_wrlock(&g.ts_lock));
 
-		testutil_check(__wt_snprintf(
-		    config_buf, sizeof(config_buf),
-		    "oldest_timestamp=%" PRIx64, oldest_timestamp));
-		testutil_check(conn->set_timestamp(conn, config_buf));
+		ret = conn->query_timestamp(conn,
+		    buf + strlen("oldest_timestamp="), "get=all_committed");
+		testutil_assert(ret == 0 || ret == WT_NOTFOUND);
+		if (ret == 0)
+			testutil_check(conn->set_timestamp(conn, buf));
 
-		usecs = mmrand(NULL, 5, 40);
-		__wt_sleep(0, usecs);
-	}
+		testutil_check(pthread_rwlock_unlock(&g.ts_lock));
+	} while (!done);
 
 	testutil_check(session->close(session, NULL));
 	return (WT_THREAD_RET_VALUE);

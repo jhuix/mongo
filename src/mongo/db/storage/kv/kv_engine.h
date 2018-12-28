@@ -1,25 +1,27 @@
 // kv_engine.h
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,10 +38,10 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/db/storage/snapshot_name.h"
 
 namespace mongo {
 
@@ -57,8 +59,13 @@ public:
     // ---------
 
     /**
-     * Having multiple out for the same ns is a rules violation; Calling on a non-created ident is
-     * invalid and may crash.
+     * Requesting multiple copies for the same ns/ident is a rules violation; Calling on a
+     * non-created ident is invalid and may crash.
+     *
+     * Trying to access this record store in the future will retreive the pointer from the
+     * collection object, and therefore this function can only be called once per namespace.
+     *
+     * @param ident Will be created if it does not already exist.
      */
     virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
                                                         StringData ns,
@@ -115,6 +122,9 @@ public:
                                      StringData ident,
                                      const CollectionOptions& options) = 0;
 
+    virtual std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                  StringData ident) = 0;
+
     /**
      * Create a RecordStore that MongoDB considers eligible to share space in an underlying table
      * with other RecordStores. 'prefix' is guaranteed to be 'KVPrefix::kNotPrefixed' when
@@ -159,9 +169,39 @@ public:
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) = 0;
 
+    /**
+     * Repair an ident. Returns Status::OK if repair did not modify data. Returns a non-fatal status
+     * of DataModifiedByRepair if a repair operation succeeded, but may have modified data.
+     */
     virtual Status repairIdent(OperationContext* opCtx, StringData ident) = 0;
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident) = 0;
+
+    /**
+     * Attempts to locate and recover a file that is "orphaned" from the storage engine's metadata,
+     * but may still exist on disk if this is a durable storage engine. Returns DataModifiedByRepair
+     * if a new record store was successfully created and Status::OK() if no data was modified.
+     *
+     * This may return an error if the storage engine attempted to recover the file and failed.
+     *
+     * This recovery process makes no guarantees about the integrity of data recovered or even that
+     * it still exists when recovered.
+     */
+    virtual Status recoverOrphanedIdent(OperationContext* opCtx,
+                                        StringData ns,
+                                        StringData ident,
+                                        const CollectionOptions& options) {
+        auto status = createRecordStore(opCtx, ns, ident, options);
+        if (status.isOK()) {
+            return {ErrorCodes::DataModifiedByRepair, "Orphan recovery created a new record store"};
+        }
+        return status;
+    }
+
+
+    virtual void alterIdentMetadata(OperationContext* opCtx,
+                                    StringData ident,
+                                    const IndexDescriptor* desc){};
 
     // optional
     virtual int flushAllFiles(OperationContext* opCtx, bool sync) {
@@ -183,6 +223,20 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support backup mode");
+    }
+
+    virtual void endNonBlockingBackup(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual StatusWith<std::vector<std::string>> extendBackupCursor(OperationContext* opCtx) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support backup mode");
+    }
+
     virtual bool isDurable() const = 0;
 
     /**
@@ -200,6 +254,13 @@ public:
      * This must not change over the lifetime of the engine.
      */
     virtual bool supportsDBLocking() const {
+        return true;
+    }
+
+    /**
+     * This must not change over the lifetime of the engine.
+     */
+    virtual bool supportsCappedCollections() const {
         return true;
     }
 
@@ -249,12 +310,36 @@ public:
     /**
      * See `StorageEngine::setStableTimestamp`
      */
-    virtual void setStableTimestamp(SnapshotName stableTimestamp) {}
+    virtual void setStableTimestamp(Timestamp stableTimestamp,
+                                    boost::optional<Timestamp> maximumTruncationTimestamp,
+                                    bool force) {}
 
     /**
      * See `StorageEngine::setInitialDataTimestamp`
      */
-    virtual void setInitialDataTimestamp(SnapshotName initialDataTimestamp) {}
+    virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) {}
+
+    /**
+     * See `StorageEngine::setOldestTimestampFromStable`
+     */
+    virtual void setOldestTimestampFromStable() {}
+
+    /**
+     * See `StorageEngine::setOldestTimestamp`
+     */
+    virtual void setOldestTimestamp(Timestamp newOldestTimestamp, bool force) {}
+
+    /**
+     * See `StorageEngine::isCacheUnderPressure()`
+     */
+    virtual bool isCacheUnderPressure(OperationContext* opCtx) const {
+        return false;
+    }
+
+    /**
+     * See 'StorageEngine::setCachePressureForTest()'
+     */
+    virtual void setCachePressureForTest(int pressure) {}
 
     /**
      * See `StorageEngine::supportsRecoverToStableTimestamp`
@@ -264,9 +349,73 @@ public:
     }
 
     /**
+     * See `StorageEngine::supportsRecoveryTimestamp`
+     */
+    virtual bool supportsRecoveryTimestamp() const {
+        return false;
+    }
+
+    /**
+     * See `StorageEngine::recoverToStableTimestamp`
+     */
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) {
+        fassertFailed(50664);
+    }
+
+    /**
+     * See `StorageEngine::getRecoveryTimestamp`
+     */
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * See `StorageEngine::getLastStableRecoveryTimestamp`
+     */
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * See `StorageEngine::getAllCommittedTimestamp`
+     */
+    virtual Timestamp getAllCommittedTimestamp() const = 0;
+
+    /**
+     * See `StorageEngine::getOldestOpenReadTimestamp`
+     */
+    virtual Timestamp getOldestOpenReadTimestamp() const = 0;
+
+    /**
+     * See `StorageEngine::supportsReadConcernSnapshot`
+     */
+    virtual bool supportsReadConcernSnapshot() const {
+        return false;
+    }
+
+    virtual bool supportsReadConcernMajority() const {
+        return false;
+    }
+
+    /**
      * See `StorageEngine::replicationBatchIsComplete()`
      */
     virtual void replicationBatchIsComplete() const {};
+
+    /**
+     * Methods to access the storage engine's timestamps.
+     */
+    virtual Timestamp getCheckpointTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual Timestamp getOldestTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual Timestamp getStableTimestamp() const {
+        MONGO_UNREACHABLE;
+    }
 
     /**
      * The destructor will never be called from mongod, but may be called from tests.
@@ -274,5 +423,11 @@ public:
      * cleanShutdown() hasn't been called.
      */
     virtual ~KVEngine() {}
+
+protected:
+    /**
+     * The default capped size (in bytes) for capped collections, unless overridden.
+     */
+    const int64_t kDefaultCappedSizeBytes = 4096;
 };
 }

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,11 +37,19 @@
 #include "mongo/bson/util/bson_check.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/mongod_options.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
+/**
+ * Dont run any sharding validations. Can not be combined with --configsvr or shardvr. Intended to
+ * allow restarting config server or shard as an independent replica set.
+ */
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(skipShardingConfigurationChecks, bool, false);
+
 namespace repl {
 
 const size_t ReplSetConfig::kMaxMembers;
@@ -57,6 +67,7 @@ const Milliseconds ReplSetConfig::kDefaultElectionTimeoutPeriod(10000);
 const Milliseconds ReplSetConfig::kDefaultCatchUpTimeoutPeriod(kInfiniteCatchUpTimeout);
 const bool ReplSetConfig::kDefaultChainingAllowed(true);
 const Milliseconds ReplSetConfig::kDefaultCatchUpTakeoverDelay(30000);
+const std::string ReplSetConfig::kRepairedFieldName = "repaired";
 
 namespace {
 
@@ -88,22 +99,22 @@ const std::string kCatchUpTakeoverDelayFieldName = "catchUpTakeoverDelayMillis";
 
 }  // namespace
 
-Status ReplSetConfig::initialize(const BSONObj& cfg,
-                                 bool usePV1ByDefault,
-                                 OID defaultReplicaSetId) {
-    return _initialize(cfg, false, usePV1ByDefault, defaultReplicaSetId);
+Status ReplSetConfig::initialize(const BSONObj& cfg, OID defaultReplicaSetId) {
+    return _initialize(cfg, false, defaultReplicaSetId);
 }
 
-Status ReplSetConfig::initializeForInitiate(const BSONObj& cfg, bool usePV1ByDefault) {
-    return _initialize(cfg, true, usePV1ByDefault, OID());
+Status ReplSetConfig::initializeForInitiate(const BSONObj& cfg) {
+    return _initialize(cfg, true, OID());
 }
 
-Status ReplSetConfig::_initialize(const BSONObj& cfg,
-                                  bool forInitiate,
-                                  bool usePV1ByDefault,
-                                  OID defaultReplicaSetId) {
+Status ReplSetConfig::_initialize(const BSONObj& cfg, bool forInitiate, OID defaultReplicaSetId) {
     _isInitialized = false;
     _members.clear();
+
+    if (cfg.hasField(kRepairedFieldName)) {
+        return {ErrorCodes::RepairedReplicaSetNode, "Replicated data has been repaired"};
+    }
+
     Status status =
         bsonCheckOnlyHasFields("replica set configuration", cfg, kLegalConfigTopFieldNames);
     if (!status.isOK())
@@ -131,8 +142,7 @@ Status ReplSetConfig::_initialize(const BSONObj& cfg,
     if (!status.isOK())
         return status;
 
-    for (BSONObj::iterator membersIterator(membersElement.Obj()); membersIterator.more();) {
-        BSONElement memberElement = membersIterator.next();
+    for (auto&& memberElement : membersElement.Obj()) {
         if (memberElement.type() != Object) {
             return Status(ErrorCodes::TypeMismatch,
                           str::stream() << "Expected type of " << kMembersFieldName << "."
@@ -164,14 +174,9 @@ Status ReplSetConfig::_initialize(const BSONObj& cfg,
     // Parse protocol version
     //
     status = bsonExtractIntegerField(cfg, kProtocolVersionFieldName, &_protocolVersion);
-    if (!status.isOK()) {
-        if (status != ErrorCodes::NoSuchKey) {
-            return status;
-        }
-
-        if (usePV1ByDefault) {
-            _protocolVersion = 1;
-        }
+    // If 'protocolVersion' field is missing for initiate, then _protocolVersion defaults to 1.
+    if (!(status.isOK() || (status == ErrorCodes::NoSuchKey && forInitiate))) {
+        return status;
     }
 
     //
@@ -179,7 +184,7 @@ Status ReplSetConfig::_initialize(const BSONObj& cfg,
     //
     status = bsonExtractBooleanFieldWithDefault(cfg,
                                                 kWriteConcernMajorityJournalDefaultFieldName,
-                                                _protocolVersion == 1,
+                                                true,
                                                 &_writeConcernMajorityJournalDefault);
     if (!status.isOK())
         return status;
@@ -242,8 +247,8 @@ Status ReplSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
     //
     // Parse electionTimeoutMillis
     //
-    auto greaterThanZero = stdx::bind(std::greater<long long>(), stdx::placeholders::_1, 0);
     long long electionTimeoutMillis;
+    auto greaterThanZero = [](const auto& x) { return x > 0; };
     auto electionTimeoutStatus = bsonExtractIntegerFieldWithDefaultIf(
         settings,
         kElectionTimeoutFieldName,
@@ -345,11 +350,10 @@ Status ReplSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
         return status;
     }
 
-    for (BSONObj::iterator gleModeIter(gleModes); gleModeIter.more();) {
-        const BSONElement modeElement = gleModeIter.next();
+    for (auto&& modeElement : gleModes) {
         if (_customWriteConcernModes.find(modeElement.fieldNameStringData()) !=
             _customWriteConcernModes.end()) {
-            return Status(ErrorCodes::DuplicateKey,
+            return Status(ErrorCodes::Error(51001),
                           str::stream() << kSettingsFieldName << '.' << kGetLastErrorModesFieldName
                                         << " contains multiple fields named "
                                         << modeElement.fieldName());
@@ -364,8 +368,7 @@ Status ReplSetConfig::_parseSettingsSubdocument(const BSONObj& settings) {
                                         << typeName(modeElement.type()));
         }
         ReplSetTagPattern pattern = _tagConfig.makePattern();
-        for (BSONObj::iterator constraintIter(modeElement.Obj()); constraintIter.more();) {
-            const BSONElement constraintElement = constraintIter.next();
+        for (auto&& constraintElement : modeElement.Obj()) {
             if (!constraintElement.isNumber()) {
                 return Status(ErrorCodes::TypeMismatch,
                               str::stream() << "Expected " << kSettingsFieldName << '.'
@@ -544,17 +547,23 @@ Status ReplSetConfig::validate() const {
         }
     }
 
-    if (_protocolVersion != 0 && _protocolVersion != 1) {
+
+    if (_protocolVersion == 0) {
+        return Status(
+            ErrorCodes::BadValue,
+            str::stream()
+                << "Support for replication protocol version 0 was removed in MongoDB 4.0. "
+                << "Downgrade to MongoDB version 3.6 and upgrade your protocol "
+                   "version to 1 before upgrading your MongoDB version");
+    }
+    if (_protocolVersion != 1) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << kProtocolVersionFieldName << " field value of "
-                                    << _protocolVersion
-                                    << " is not 1 or 0");
+                      str::stream() << kProtocolVersionFieldName
+                                    << " of 1 is the only supported value. Found: "
+                                    << _protocolVersion);
     }
 
     if (_configServer) {
-        if (_protocolVersion == 0) {
-            return Status(ErrorCodes::BadValue, "Config servers cannot run in protocolVersion 0");
-        }
         if (arbiterCount > 0) {
             return Status(ErrorCodes::BadValue,
                           "Arbiters are not allowed in replica set configurations being used for "
@@ -572,7 +581,8 @@ Status ReplSetConfig::validate() const {
                               "servers cannot have a non-zero slaveDelay");
             }
         }
-        if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
+        if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer &&
+            !skipShardingConfigurationChecks) {
             return Status(ErrorCodes::BadValue,
                           "Nodes being used for config servers must be started with the "
                           "--configsvr flag");
@@ -599,7 +609,8 @@ Status ReplSetConfig::validate() const {
 
 Status ReplSetConfig::checkIfWriteConcernCanBeSatisfied(
     const WriteConcernOptions& writeConcern) const {
-    if (!writeConcern.wMode.empty() && writeConcern.wMode != WriteConcernOptions::kMajority) {
+    if (!writeConcern.wMode.empty() && writeConcern.wMode != WriteConcernOptions::kMajority &&
+        writeConcern.wMode != WriteConcernOptions::kInternalMajorityNoSnapshot) {
         StatusWith<ReplSetTagPattern> tagPatternStatus = findCustomWriteMode(writeConcern.wMode);
         if (!tagPatternStatus.isOK()) {
             return tagPatternStatus.getStatus();
@@ -618,7 +629,7 @@ Status ReplSetConfig::checkIfWriteConcernCanBeSatisfied(
         }
         // Even if all the nodes in the set had a given write it still would not satisfy this
         // write concern mode.
-        return Status(ErrorCodes::CannotSatisfyWriteConcern,
+        return Status(ErrorCodes::UnsatisfiableWriteConcern,
                       str::stream() << "Not enough nodes match write concern mode \""
                                     << writeConcern.wMode
                                     << "\"");
@@ -632,7 +643,7 @@ Status ReplSetConfig::checkIfWriteConcernCanBeSatisfied(
                 }
             }
         }
-        return Status(ErrorCodes::CannotSatisfyWriteConcern, "Not enough data-bearing nodes");
+        return Status(ErrorCodes::UnsatisfiableWriteConcern, "Not enough data-bearing nodes");
     }
 }
 
@@ -706,13 +717,10 @@ StatusWith<ReplSetTagPattern> ReplSetConfig::findCustomWriteMode(StringData patt
 }
 
 void ReplSetConfig::_calculateMajorities() {
-    const int voters = std::count_if(_members.begin(),
-                                     _members.end(),
-                                     stdx::bind(&MemberConfig::isVoter, stdx::placeholders::_1));
+    const int voters =
+        std::count_if(begin(_members), end(_members), [](const auto& x) { return x.isVoter(); });
     const int arbiters =
-        std::count_if(_members.begin(),
-                      _members.end(),
-                      stdx::bind(&MemberConfig::isArbiter, stdx::placeholders::_1));
+        std::count_if(begin(_members), end(_members), [](const auto& x) { return x.isArbiter(); });
     _totalVotingMembers = voters;
     _majorityVoteCount = voters / 2 + 1;
     _writeMajority = std::min(_majorityVoteCount, voters - arbiters);
@@ -773,21 +781,9 @@ BSONObj ReplSetConfig::toBSON() const {
         configBuilder.append(kConfigServerFieldName, _configServer);
     }
 
-    // Only include writeConcernMajorityJournalDefault if it is not the default version for this
-    // ProtocolVersion to prevent breaking cross version-3.2.1 compatibilty of ReplSetConfigs.
-    if (_protocolVersion > 0) {
-        configBuilder.append(kProtocolVersionFieldName, _protocolVersion);
-        // Only include writeConcernMajorityJournalDefault if it is not the default version for this
-        // ProtocolVersion to prevent breaking cross version-3.2.1 compatibilty of
-        // ReplSetConfigs.
-        if (!_writeConcernMajorityJournalDefault) {
-            configBuilder.append(kWriteConcernMajorityJournalDefaultFieldName,
-                                 _writeConcernMajorityJournalDefault);
-        }
-    } else if (_writeConcernMajorityJournalDefault) {
-        configBuilder.append(kWriteConcernMajorityJournalDefaultFieldName,
-                             _writeConcernMajorityJournalDefault);
-    }
+    configBuilder.append(kProtocolVersionFieldName, _protocolVersion);
+    configBuilder.append(kWriteConcernMajorityJournalDefaultFieldName,
+                         _writeConcernMajorityJournalDefault);
 
     BSONArrayBuilder members(configBuilder.subarrayStart(kMembersFieldName));
     for (MemberIterator mem = membersBegin(); mem != membersEnd(); mem++) {
@@ -850,11 +846,11 @@ std::vector<std::string> ReplSetConfig::getWriteConcernNames() const {
 
 Milliseconds ReplSetConfig::getPriorityTakeoverDelay(int memberIdx) const {
     auto member = getMemberAt(memberIdx);
-    int priorityRank = _calculatePriorityRank(member.getPriority());
+    int priorityRank = calculatePriorityRank(member.getPriority());
     return (priorityRank + 1) * getElectionTimeoutPeriod();
 }
 
-int ReplSetConfig::_calculatePriorityRank(double priority) const {
+int ReplSetConfig::calculatePriorityRank(double priority) const {
     int count = 0;
     for (MemberIterator mem = membersBegin(); mem != membersEnd(); mem++) {
         if (mem->getPriority() > priority) {
@@ -862,6 +858,15 @@ int ReplSetConfig::_calculatePriorityRank(double priority) const {
         }
     }
     return count;
+}
+
+bool ReplSetConfig::containsArbiter() const {
+    for (MemberIterator mem = membersBegin(); mem != membersEnd(); mem++) {
+        if (mem->isArbiter()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace repl

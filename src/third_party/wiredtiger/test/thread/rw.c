@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -115,7 +115,7 @@ rw_start(u_int readers, u_int writers)
 
 	/* Wait for the threads. */
 	for (i = 0; i < readers + writers; ++i)
-		testutil_check(__wt_thread_join(NULL, tids[i]));
+		testutil_check(__wt_thread_join(NULL, &tids[i]));
 
 	(void)gettimeofday(&stop, NULL);
 	seconds = (stop.tv_sec - start.tv_sec) +
@@ -191,7 +191,7 @@ reader(void *arg)
 
 	id = (int)(uintptr_t)arg;
 	s = &run_info[id];
-	testutil_check(__wt_thread_id(tid, sizeof(tid)));
+	testutil_check(__wt_thread_str(tid, sizeof(tid)));
 	__wt_random_init(&s->rnd);
 
 	printf(" read thread %2d starting: tid: %s, file: %s\n",
@@ -287,7 +287,7 @@ writer(void *arg)
 
 	id = (int)(uintptr_t)arg;
 	s = &run_info[id];
-	testutil_check(__wt_thread_id(tid, sizeof(tid)));
+	testutil_check(__wt_thread_str(tid, sizeof(tid)));
 	__wt_random_init(&s->rnd);
 
 	printf("write thread %2d starting: tid: %s, file: %s\n",

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2014-2018 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -38,14 +38,11 @@ def timestamp_str(t):
 
 class test_timestamp01(wttest.WiredTigerTestCase, suite_subprocess):
     def test_timestamp_range(self):
-        if not wiredtiger.timestamp_build():
-            self.skipTest('requires a timestamp build')
-
         # Cannot set a timestamp on a non-running transaction
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.timestamp_transaction(
                 'commit_timestamp=' + timestamp_str(1 << 5000)),
-                '/must be running/')
+                '/only permitted in a running/')
 
         # Zero is not permitted
         self.session.begin_transaction()

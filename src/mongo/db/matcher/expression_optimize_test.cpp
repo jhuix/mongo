@@ -1,33 +1,36 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/pipeline/expression.h"
 
+#include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
@@ -133,7 +136,7 @@ TEST(ExpressionOptimizeTest, IsValidText) {
 TEST(ExpressionOptimizeTest, IsValidTextTailable) {
     // Filter inside QueryRequest is not used.
     auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setTailableMode(TailableMode::kTailable);
+    qr->setTailableMode(TailableModeEnum::kTailable);
     ASSERT_OK(qr->validate());
 
     // Invalid: TEXT and tailable.
@@ -279,16 +282,6 @@ TEST(ExpressionOptimizeTest, IsValidGeoNearNaturalHint) {
     ASSERT_NOT_OK(isValid("{a: {$near: {$geometry: {type: 'Point', coordinates: [0, 0]}}}}", *qr));
 }
 
-TEST(ExpressionOptimizeTest, IsValidTextAndSnapshot) {
-    // Filter inside QueryRequest is not used.
-    auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setSnapshot(true);
-    ASSERT_OK(qr->validate());
-
-    // Invalid: TEXT and snapshot.
-    ASSERT_NOT_OK(isValid("{$text: {$search: 's'}}", *qr));
-}
-
 TEST(ExpressionOptimizeTest, IsValidNaturalSortIndexHint) {
     const bool isExplain = false;
     auto qr = assertGet(QueryRequest::makeFromFindCommand(
@@ -339,7 +332,7 @@ TEST(ExpressionOptimizeTest, NormalizeWithInAndRegexPreservesTags) {
 TEST(ExpressionOptimizeTest, NormalizeWithInPreservesCollator) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     BSONObj obj = fromjson("{'': 'string'}");
-    auto inMatchExpression = stdx::make_unique<InMatchExpression>();
+    auto inMatchExpression = stdx::make_unique<InMatchExpression>("");
     inMatchExpression->setCollator(&collator);
     std::vector<BSONElement> equalities{obj.firstElement()};
     ASSERT_OK(inMatchExpression->setEqualities(std::move(equalities)));
@@ -348,6 +341,113 @@ TEST(ExpressionOptimizeTest, NormalizeWithInPreservesCollator) {
     EqualityMatchExpression* eqMatchExpression =
         static_cast<EqualityMatchExpression*>(matchExpression.get());
     ASSERT_EQ(eqMatchExpression->getCollator(), &collator);
+}
+
+TEST(ExpressionOptimizeTest, AndWithAlwaysFalseChildOptimizesToAlwaysFalse) {
+    BSONObj obj = fromjson("{$and: [{a: 1}, {$alwaysFalse: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    BSONObjBuilder bob;
+    optimizedMatchExpression->serialize(&bob);
+    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysFalse: 1}"));
+}
+
+TEST(ExpressionOptimizeTest, AndRemovesAlwaysTrueChildren) {
+    BSONObj obj = fromjson("{$and: [{a: 1}, {$alwaysTrue: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    BSONObjBuilder bob;
+    optimizedMatchExpression->serialize(&bob);
+    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{a: {$eq: 1}}"));
+}
+
+TEST(ExpressionOptimizeTest, AndWithSingleChildAlwaysTrueOptimizesToEmptyAnd) {
+    BSONObj obj = fromjson("{$and: [{$alwaysTrue: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    // TODO SERVER-34759 We want this to optimize to an AlwaysTrueMatchExpression.
+    ASSERT_TRUE(dynamic_cast<AndMatchExpression*>(optimizedMatchExpression.get()));
+    BSONObjBuilder bob;
+    optimizedMatchExpression->serialize(&bob);
+    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{}"));
+}
+
+TEST(ExpressionOptimizeTest, AndWithEachChildAlwaysTrueOptimizesToEmptyAnd) {
+    BSONObj obj = fromjson("{$and: [{$alwaysTrue: 1}, {$alwaysTrue: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    // TODO SERVER-34759 We want this to optimize to an AlwaysTrueMatchExpression.
+    ASSERT_TRUE(dynamic_cast<AndMatchExpression*>(optimizedMatchExpression.get()));
+    BSONObjBuilder bob;
+    optimizedMatchExpression->serialize(&bob);
+    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{}"));
+}
+
+TEST(ExpressionOptimizeTest, NestedAndWithAlwaysFalseOptimizesToAlwaysFalse) {
+    BSONObj obj = fromjson("{$and: [{$and: [{$alwaysFalse: 1}, {a: 1}]}, {b: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    BSONObjBuilder bob;
+    optimizedMatchExpression->serialize(&bob);
+    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysFalse: 1}"));
+}
+
+TEST(ExpressionOptimizeTest, OrWithAlwaysTrueOptimizesToAlwaysTrue) {
+    BSONObj obj = fromjson("{$or: [{a: 1}, {$alwaysTrue: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    BSONObjBuilder bob;
+    optimizedMatchExpression->serialize(&bob);
+    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysTrue: 1}"));
+}
+
+TEST(ExpressionOptimizeTest, OrRemovesAlwaysFalseChildren) {
+    BSONObj obj = fromjson("{$or: [{a: 1}, {$alwaysFalse: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    BSONObjBuilder bob;
+    optimizedMatchExpression->serialize(&bob);
+    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{a: {$eq: 1}}"));
+}
+
+TEST(ExpressionOptimizeTest, OrPromotesSingleAlwaysFalseAfterOptimize) {
+    // The nested predicate is always false. This test is designed to reproduce SERVER-34714.
+    BSONObj obj = fromjson("{$or: [{a: {$all: []}}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_TRUE(dynamic_cast<AlwaysFalseMatchExpression*>(optimizedMatchExpression.get()));
+    BSONObjBuilder bob;
+    optimizedMatchExpression->serialize(&bob);
+    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysFalse: 1}"));
+}
+
+TEST(ExpressionOptimizeTest, OrPromotesSingleAlwaysFalse) {
+    BSONObj obj = fromjson("{$or: [{$alwaysFalse: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_TRUE(dynamic_cast<AlwaysFalseMatchExpression*>(optimizedMatchExpression.get()));
+    BSONObjBuilder bob;
+    optimizedMatchExpression->serialize(&bob);
+    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysFalse: 1}"));
+}
+
+TEST(ExpressionOptimizeTest, OrPromotesMultipleAlwaysFalse) {
+    BSONObj obj = fromjson("{$or: [{$alwaysFalse: 1}, {a: {$all: []}}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_TRUE(dynamic_cast<AlwaysFalseMatchExpression*>(optimizedMatchExpression.get()));
+    BSONObjBuilder bob;
+    optimizedMatchExpression->serialize(&bob);
+    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysFalse: 1}"));
+}
+
+TEST(ExpressionOptimizeTest, NestedOrWithAlwaysTrueOptimizesToAlwaysTrue) {
+    BSONObj obj = fromjson("{$or: [{$or: [{$alwaysTrue: 1}, {a: 1}]}, {b: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    BSONObjBuilder bob;
+    optimizedMatchExpression->serialize(&bob);
+    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysTrue: 1}"));
 }
 
 }  // namespace

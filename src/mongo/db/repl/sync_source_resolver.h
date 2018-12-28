@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -154,7 +156,8 @@ private:
      * Creates fetcher to check the remote oplog for '_requiredOpTime'.
      */
     std::unique_ptr<Fetcher> _makeRequiredOpTimeFetcher(HostAndPort candidate,
-                                                        OpTime earliestOpTimeSeen);
+                                                        OpTime earliestOpTimeSeen,
+                                                        int rbid);
 
     /**
      * Schedules fetcher to read oplog on sync source.
@@ -179,7 +182,7 @@ private:
     /**
      * Schedules a replSetGetRBID command against the candidate to fetch its current rollback id.
      */
-    void _scheduleRBIDRequest(HostAndPort candidate, OpTime earliestOpTimeSeen);
+    Status _scheduleRBIDRequest(HostAndPort candidate, OpTime earliestOpTimeSeen);
     void _rbidRequestCallback(HostAndPort candidate,
                               OpTime earliestOpTimeSeen,
                               const executor::TaskExecutor::RemoteCommandCallbackArgs& rbidReply);
@@ -194,7 +197,8 @@ private:
      */
     void _requiredOpTimeFetcherCallback(const StatusWith<Fetcher::QueryResponse>& queryResult,
                                         HostAndPort candidate,
-                                        OpTime earliestOpTimeSeen);
+                                        OpTime earliestOpTimeSeen,
+                                        int rbid);
 
     /**
      * Obtains new sync source candidate and schedules remote command to fetcher first oplog entry.
@@ -207,7 +211,8 @@ private:
      * Invokes completion callback and transitions state to State::kComplete.
      * Returns result.getStatus().
      */
-    Status _finishCallback(StatusWith<HostAndPort> result);
+    Status _finishCallback(HostAndPort hostAndPort, int rbid);
+    Status _finishCallback(Status status);
     Status _finishCallback(const SyncSourceResolverResponse& response);
 
     // Executor used to send remote commands to sync source candidates.
@@ -228,9 +233,6 @@ private:
     // This is invoked exactly once after startup. The caller gets the results of the sync source
     // resolver via this callback in a SyncSourceResolverResponse struct when the resolver finishes.
     const OnCompletionFn _onCompletion;
-
-    // The rbid we will return to our caller.
-    int _rbid;
 
     // Protects members of this sync source resolver defined below.
     mutable stdx::mutex _mutex;

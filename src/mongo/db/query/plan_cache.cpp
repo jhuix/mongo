@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,22 +34,25 @@
 
 #include "mongo/db/query/plan_cache.h"
 
+#include <boost/iterator/transform_iterator.hpp>
+
 #include <algorithm>
 #include <math.h>
 #include <memory>
 #include <vector>
 
 #include "mongo/base/owned_pointer_vector.h"
-#include "mongo/client/dbclientinterface.h"  // For QueryOption_foobar
+#include "mongo/base/string_data_comparator_interface.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
 namespace mongo {
@@ -56,256 +61,49 @@ namespace {
 // Delimiters for cache key encoding.
 const char kEncodeDiscriminatorsBegin = '<';
 const char kEncodeDiscriminatorsEnd = '>';
-const char kEncodeChildrenBegin = '[';
-const char kEncodeChildrenEnd = ']';
-const char kEncodeChildrenSeparator = ',';
-const char kEncodeSortSection = '~';
-const char kEncodeProjectionSection = '|';
-const char kEncodeCollationSection = '#';
 
-/**
- * Encode user-provided string. Cache key delimiters seen in the
- * user string are escaped with a backslash.
- */
-void encodeUserString(StringData s, StringBuilder* keyBuilder) {
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-        switch (c) {
-            case kEncodeDiscriminatorsBegin:
-            case kEncodeDiscriminatorsEnd:
-            case kEncodeChildrenBegin:
-            case kEncodeChildrenEnd:
-            case kEncodeChildrenSeparator:
-            case kEncodeSortSection:
-            case kEncodeProjectionSection:
-            case kEncodeCollationSection:
-            case '\\':
-                *keyBuilder << '\\';
-            // Fall through to default case.
-            default:
-                *keyBuilder << c;
+void encodeIndexabilityForDiscriminators(const MatchExpression* tree,
+                                         const IndexToDiscriminatorMap& discriminators,
+                                         StringBuilder* keyBuilder) {
+    for (auto&& indexAndDiscriminatorPair : discriminators) {
+        *keyBuilder << indexAndDiscriminatorPair.second.isMatchCompatibleWithIndex(tree);
+    }
+}
+
+void encodeIndexability(const MatchExpression* tree,
+                        const PlanCacheIndexabilityState& indexabilityState,
+                        StringBuilder* keyBuilder) {
+    if (!tree->path().empty()) {
+        const IndexToDiscriminatorMap& discriminators =
+            indexabilityState.getDiscriminators(tree->path());
+        IndexToDiscriminatorMap wildcardDiscriminators =
+            indexabilityState.buildWildcardDiscriminators(tree->path());
+        if (!discriminators.empty() || !wildcardDiscriminators.empty()) {
+            *keyBuilder << kEncodeDiscriminatorsBegin;
+            // For each discriminator on this path, append the character '0' or '1'.
+            encodeIndexabilityForDiscriminators(tree, discriminators, keyBuilder);
+            encodeIndexabilityForDiscriminators(tree, wildcardDiscriminators, keyBuilder);
+
+            *keyBuilder << kEncodeDiscriminatorsEnd;
         }
     }
-}
 
-/**
- * String encoding of MatchExpression::MatchType.
- */
-const char* encodeMatchType(MatchExpression::MatchType mt) {
-    switch (mt) {
-        case MatchExpression::AND:
-            return "an";
-
-        case MatchExpression::OR:
-            return "or";
-
-        case MatchExpression::NOR:
-            return "nr";
-
-        case MatchExpression::NOT:
-            return "nt";
-
-        case MatchExpression::ELEM_MATCH_OBJECT:
-            return "eo";
-
-        case MatchExpression::ELEM_MATCH_VALUE:
-            return "ev";
-
-        case MatchExpression::SIZE:
-            return "sz";
-
-        case MatchExpression::LTE:
-            return "le";
-
-        case MatchExpression::LT:
-            return "lt";
-
-        case MatchExpression::EQ:
-            return "eq";
-
-        case MatchExpression::GT:
-            return "gt";
-
-        case MatchExpression::GTE:
-            return "ge";
-
-        case MatchExpression::REGEX:
-            return "re";
-
-        case MatchExpression::MOD:
-            return "mo";
-
-        case MatchExpression::EXISTS:
-            return "ex";
-
-        case MatchExpression::MATCH_IN:
-            return "in";
-
-        case MatchExpression::TYPE_OPERATOR:
-            return "ty";
-
-        case MatchExpression::GEO:
-            return "go";
-
-        case MatchExpression::WHERE:
-            return "wh";
-
-        case MatchExpression::ALWAYS_FALSE:
-            return "af";
-
-        case MatchExpression::ALWAYS_TRUE:
-            return "at";
-
-        case MatchExpression::GEO_NEAR:
-            return "gn";
-
-        case MatchExpression::TEXT:
-            return "te";
-
-        case MatchExpression::BITS_ALL_SET:
-            return "ls";
-
-        case MatchExpression::BITS_ALL_CLEAR:
-            return "lc";
-
-        case MatchExpression::BITS_ANY_SET:
-            return "ys";
-
-        case MatchExpression::BITS_ANY_CLEAR:
-            return "yc";
-
-        case MatchExpression::EXPRESSION:
-            return "xp";
-
-        case MatchExpression::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX:
-            return "internalSchemaAllElemMatchFromIndex";
-
-        case MatchExpression::INTERNAL_SCHEMA_ALLOWED_PROPERTIES:
-            return "internalSchemaAllowedProperties";
-
-        case MatchExpression::INTERNAL_SCHEMA_COND:
-            return "internalSchemaCond";
-
-        case MatchExpression::INTERNAL_SCHEMA_EQ:
-            return "internalSchemaEq";
-
-        case MatchExpression::INTERNAL_SCHEMA_FMOD:
-            return "internalSchemaFmod";
-
-        case MatchExpression::INTERNAL_SCHEMA_MIN_ITEMS:
-            return "internalSchemaMinItems";
-
-        case MatchExpression::INTERNAL_SCHEMA_MAX_ITEMS:
-            return "internalSchemaMaxItems";
-
-        case MatchExpression::INTERNAL_SCHEMA_UNIQUE_ITEMS:
-            return "internalSchemaUniqueItems";
-
-        case MatchExpression::INTERNAL_SCHEMA_XOR:
-            return "internalSchemaXor";
-
-        case MatchExpression::INTERNAL_SCHEMA_OBJECT_MATCH:
-            return "internalSchemaObjectMatch";
-
-        case MatchExpression::INTERNAL_SCHEMA_ROOT_DOC_EQ:
-            return "internalSchemaRootDocEq";
-
-        case MatchExpression::INTERNAL_SCHEMA_MIN_LENGTH:
-            return "internalSchemaMinLength";
-
-        case MatchExpression::INTERNAL_SCHEMA_MAX_LENGTH:
-            return "internalSchemaMaxLength";
-
-        case MatchExpression::INTERNAL_SCHEMA_MIN_PROPERTIES:
-            return "internalSchemaMinProperties";
-
-        case MatchExpression::INTERNAL_SCHEMA_MAX_PROPERTIES:
-            return "internalSchemaMaxProperties";
-
-        case MatchExpression::INTERNAL_SCHEMA_MATCH_ARRAY_INDEX:
-            return "internalSchemaMatchArrayIndex";
-
-        case MatchExpression::INTERNAL_SCHEMA_TYPE:
-            return "internalSchemaType";
-
-        default:
-            MONGO_UNREACHABLE;
-    }
-}
-
-/**
- * Encodes GEO match expression.
- * Encoding includes:
- * - type of geo query (within/intersect/near)
- * - geometry type
- * - CRS (flat or spherical)
- */
-void encodeGeoMatchExpression(const GeoMatchExpression* tree, StringBuilder* keyBuilder) {
-    const GeoExpression& geoQuery = tree->getGeoExpression();
-
-    // Type of geo query.
-    switch (geoQuery.getPred()) {
-        case GeoExpression::WITHIN:
-            *keyBuilder << "wi";
-            break;
-        case GeoExpression::INTERSECT:
-            *keyBuilder << "in";
-            break;
-        case GeoExpression::INVALID:
-            *keyBuilder << "id";
-            break;
-    }
-
-    // Geometry type.
-    // Only one of the shared_ptrs in GeoContainer may be non-NULL.
-    *keyBuilder << geoQuery.getGeometry().getDebugType();
-
-    // CRS (flat or spherical)
-    if (FLAT == geoQuery.getGeometry().getNativeCRS()) {
-        *keyBuilder << "fl";
-    } else if (SPHERE == geoQuery.getGeometry().getNativeCRS()) {
-        *keyBuilder << "sp";
-    } else if (STRICT_SPHERE == geoQuery.getGeometry().getNativeCRS()) {
-        *keyBuilder << "ss";
-    } else {
-        error() << "unknown CRS type " << (int)geoQuery.getGeometry().getNativeCRS()
-                << " in geometry of type " << geoQuery.getGeometry().getDebugType();
-        invariant(false);
-    }
-}
-
-/**
- * Encodes GEO_NEAR match expression.
- * Encode:
- * - isNearSphere
- * - CRS (flat or spherical)
- */
-void encodeGeoNearMatchExpression(const GeoNearMatchExpression* tree, StringBuilder* keyBuilder) {
-    const GeoNearExpression& nearQuery = tree->getData();
-
-    // isNearSphere
-    *keyBuilder << (nearQuery.isNearSphere ? "ns" : "nr");
-
-    // CRS (flat or spherical or strict-winding spherical)
-    switch (nearQuery.centroid->crs) {
-        case FLAT:
-            *keyBuilder << "fl";
-            break;
-        case SPHERE:
-            *keyBuilder << "sp";
-            break;
-        case STRICT_SPHERE:
-            *keyBuilder << "ss";
-            break;
-        case UNSET:
-            error() << "unknown CRS type " << (int)nearQuery.centroid->crs
-                    << " in point geometry for near query";
-            invariant(false);
-            break;
+    for (size_t i = 0; i < tree->numChildren(); ++i) {
+        encodeIndexability(tree->getChild(i), indexabilityState, keyBuilder);
     }
 }
 
 }  // namespace
+
+std::ostream& operator<<(std::ostream& stream, const PlanCacheKey& key) {
+    stream << key.stringData();
+    return stream;
+}
+
+StringBuilder& operator<<(StringBuilder& builder, const PlanCacheKey& key) {
+    builder << key.stringData();
+    return builder;
+}
 
 //
 // Cache-related functions for CanonicalQuery
@@ -352,11 +150,6 @@ bool PlanCache::shouldCacheQuery(const CanonicalQuery& query) {
         return false;
     }
 
-    // Snapshot is really a hint.
-    if (query.getQueryRequest().isSnapshot()) {
-        return false;
-    }
-
     return true;
 }
 
@@ -371,7 +164,7 @@ CachedSolution::CachedSolution(const PlanCacheKey& key, const PlanCacheEntry& en
       sort(entry.sort.getOwned()),
       projection(entry.projection.getOwned()),
       collation(entry.collation.getOwned()),
-      decisionWorks(entry.decision->stats[0]->common.works) {
+      decisionWorks(entry.works) {
     // CachedSolution should not having any references into
     // cache entry. All relevant data should be cloned/copied.
     for (size_t i = 0; i < entry.plannerData.size(); ++i) {
@@ -394,8 +187,13 @@ CachedSolution::~CachedSolution() {
 //
 
 PlanCacheEntry::PlanCacheEntry(const std::vector<QuerySolution*>& solutions,
-                               PlanRankingDecision* why)
-    : plannerData(solutions.size()), decision(why) {
+                               PlanRankingDecision* why,
+                               uint32_t queryHash,
+                               uint32_t planCacheKey)
+    : plannerData(solutions.size()),
+      queryHash(queryHash),
+      planCacheKey(planCacheKey),
+      decision(why) {
     invariant(why);
 
     // The caller of this constructor is responsible for ensuring
@@ -410,9 +208,6 @@ PlanCacheEntry::PlanCacheEntry(const std::vector<QuerySolution*>& solutions,
 }
 
 PlanCacheEntry::~PlanCacheEntry() {
-    for (size_t i = 0; i < feedback.size(); ++i) {
-        delete feedback[i];
-    }
     for (size_t i = 0; i < plannerData.size(); ++i) {
         delete plannerData[i];
     }
@@ -425,22 +220,24 @@ PlanCacheEntry* PlanCacheEntry::clone() const {
         qs->cacheData.reset(plannerData[i]->clone());
         solutions.push_back(std::move(qs));
     }
-    PlanCacheEntry* entry = new PlanCacheEntry(
-        transitional_tools_do_not_use::unspool_vector(solutions), decision->clone());
+    PlanCacheEntry* entry =
+        new PlanCacheEntry(transitional_tools_do_not_use::unspool_vector(solutions),
+                           decision->clone(),
+                           queryHash,
+                           planCacheKey);
 
     // Copy query shape.
     entry->query = query.getOwned();
     entry->sort = sort.getOwned();
     entry->projection = projection.getOwned();
     entry->collation = collation.getOwned();
+    entry->timeOfCreation = timeOfCreation;
+    entry->isActive = isActive;
+    entry->works = works;
 
     // Copy performance stats.
-    for (size_t i = 0; i < feedback.size(); ++i) {
-        PlanCacheEntryFeedback* fb = new PlanCacheEntryFeedback();
-        fb->stats.reset(feedback[i]->stats->clone());
-        fb->score = feedback[i]->score;
-        entry->feedback.push_back(fb);
-    }
+    entry->feedback = feedback;
+
     return entry;
 }
 
@@ -448,7 +245,8 @@ std::string PlanCacheEntry::toString() const {
     return str::stream() << "(query: " << query.toString() << ";sort: " << sort.toString()
                          << ";projection: " << projection.toString()
                          << ";collation: " << collation.toString()
-                         << ";solutions: " << plannerData.size() << ")";
+                         << ";solutions: " << plannerData.size()
+                         << ";timeOfCreation: " << timeOfCreation.toString() << ")";
 }
 
 std::string CachedSolution::toString() const {
@@ -495,7 +293,7 @@ std::string PlanCacheIndexTree::toString(int indents) const {
     } else {
         result << std::string(3 * indents, '-') << "Leaf ";
         if (NULL != entry.get()) {
-            result << entry->name << ", pos: " << index_pos << ", can combine? "
+            result << entry->identifier << ", pos: " << index_pos << ", can combine? "
                    << canCombineBounds;
         }
         for (const auto& orPushdown : orPushdowns) {
@@ -508,7 +306,7 @@ std::string PlanCacheIndexTree::toString(int indents) const {
                 firstPosition = false;
                 result << position;
             }
-            result << ": " << orPushdown.indexName << ", pos: " << orPushdown.position
+            result << ": " << orPushdown.indexEntryId << " pos: " << orPushdown.position
                    << ", can combine? " << orPushdown.canCombineBounds << ". ";
         }
         result << '\n';
@@ -554,147 +352,110 @@ std::string SolutionCacheData::toString() const {
 // PlanCache
 //
 
-PlanCache::PlanCache() : _cache(internalQueryCacheSize.load()) {}
+PlanCache::PlanCache() : PlanCache(internalQueryCacheSize.load()) {}
+
+PlanCache::PlanCache(size_t size) : _cache(size) {}
 
 PlanCache::PlanCache(const std::string& ns) : _cache(internalQueryCacheSize.load()), _ns(ns) {}
 
 PlanCache::~PlanCache() {}
 
-/**
- * Traverses expression tree pre-order.
- * Appends an encoding of each node's match type and path name
- * to the output stream.
- */
-void PlanCache::encodeKeyForMatch(const MatchExpression* tree, StringBuilder* keyBuilder) const {
-    // Encode match type and path.
-    *keyBuilder << encodeMatchType(tree->matchType());
+std::unique_ptr<CachedSolution> PlanCache::getCacheEntryIfActive(const PlanCacheKey& key) const {
 
-    encodeUserString(tree->path(), keyBuilder);
-
-    // GEO and GEO_NEAR require additional encoding.
-    if (MatchExpression::GEO == tree->matchType()) {
-        encodeGeoMatchExpression(static_cast<const GeoMatchExpression*>(tree), keyBuilder);
-    } else if (MatchExpression::GEO_NEAR == tree->matchType()) {
-        encodeGeoNearMatchExpression(static_cast<const GeoNearMatchExpression*>(tree), keyBuilder);
+    PlanCache::GetResult res = get(key);
+    if (res.state == PlanCache::CacheEntryState::kPresentInactive) {
+        LOG(2) << "Not using cached entry for " << redact(res.cachedSolution->toString())
+               << " since it is inactive";
+        return nullptr;
     }
 
-    // Encode indexability.
-    const IndexToDiscriminatorMap& discriminators =
-        _indexabilityState.getDiscriminators(tree->path());
-    if (!discriminators.empty()) {
-        *keyBuilder << kEncodeDiscriminatorsBegin;
-        // For each discriminator on this path, append the character '0' or '1'.
-        for (auto&& indexAndDiscriminatorPair : discriminators) {
-            *keyBuilder << indexAndDiscriminatorPair.second.isMatchCompatibleWithIndex(tree);
-        }
-        *keyBuilder << kEncodeDiscriminatorsEnd;
-    }
-
-    // Traverse child nodes.
-    // Enclose children in [].
-    if (tree->numChildren() > 0) {
-        *keyBuilder << kEncodeChildrenBegin;
-    }
-    // Use comma to separate children encoding.
-    for (size_t i = 0; i < tree->numChildren(); ++i) {
-        if (i > 0) {
-            *keyBuilder << kEncodeChildrenSeparator;
-        }
-        encodeKeyForMatch(tree->getChild(i), keyBuilder);
-    }
-    if (tree->numChildren() > 0) {
-        *keyBuilder << kEncodeChildrenEnd;
-    }
+    return std::move(res.cachedSolution);
 }
 
 /**
- * Encodes sort order into cache key.
- * Sort order is normalized because it provided by
- * QueryRequest.
+ * Given a query, and an (optional) current cache entry for its shape ('oldEntry'), determine
+ * whether:
+ * - We should create a new entry
+ * - The new entry should be marked 'active'
  */
-void PlanCache::encodeKeyForSort(const BSONObj& sortObj, StringBuilder* keyBuilder) const {
-    if (sortObj.isEmpty()) {
-        return;
+PlanCache::NewEntryState PlanCache::getNewEntryState(const CanonicalQuery& query,
+                                                     uint32_t queryHash,
+                                                     uint32_t planCacheKey,
+                                                     PlanCacheEntry* oldEntry,
+                                                     size_t newWorks,
+                                                     double growthCoefficient) {
+    NewEntryState res;
+    if (!oldEntry) {
+        LOG(1) << "Creating inactive cache entry for query shape " << redact(query.toStringShort())
+               << " queryHash " << unsignedIntToFixedLengthHex(queryHash) << " planCacheKey "
+               << unsignedIntToFixedLengthHex(planCacheKey) << " with works value " << newWorks;
+        res.shouldBeCreated = true;
+        res.shouldBeActive = false;
+        return res;
     }
 
-    *keyBuilder << kEncodeSortSection;
+    if (oldEntry->isActive && newWorks <= oldEntry->works) {
+        // The new plan did better than the currently stored active plan. This case may
+        // occur if many MultiPlanners are run simultaneously.
 
-    BSONObjIterator it(sortObj);
-    while (it.more()) {
-        BSONElement elt = it.next();
-        // $meta text score
-        if (QueryRequest::isTextScoreMeta(elt)) {
-            *keyBuilder << "t";
-        }
-        // Ascending
-        else if (elt.numberInt() == 1) {
-            *keyBuilder << "a";
-        }
-        // Descending
-        else {
-            *keyBuilder << "d";
-        }
-        encodeUserString(elt.fieldName(), keyBuilder);
+        LOG(1) << "Replacing active cache entry for query " << redact(query.toStringShort())
+               << " queryHash " << unsignedIntToFixedLengthHex(queryHash) << " planCacheKey "
+               << unsignedIntToFixedLengthHex(planCacheKey) << " with works " << oldEntry->works
+               << " with a plan with works " << newWorks;
+        res.shouldBeCreated = true;
+        res.shouldBeActive = true;
+    } else if (oldEntry->isActive) {
+        LOG(1) << "Attempt to write to the planCache for query " << redact(query.toStringShort())
+               << " queryHash " << unsignedIntToFixedLengthHex(queryHash) << " planCacheKey "
+               << unsignedIntToFixedLengthHex(planCacheKey) << " with a plan with works "
+               << newWorks << " is a noop, since there's already a plan with works value "
+               << oldEntry->works;
+        // There is already an active cache entry with a higher works value.
+        // We do nothing.
+        res.shouldBeCreated = false;
+    } else if (newWorks > oldEntry->works) {
+        // This plan performed worse than expected. Rather than immediately overwriting the
+        // cache, lower the bar to what is considered good performance and keep the entry
+        // inactive.
 
-        // Sort argument separator
-        if (it.more()) {
-            *keyBuilder << ",";
-        }
+        // Be sure that 'works' always grows by at least 1, in case its current
+        // value and 'internalQueryCacheWorksGrowthCoefficient' are low enough that
+        // the old works * new works cast to size_t is the same as the previous value of
+        // 'works'.
+        const double increasedWorks = std::max(
+            oldEntry->works + 1u, static_cast<size_t>(oldEntry->works * growthCoefficient));
+
+        LOG(1) << "Increasing work value associated with cache entry for query "
+               << redact(query.toStringShort()) << " queryHash "
+               << unsignedIntToFixedLengthHex(queryHash) << " planCacheKey "
+               << unsignedIntToFixedLengthHex(planCacheKey) << " from " << oldEntry->works << " to "
+               << increasedWorks;
+        oldEntry->works = increasedWorks;
+
+        // Don't create a new entry.
+        res.shouldBeCreated = false;
+    } else {
+        // This plan performed just as well or better than we expected, based on the
+        // inactive entry's works. We use this as an indicator that it's safe to
+        // cache (as an active entry) the plan this query used for the future.
+        LOG(1) << "Inactive cache entry for query " << redact(query.toStringShort())
+               << " queryHash " << unsignedIntToFixedLengthHex(queryHash) << " planCacheKey "
+               << unsignedIntToFixedLengthHex(planCacheKey) << " with works " << oldEntry->works
+               << " is being promoted to active entry with works value " << newWorks;
+        // We'll replace the old inactive entry with an active entry.
+        res.shouldBeCreated = true;
+        res.shouldBeActive = true;
     }
+
+    return res;
 }
 
-/**
- * Encodes parsed projection into cache key.
- * Does a simple toString() on each projected field
- * in the BSON object.
- * Orders the encoded elements in the projection by field name.
- * This handles all the special projection types ($meta, $elemMatch, etc.)
- */
-void PlanCache::encodeKeyForProj(const BSONObj& projObj, StringBuilder* keyBuilder) const {
-    // Sorts the BSON elements by field name using a map.
-    std::map<StringData, BSONElement> elements;
 
-    BSONObjIterator it(projObj);
-    while (it.more()) {
-        BSONElement elt = it.next();
-        StringData fieldName = elt.fieldNameStringData();
-
-        // Internal callers may add $-prefixed fields to the projection. These are not part of a
-        // user query, and therefore are not considered part of the cache key.
-        if (fieldName[0] == '$') {
-            continue;
-        }
-
-        elements[fieldName] = elt;
-    }
-
-    if (!elements.empty()) {
-        *keyBuilder << kEncodeProjectionSection;
-    }
-
-    // Read elements in order of field name
-    for (std::map<StringData, BSONElement>::const_iterator i = elements.begin();
-         i != elements.end();
-         ++i) {
-        const BSONElement& elt = (*i).second;
-
-        if (elt.type() != BSONType::Object) {
-            // For inclusion/exclusion projections, we encode as "i" or "e".
-            *keyBuilder << (elt.trueValue() ? "i" : "e");
-        } else {
-            // For projection operators, we use the verbatim string encoding of the element.
-            encodeUserString(elt.toString(false,   // includeFieldName
-                                          false),  // full
-                             keyBuilder);
-        }
-
-        encodeUserString(elt.fieldName(), keyBuilder);
-    }
-}
-
-Status PlanCache::add(const CanonicalQuery& query,
+Status PlanCache::set(const CanonicalQuery& query,
                       const std::vector<QuerySolution*>& solns,
-                      PlanRankingDecision* why) {
+                      std::unique_ptr<PlanRankingDecision> why,
+                      Date_t now,
+                      boost::optional<double> worksGrowthCoefficient) {
     invariant(why);
 
     if (solns.empty()) {
@@ -714,13 +475,53 @@ Status PlanCache::add(const CanonicalQuery& query,
                       "candidate ordering entries in decision must match solutions");
     }
 
-    PlanCacheEntry* entry = new PlanCacheEntry(solns, why);
-    const QueryRequest& qr = query.getQueryRequest();
-    entry->query = qr.getFilter().getOwned();
-    entry->sort = qr.getSort().getOwned();
-    if (query.getCollator()) {
-        entry->collation = query.getCollator()->getSpec().toBSON();
+    const auto key = computeKey(query);
+    const size_t newWorks = why->stats[0]->common.works;
+    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    bool isNewEntryActive = false;
+    uint32_t queryHash;
+    uint32_t planCacheKey;
+    if (internalQueryCacheDisableInactiveEntries.load()) {
+        // All entries are always active.
+        isNewEntryActive = true;
+        planCacheKey = canonical_query_encoder::computeHash(key.stringData());
+        queryHash = canonical_query_encoder::computeHash(key.getStableKeyStringData());
+    } else {
+        PlanCacheEntry* oldEntry = nullptr;
+        Status cacheStatus = _cache.get(key, &oldEntry);
+        invariant(cacheStatus.isOK() || cacheStatus == ErrorCodes::NoSuchKey);
+        if (oldEntry) {
+            queryHash = oldEntry->queryHash;
+            planCacheKey = oldEntry->planCacheKey;
+        } else {
+            planCacheKey = canonical_query_encoder::computeHash(key.stringData());
+            queryHash = canonical_query_encoder::computeHash(key.getStableKeyStringData());
+        }
+
+        const auto newState = getNewEntryState(
+            query,
+            queryHash,
+            planCacheKey,
+            oldEntry,
+            newWorks,
+            worksGrowthCoefficient.get_value_or(internalQueryCacheWorksGrowthCoefficient));
+
+        if (!newState.shouldBeCreated) {
+            return Status::OK();
+        }
+        isNewEntryActive = newState.shouldBeActive;
     }
+
+    auto newEntry = std::make_unique<PlanCacheEntry>(solns, why.release(), queryHash, planCacheKey);
+    const QueryRequest& qr = query.getQueryRequest();
+    newEntry->query = qr.getFilter().getOwned();
+    newEntry->sort = qr.getSort().getOwned();
+    newEntry->isActive = isNewEntryActive;
+    newEntry->works = newWorks;
+    if (query.getCollator()) {
+        newEntry->collation = query.getCollator()->getSpec().toBSON();
+    }
+    newEntry->timeOfCreation = now;
 
     // Strip projections on $-prefixed fields, as these are added by internal callers of the query
     // system and are not considered part of the user projection.
@@ -731,10 +532,9 @@ Status PlanCache::add(const CanonicalQuery& query,
         }
         projBuilder.append(elem);
     }
-    entry->projection = projBuilder.obj();
+    newEntry->projection = projBuilder.obj();
 
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
-    std::unique_ptr<PlanCacheEntry> evictedEntry = _cache.add(computeKey(query), entry);
+    std::unique_ptr<PlanCacheEntry> evictedEntry = _cache.add(key, newEntry.release());
 
     if (NULL != evictedEntry.get()) {
         LOG(1) << _ns << ": plan cache maximum size exceeded - "
@@ -744,28 +544,45 @@ Status PlanCache::add(const CanonicalQuery& query,
     return Status::OK();
 }
 
-Status PlanCache::get(const CanonicalQuery& query, CachedSolution** crOut) const {
-    PlanCacheKey key = computeKey(query);
-    verify(crOut);
+void PlanCache::deactivate(const CanonicalQuery& query) {
+    if (internalQueryCacheDisableInactiveEntries.load()) {
+        // This is a noop if inactive entries are disabled.
+        return;
+    }
 
+    PlanCacheKey key = computeKey(query);
     stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
-    PlanCacheEntry* entry;
+    PlanCacheEntry* entry = nullptr;
     Status cacheStatus = _cache.get(key, &entry);
     if (!cacheStatus.isOK()) {
-        return cacheStatus;
+        invariant(cacheStatus == ErrorCodes::NoSuchKey);
+        return;
+    }
+    invariant(entry);
+    entry->isActive = false;
+}
+
+PlanCache::GetResult PlanCache::get(const CanonicalQuery& query) const {
+    PlanCacheKey key = computeKey(query);
+    return get(key);
+}
+
+PlanCache::GetResult PlanCache::get(const PlanCacheKey& key) const {
+    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+    PlanCacheEntry* entry = nullptr;
+    Status cacheStatus = _cache.get(key, &entry);
+    if (!cacheStatus.isOK()) {
+        invariant(cacheStatus == ErrorCodes::NoSuchKey);
+        return {CacheEntryState::kNotPresent, nullptr};
     }
     invariant(entry);
 
-    *crOut = new CachedSolution(key, *entry);
-
-    return Status::OK();
+    auto state =
+        entry->isActive ? CacheEntryState::kPresentActive : CacheEntryState::kPresentInactive;
+    return {state, stdx::make_unique<CachedSolution>(key, *entry)};
 }
 
-Status PlanCache::feedback(const CanonicalQuery& cq, PlanCacheEntryFeedback* feedback) {
-    if (NULL == feedback) {
-        return Status(ErrorCodes::BadValue, "feedback is NULL");
-    }
-    std::unique_ptr<PlanCacheEntryFeedback> autoFeedback(feedback);
+Status PlanCache::feedback(const CanonicalQuery& cq, double score) {
     PlanCacheKey ck = computeKey(cq);
 
     stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
@@ -778,7 +595,7 @@ Status PlanCache::feedback(const CanonicalQuery& cq, PlanCacheEntryFeedback* fee
 
     // We store up to a constant number of feedback entries.
     if (entry->feedback.size() < static_cast<size_t>(internalQueryCacheFeedbacksStored.load())) {
-        entry->feedback.push_back(autoFeedback.release());
+        entry->feedback.push_back(score);
     }
 
     return Status::OK();
@@ -795,16 +612,15 @@ void PlanCache::clear() {
 }
 
 PlanCacheKey PlanCache::computeKey(const CanonicalQuery& cq) const {
-    StringBuilder keyBuilder;
-    encodeKeyForMatch(cq.root(), &keyBuilder);
-    encodeKeyForSort(cq.getQueryRequest().getSort(), &keyBuilder);
-    encodeKeyForProj(cq.getQueryRequest().getProj(), &keyBuilder);
-    return keyBuilder.str();
+    const auto shapeString = cq.encodeKey();
+
+    StringBuilder indexabilityKeyBuilder;
+    encodeIndexability(cq.root(), _indexabilityState, &indexabilityKeyBuilder);
+    return PlanCacheKey(std::move(shapeString), indexabilityKeyBuilder.str());
 }
 
-Status PlanCache::getEntry(const CanonicalQuery& query, PlanCacheEntry** entryOut) const {
+StatusWith<std::unique_ptr<PlanCacheEntry>> PlanCache::getEntry(const CanonicalQuery& query) const {
     PlanCacheKey key = computeKey(query);
-    verify(entryOut);
 
     stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
     PlanCacheEntry* entry;
@@ -814,26 +630,19 @@ Status PlanCache::getEntry(const CanonicalQuery& query, PlanCacheEntry** entryOu
     }
     invariant(entry);
 
-    *entryOut = entry->clone();
-
-    return Status::OK();
+    return std::unique_ptr<PlanCacheEntry>(entry->clone());
 }
 
-std::vector<PlanCacheEntry*> PlanCache::getAllEntries() const {
+std::vector<std::unique_ptr<PlanCacheEntry>> PlanCache::getAllEntries() const {
     stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
-    std::vector<PlanCacheEntry*> entries;
-    typedef std::list<std::pair<PlanCacheKey, PlanCacheEntry*>>::const_iterator ConstIterator;
-    for (ConstIterator i = _cache.begin(); i != _cache.end(); i++) {
-        PlanCacheEntry* entry = i->second;
-        entries.push_back(entry->clone());
+    std::vector<std::unique_ptr<PlanCacheEntry>> entries;
+
+    for (auto&& cacheEntry : _cache) {
+        auto entry = cacheEntry.second;
+        entries.push_back(std::unique_ptr<PlanCacheEntry>(entry->clone()));
     }
 
     return entries;
-}
-
-bool PlanCache::contains(const CanonicalQuery& cq) const {
-    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
-    return _cache.hasKey(computeKey(cq));
 }
 
 size_t PlanCache::size() const {
@@ -841,8 +650,25 @@ size_t PlanCache::size() const {
     return _cache.size();
 }
 
-void PlanCache::notifyOfIndexEntries(const std::vector<IndexEntry>& indexEntries) {
-    _indexabilityState.updateDiscriminators(indexEntries);
+void PlanCache::notifyOfIndexUpdates(const std::vector<CoreIndexInfo>& indexCores) {
+    _indexabilityState.updateDiscriminators(indexCores);
+}
+
+std::vector<BSONObj> PlanCache::getMatchingStats(
+    const std::function<BSONObj(const PlanCacheEntry&)>& serializationFunc,
+    const std::function<bool(const BSONObj&)>& filterFunc) const {
+    std::vector<BSONObj> results;
+    stdx::lock_guard<stdx::mutex> cacheLock(_cacheMutex);
+
+    for (auto&& cacheEntry : _cache) {
+        const auto entry = cacheEntry.second;
+        auto serializedEntry = serializationFunc(*entry);
+        if (filterFunc(serializedEntry)) {
+            results.push_back(serializedEntry);
+        }
+    }
+
+    return results;
 }
 
 }  // namespace mongo

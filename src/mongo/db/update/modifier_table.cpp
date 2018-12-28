@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,18 +36,6 @@
 #include "mongo/base/init.h"
 #include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/base/status.h"
-#include "mongo/db/ops/modifier_add_to_set.h"
-#include "mongo/db/ops/modifier_bit.h"
-#include "mongo/db/ops/modifier_compare.h"
-#include "mongo/db/ops/modifier_current_date.h"
-#include "mongo/db/ops/modifier_inc.h"
-#include "mongo/db/ops/modifier_pop.h"
-#include "mongo/db/ops/modifier_pull.h"
-#include "mongo/db/ops/modifier_pull_all.h"
-#include "mongo/db/ops/modifier_push.h"
-#include "mongo/db/ops/modifier_rename.h"
-#include "mongo/db/ops/modifier_set.h"
-#include "mongo/db/ops/modifier_unset.h"
 #include "mongo/db/update/addtoset_node.h"
 #include "mongo/db/update/arithmetic_node.h"
 #include "mongo/db/update/bit_node.h"
@@ -59,7 +49,6 @@
 #include "mongo/db/update/rename_node.h"
 #include "mongo/db/update/set_node.h"
 #include "mongo/db/update/unset_node.h"
-#include "mongo/platform/unordered_map.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -145,43 +134,6 @@ ModifierType getType(StringData typeStr) {
         return MOD_UNKNOWN;
     }
     return it->second->type;
-}
-
-ModifierInterface* makeUpdateMod(ModifierType modType) {
-    switch (modType) {
-        case MOD_ADD_TO_SET:
-            return new ModifierAddToSet;
-        case MOD_BIT:
-            return new ModifierBit;
-        case MOD_CURRENTDATE:
-            return new ModifierCurrentDate;
-        case MOD_INC:
-            return new ModifierInc(ModifierInc::MODE_INC);
-        case MOD_MAX:
-            return new ModifierCompare(ModifierCompare::MAX);
-        case MOD_MIN:
-            return new ModifierCompare(ModifierCompare::MIN);
-        case MOD_MUL:
-            return new ModifierInc(ModifierInc::MODE_MUL);
-        case MOD_POP:
-            return new ModifierPop;
-        case MOD_PULL:
-            return new ModifierPull;
-        case MOD_PULL_ALL:
-            return new ModifierPullAll;
-        case MOD_PUSH:
-            return new ModifierPush;
-        case MOD_SET:
-            return new ModifierSet(ModifierSet::SET_NORMAL);
-        case MOD_SET_ON_INSERT:
-            return new ModifierSet(ModifierSet::SET_ON_INSERT);
-        case MOD_RENAME:
-            return new ModifierRename;
-        case MOD_UNSET:
-            return new ModifierUnset;
-        default:
-            return NULL;
-    }
 }
 
 std::unique_ptr<UpdateLeafNode> makeUpdateLeafNode(ModifierType modType) {

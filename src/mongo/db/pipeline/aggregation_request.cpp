@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,6 +38,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/value.h"
@@ -43,7 +46,6 @@
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/db/write_concern_options.h"
 
 namespace mongo {
 
@@ -52,13 +54,13 @@ constexpr StringData AggregationRequest::kCursorName;
 constexpr StringData AggregationRequest::kBatchSizeName;
 constexpr StringData AggregationRequest::kFromMongosName;
 constexpr StringData AggregationRequest::kNeedsMergeName;
-constexpr StringData AggregationRequest::kNeedsMerge34Name;
 constexpr StringData AggregationRequest::kPipelineName;
 constexpr StringData AggregationRequest::kCollationName;
 constexpr StringData AggregationRequest::kExplainName;
 constexpr StringData AggregationRequest::kAllowDiskUseName;
 constexpr StringData AggregationRequest::kHintName;
 constexpr StringData AggregationRequest::kCommentName;
+constexpr StringData AggregationRequest::kExchangeName;
 
 constexpr long long AggregationRequest::kDefaultBatchSize;
 
@@ -110,7 +112,6 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
 
     bool hasFromMongosElem = false;
     bool hasNeedsMergeElem = false;
-    bool hasNeedsMerge34Elem = false;
 
     // Parse optional parameters.
     for (auto&& elem : cmdObj) {
@@ -203,17 +204,6 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
 
             hasNeedsMergeElem = true;
             request.setNeedsMerge(elem.Bool());
-        } else if (kNeedsMerge34Name == fieldName) {
-            if (elem.type() != BSONType::Bool) {
-                return {ErrorCodes::TypeMismatch,
-                        str::stream() << kNeedsMerge34Name << " must be a boolean, not a "
-                                      << typeName(elem.type())};
-            }
-
-            hasNeedsMerge34Elem = true;
-            request.setNeedsMerge(elem.Bool());
-            request.setFromMongos(elem.Bool());
-            request.setFrom34Mongos(elem.Bool());
         } else if (kAllowDiskUseName == fieldName) {
             if (storageGlobalParams.readOnly) {
                 return {ErrorCodes::IllegalOperation,
@@ -225,9 +215,26 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
                                       << typeName(elem.type())};
             }
             request.setAllowDiskUse(elem.Bool());
+        } else if (kExchangeName == fieldName) {
+            try {
+                IDLParserErrorContext ctx("internalExchange");
+                request.setExchangeSpec(ExchangeSpec::parse(ctx, elem.Obj()));
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
         } else if (bypassDocumentValidationCommandOption() == fieldName) {
             request.setBypassDocumentValidation(elem.trueValue());
-        } else if (!Command::isGenericArgument(fieldName)) {
+        } else if (WriteConcernOptions::kWriteConcernField == fieldName) {
+            if (elem.type() != BSONType::Object) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream() << fieldName << " must be an object, not a "
+                                      << typeName(elem.type())};
+            }
+
+            WriteConcernOptions writeConcern;
+            uassertStatusOK(writeConcern.parse(elem.embeddedObject()));
+            request.setWriteConcern(writeConcern);
+        } else if (!isGenericArgument(fieldName)) {
             return {ErrorCodes::FailedToParse,
                     str::stream() << "unrecognized field '" << elem.fieldName() << "'"};
         }
@@ -266,23 +273,6 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
                 str::stream() << "Cannot specify '" << kNeedsMergeName << "' without '"
                               << kFromMongosName
                               << "'"};
-    }
-
-    // If 'fromRouter' is specified, the request is from a 3.4 mongos, so we do not expect
-    // 'fromMongos' or 'needsMerge' to be specified.
-    if (hasNeedsMerge34Elem) {
-        if (hasNeedsMergeElem) {
-            return {ErrorCodes::FailedToParse,
-                    str::stream() << "Cannot specify both '" << kNeedsMergeName << "' and '"
-                                  << kNeedsMerge34Name
-                                  << "'"};
-        }
-        if (hasFromMongosElem) {
-            return {ErrorCodes::FailedToParse,
-                    str::stream() << "Cannot specify both '" << kFromMongosName << "' and '"
-                                  << kNeedsMerge34Name
-                                  << "'"};
-        }
     }
 
     return request;
@@ -342,7 +332,11 @@ Document AggregationRequest::serializeToCommandObj() const {
          _unwrappedReadPref.isEmpty() ? Value() : Value(_unwrappedReadPref)},
         // Only serialize maxTimeMs if specified.
         {QueryRequest::cmdOptionMaxTimeMS,
-         _maxTimeMS == 0 ? Value() : Value(static_cast<int>(_maxTimeMS))}};
+         _maxTimeMS == 0 ? Value() : Value(static_cast<int>(_maxTimeMS))},
+        {kExchangeName, _exchangeSpec ? Value(_exchangeSpec->toBSON()) : Value()},
+        {WriteConcernOptions::kWriteConcernField,
+         _writeConcern ? Value(_writeConcern->toBSON()) : Value()},
+    };
 }
 
 }  // namespace mongo

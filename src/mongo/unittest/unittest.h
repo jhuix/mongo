@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 /*
  * A C++ unit testing framework.
@@ -37,6 +39,7 @@
 #include <cmath>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -89,19 +92,19 @@
 #define ASSERT_LESS_THAN_OR_EQUALS(a, b) ASSERT_LTE(a, b)
 #define ASSERT_GREATER_THAN_OR_EQUALS(a, b) ASSERT_GTE(a, b)
 
-#define ASSERT_EQ(a, b) _ASSERT_COMPARISON(EQ, a, b)
-#define ASSERT_NE(a, b) _ASSERT_COMPARISON(NE, a, b)
-#define ASSERT_LT(a, b) _ASSERT_COMPARISON(LT, a, b)
-#define ASSERT_LTE(a, b) _ASSERT_COMPARISON(LTE, a, b)
-#define ASSERT_GT(a, b) _ASSERT_COMPARISON(GT, a, b)
-#define ASSERT_GTE(a, b) _ASSERT_COMPARISON(GTE, a, b)
+#define ASSERT_EQ(a, b) ASSERT_COMPARISON_(kEq, a, b)
+#define ASSERT_NE(a, b) ASSERT_COMPARISON_(kNe, a, b)
+#define ASSERT_LT(a, b) ASSERT_COMPARISON_(kLt, a, b)
+#define ASSERT_LTE(a, b) ASSERT_COMPARISON_(kLe, a, b)
+#define ASSERT_GT(a, b) ASSERT_COMPARISON_(kGt, a, b)
+#define ASSERT_GTE(a, b) ASSERT_COMPARISON_(kGe, a, b)
 
 /**
  * Binary comparison utility macro.  Do not use directly.
  */
-#define _ASSERT_COMPARISON(COMPARISON, a, b)                                                       \
-    if (::mongo::unittest::ComparisonAssertion_##COMPARISON ca =                                   \
-            ::mongo::unittest::ComparisonAssertion_##COMPARISON(__FILE__, __LINE__, #a, #b, a, b)) \
+#define ASSERT_COMPARISON_(OP, a, b)                                                           \
+    if (auto ca = ::mongo::unittest::ComparisonAssertion<::mongo::unittest::ComparisonOp::OP>( \
+            __FILE__, __LINE__, #a, #b, a, b))                                                 \
     ca.failure().stream()
 
 /**
@@ -152,13 +155,30 @@
                              }))
 
 /**
+ * This internal helper is used to ignore warnings about unused results.  Some unit tests which test
+ * `ASSERT_THROWS` and its variations are used on functions which both throw and return `Status` or
+ * `StatusWith` objects.  Although such function designs are undesirable, they do exist, presently.
+ * Therefore this internal helper macro is used by `ASSERT_THROWS` and its variations to silence
+ * such warnings without forcing the caller to invoke `.ignore()` on the called function.
+ *
+ * NOTE: This macro should NOT be used inside regular unit test code to ignore unchecked `Status` or
+ * `StatusWith` instances -- if a `Status` or `StatusWith` result is to be ignored, please use the
+ * normal `.ignore()` code.  This macro exists only to make using `ASSERT_THROWS` less inconvenient
+ * on functions which both throw and return `Status` or `StatusWith`.
+ */
+#define UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(EXPRESSION) \
+    do {                                                              \
+        (void)(EXPRESSION);                                           \
+    } while (false)
+
+/**
  * Behaves like ASSERT_THROWS, above, but also calls CHECK(caughtException) which may contain
  * additional assertions.
  */
 #define ASSERT_THROWS_WITH_CHECK(STATEMENT, EXCEPTION_TYPE, CHECK)             \
     do {                                                                       \
         try {                                                                  \
-            STATEMENT;                                                         \
+            UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(STATEMENT);      \
             FAIL("Expected statement " #STATEMENT " to throw " #EXCEPTION_TYPE \
                  " but it threw nothing.");                                    \
         } catch (const EXCEPTION_TYPE& ex) {                                   \
@@ -232,16 +252,18 @@
 #define _TEST_TYPE_NAME(CASE_NAME, TEST_NAME) UnitTest__##CASE_NAME##__##TEST_NAME
 
 namespace mongo {
-
 namespace unittest {
 
 class Result;
+
+void setupTestLogger();
 
 /**
  * Gets a LogstreamBuilder for logging to the unittest log domain, which may have
  * different target from the global log domain.
  */
 mongo::logger::LogstreamBuilder log();
+mongo::logger::LogstreamBuilder warning();
 
 /**
  * Type representing the function composing a test.
@@ -341,7 +363,6 @@ protected:
      */
     void printCapturedLogLines() const;
 
-private:
     /**
      * Called on the test object before running the test.
      */
@@ -352,6 +373,7 @@ private:
      */
     virtual void tearDown();
 
+private:
     /**
      * The test itself.
      */
@@ -360,7 +382,7 @@ private:
     bool _isCapturingLogMessages;
     std::vector<std::string> _capturedLogMessages;
     logger::MessageLogDomain::AppenderHandle _captureAppenderHandle;
-    logger::MessageLogDomain::AppenderAutoPtr _captureAppender;
+    std::unique_ptr<logger::MessageLogDomain::EventAppender> _captureAppender;
 };
 
 /**
@@ -383,14 +405,20 @@ public:
         add<T>(demangleName(typeid(T)));
     }
 
-    template <class T, typename A>
+    template <class T, class A>
     void add(const A& a) {
-        add(demangleName(typeid(T)), stdx::bind(&Suite::runTestObjectWithArg<T, A>, a));
+        add(demangleName(typeid(T)), [a] {
+            T testObj(a);
+            testObj.run();
+        });
     }
 
     template <class T>
     void add(const std::string& name) {
-        add(name, &Suite::runTestObject<T>);
+        add(name, [] {
+            T testObj;
+            testObj.run();
+        });
     }
 
     void add(const std::string& name, const TestFunction& testFn);
@@ -413,20 +441,7 @@ protected:
     virtual void setupTests();
 
 private:
-    // TODO(C++11): Make this hold unique_ptrs.
-    typedef std::vector<std::shared_ptr<TestHolder>> TestHolderList;
-
-    template <typename T>
-    static void runTestObject() {
-        T testObj;
-        testObj.run();
-    }
-
-    template <typename T, typename A>
-    static void runTestObjectWithArg(const A& a) {
-        T testObj(a);
-        testObj.run();
-    }
+    typedef std::vector<std::unique_ptr<TestHolder>> TestHolderList;
 
     std::string _name;
     TestHolderList _tests;
@@ -448,6 +463,23 @@ struct SuiteInstance {
         new T(u);
     }
 };
+
+template <typename T>
+Test::RegistrationAgent<T>::RegistrationAgent(const std::string& suiteName,
+                                              const std::string& testName)
+    : _suiteName(suiteName), _testName(testName) {
+    Suite::getSuite(suiteName)->add<T>(testName);
+}
+
+template <typename T>
+std::string Test::RegistrationAgent<T>::getSuiteName() const {
+    return _suiteName;
+}
+
+template <typename T>
+std::string Test::RegistrationAgent<T>::getTestName() const {
+    return _testName;
+}
 
 /**
  * Exception thrown when a test assertion fails.
@@ -483,10 +515,15 @@ public:
 
     std::string toString() const;
 
+    const std::string& getStacktrace() const {
+        return _stacktrace;
+    }
+
 private:
     std::string _file;
     unsigned _line;
     std::string _message;
+    std::string _stacktrace;
 };
 
 class TestAssertionFailure {
@@ -505,45 +542,79 @@ private:
     bool _enabled;
 };
 
-#define DECLARE_COMPARISON_ASSERTION(NAME, OPERATOR)                                          \
-    class ComparisonAssertion_##NAME {                                                        \
-        typedef void (ComparisonAssertion_##NAME::*bool_type)() const;                        \
-                                                                                              \
-    public:                                                                                   \
-        template <typename A, typename B>                                                     \
-        ComparisonAssertion_##NAME(const std::string& theFile,                                \
-                                   unsigned theLine,                                          \
-                                   StringData aExpression,                                    \
-                                   StringData bExpression,                                    \
-                                   const A& a,                                                \
-                                   const B& b) {                                              \
-            if (a OPERATOR b) {                                                               \
-                return;                                                                       \
-            }                                                                                 \
-            std::ostringstream os;                                                            \
-            os << "Expected " << aExpression << " " #OPERATOR " " << bExpression << " (" << a \
-               << " " #OPERATOR " " << b << ")";                                              \
-            _assertion.reset(new TestAssertionFailure(theFile, theLine, os.str()));           \
-        }                                                                                     \
-        operator bool_type() const {                                                          \
-            return _assertion.get() ? &ComparisonAssertion_##NAME::comparison_failed : NULL;  \
-        }                                                                                     \
-        TestAssertionFailure failure() {                                                      \
-            return *_assertion;                                                               \
-        }                                                                                     \
-                                                                                              \
-    private:                                                                                  \
-        void comparison_failed() const {}                                                     \
-        std::shared_ptr<TestAssertionFailure> _assertion;                                     \
+enum class ComparisonOp { kEq, kNe, kLt, kLe, kGt, kGe };
+
+template <ComparisonOp op>
+class ComparisonAssertion {
+private:
+    template <ComparisonOp val>
+    using OpTag = std::integral_constant<ComparisonOp, val>;
+
+    static auto comparator(OpTag<ComparisonOp::kEq>) {
+        return [](auto&& a, auto&& b) { return a == b; };
+    }
+    static auto comparator(OpTag<ComparisonOp::kNe>) {
+        return [](auto&& a, auto&& b) { return a != b; };
+    }
+    static auto comparator(OpTag<ComparisonOp::kLt>) {
+        return [](auto&& a, auto&& b) { return a < b; };
+    }
+    static auto comparator(OpTag<ComparisonOp::kLe>) {
+        return [](auto&& a, auto&& b) { return a <= b; };
+    }
+    static auto comparator(OpTag<ComparisonOp::kGt>) {
+        return [](auto&& a, auto&& b) { return a > b; };
+    }
+    static auto comparator(OpTag<ComparisonOp::kGe>) {
+        return [](auto&& a, auto&& b) { return a >= b; };
     }
 
-DECLARE_COMPARISON_ASSERTION(EQ, ==);
-DECLARE_COMPARISON_ASSERTION(NE, !=);
-DECLARE_COMPARISON_ASSERTION(LT, <);
-DECLARE_COMPARISON_ASSERTION(LTE, <=);
-DECLARE_COMPARISON_ASSERTION(GT, >);
-DECLARE_COMPARISON_ASSERTION(GTE, >=);
-#undef DECLARE_COMPARISON_ASSERTION
+    static constexpr StringData name(OpTag<ComparisonOp::kEq>) {
+        return "=="_sd;
+    }
+    static constexpr StringData name(OpTag<ComparisonOp::kNe>) {
+        return "!="_sd;
+    }
+    static constexpr StringData name(OpTag<ComparisonOp::kLt>) {
+        return "<"_sd;
+    }
+    static constexpr StringData name(OpTag<ComparisonOp::kLe>) {
+        return "<="_sd;
+    }
+    static constexpr StringData name(OpTag<ComparisonOp::kGt>) {
+        return ">"_sd;
+    }
+    static constexpr StringData name(OpTag<ComparisonOp::kGe>) {
+        return ">="_sd;
+    }
+
+public:
+    template <typename A, typename B>
+    ComparisonAssertion(const std::string& theFile,
+                        unsigned theLine,
+                        StringData aExpression,
+                        StringData bExpression,
+                        const A& a,
+                        const B& b) {
+        if (comparator(OpTag<op>{})(a, b)) {
+            return;
+        }
+        std::ostringstream os;
+        StringData opName = name(OpTag<op>{});
+        os << "Expected " << aExpression << " " << opName << " " << bExpression << " (" << a << " "
+           << opName << " " << b << ")";
+        _assertion = std::make_unique<TestAssertionFailure>(theFile, theLine, os.str());
+    }
+    explicit operator bool() const {
+        return static_cast<bool>(_assertion);
+    }
+    TestAssertionFailure failure() {
+        return *_assertion;
+    }
+
+private:
+    std::unique_ptr<TestAssertionFailure> _assertion;
+};
 
 /**
  * Get the value out of a StatusWith<T>, or throw an exception if it is not OK.
@@ -565,12 +636,5 @@ T assertGet(StatusWith<T>&& swt) {
  */
 std::vector<std::string> getAllSuiteNames();
 
-
-inline bool alwaysTrue() {
-    return true;
-}
-
 }  // namespace unittest
 }  // namespace mongo
-
-#include "mongo/unittest/unittest-inl.h"

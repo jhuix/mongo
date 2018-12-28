@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/query/index_tag.h"
@@ -31,7 +33,7 @@
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_tree.h"
 #include "mongo/db/query/indexability.h"
-#include "mongo/platform/unordered_map.h"
+#include "mongo/stdx/unordered_map.h"
 
 #include <algorithm>
 #include <limits>
@@ -130,9 +132,9 @@ void attachNode(MatchExpression* node,
 
 // Partitions destinations according to the first element of the destination's route. Trims the
 // first element off of each destination's route.
-unordered_map<size_t, std::vector<OrPushdownTag::Destination>> partitionChildDestinations(
+stdx::unordered_map<size_t, std::vector<OrPushdownTag::Destination>> partitionChildDestinations(
     std::vector<OrPushdownTag::Destination> destinations) {
-    unordered_map<size_t, std::vector<OrPushdownTag::Destination>> childDestinations;
+    stdx::unordered_map<size_t, std::vector<OrPushdownTag::Destination>> childDestinations;
     for (auto&& dest : destinations) {
         invariant(!dest.route.empty());
         auto index = dest.route.front();
@@ -217,7 +219,40 @@ void getElemMatchOrPushdownDescendants(MatchExpression* node, std::vector<MatchE
         for (size_t i = 0; i < node->numChildren(); ++i) {
             getElemMatchOrPushdownDescendants(node->getChild(i), out);
         }
+    } else if (node->matchType() == MatchExpression::NOT) {
+        // The immediate child of NOT may be tagged, but there should be no tags deeper than this.
+        auto* childNode = node->getChild(0);
+        if (childNode->getTag() && childNode->getTag()->getType() == TagType::OrPushdownTag) {
+            out->push_back(node);
+        }
     }
+}
+
+// Attempts to push the given node down into the 'indexedOr' subtree. Returns true if the predicate
+// can subsequently be trimmed from the MatchExpression tree, false otherwise.
+bool processOrPushdownNode(MatchExpression* node, MatchExpression* indexedOr) {
+    // If the node is a negation, then its child is the predicate node that may be tagged.
+    auto* predNode = node->matchType() == MatchExpression::NOT ? node->getChild(0) : node;
+
+    // If the predicate node is not tagged for pushdown, return false immediately.
+    if (!predNode->getTag() || predNode->getTag()->getType() != TagType::OrPushdownTag) {
+        return false;
+    }
+    invariant(indexedOr);
+
+    // Predicate node is tagged for pushdown. Extract its route through the $or and its index tag.
+    auto* orPushdownTag = static_cast<OrPushdownTag*>(predNode->getTag());
+    auto destinations = orPushdownTag->releaseDestinations();
+    auto indexTag = orPushdownTag->releaseIndexTag();
+    predNode->setTag(nullptr);
+
+    // Attempt to push the node into the indexedOr, then re-set its tag to the indexTag.
+    const bool pushedDown = pushdownNode(node, indexedOr, std::move(destinations));
+    predNode->setTag(indexTag.release());
+
+    // Return true if we can trim the predicate. We could trim the node even if it had an index tag
+    // for this position, but that could make the index tagging of the tree wrong.
+    return pushedDown && !predNode->getTag();
 }
 
 // Finds all the nodes in the tree with OrPushdownTags and copies them to the Destinations specified
@@ -233,66 +268,19 @@ void resolveOrPushdowns(MatchExpression* tree) {
 
         for (size_t i = 0; i < andNode->numChildren(); ++i) {
             auto child = andNode->getChild(i);
-            if (child->getTag() && child->getTag()->getType() == TagType::OrPushdownTag) {
-                invariant(indexedOr);
-                OrPushdownTag* orPushdownTag = static_cast<OrPushdownTag*>(child->getTag());
-                auto destinations = orPushdownTag->releaseDestinations();
-                auto indexTag = orPushdownTag->releaseIndexTag();
-                child->setTag(nullptr);
-                if (pushdownNode(child, indexedOr, std::move(destinations)) && !indexTag) {
 
-                    // indexedOr can completely satisfy the predicate specified in child, so we can
-                    // trim it. We could remove the child even if it had an index tag for this
-                    // position, but that could make the index tagging of the tree wrong.
-                    auto ownedChild = andNode->removeChild(i);
-
-                    // We removed child i, so decrement the child index.
-                    --i;
-                } else {
-                    child->setTag(indexTag.release());
-                }
-            } else if (child->matchType() == MatchExpression::NOT && child->getChild(0)->getTag() &&
-                       child->getChild(0)->getTag()->getType() == TagType::OrPushdownTag) {
-                invariant(indexedOr);
-                OrPushdownTag* orPushdownTag =
-                    static_cast<OrPushdownTag*>(child->getChild(0)->getTag());
-                auto destinations = orPushdownTag->releaseDestinations();
-                auto indexTag = orPushdownTag->releaseIndexTag();
-                child->getChild(0)->setTag(nullptr);
-
-                // Push down the NOT and its child.
-                if (pushdownNode(child, indexedOr, std::move(destinations)) && !indexTag) {
-
-                    // indexedOr can completely satisfy the predicate specified in child, so we can
-                    // trim it. We could remove the child even if it had an index tag for this
-                    // position, but that could make the index tagging of the tree wrong.
-                    auto ownedChild = andNode->removeChild(i);
-
-                    // We removed child i, so decrement the child index.
-                    --i;
-                } else {
-                    child->getChild(0)->setTag(indexTag.release());
-                }
-            } else if (child->matchType() == MatchExpression::ELEM_MATCH_OBJECT) {
-
-                // Push down all descendants of child with OrPushdownTags.
+            // For ELEM_MATCH_OBJECT, we push down all tagged descendants. However, we cannot trim
+            // any of these predicates, since the $elemMatch filter must be applied in its entirety.
+            if (child->matchType() == MatchExpression::ELEM_MATCH_OBJECT) {
                 std::vector<MatchExpression*> orPushdownDescendants;
                 getElemMatchOrPushdownDescendants(child, &orPushdownDescendants);
-                if (!orPushdownDescendants.empty()) {
-                    invariant(indexedOr);
-                }
                 for (auto descendant : orPushdownDescendants) {
-                    OrPushdownTag* orPushdownTag =
-                        static_cast<OrPushdownTag*>(descendant->getTag());
-                    auto destinations = orPushdownTag->releaseDestinations();
-                    auto indexTag = orPushdownTag->releaseIndexTag();
-                    descendant->setTag(nullptr);
-                    pushdownNode(descendant, indexedOr, std::move(destinations));
-                    descendant->setTag(indexTag.release());
-
-                    // We cannot trim descendants of an $elemMatch object, since the filter must
-                    // be applied in its entirety.
+                    processOrPushdownNode(descendant, indexedOr);
                 }
+            } else if (processOrPushdownNode(child, indexedOr)) {
+                // The indexed $or can completely satisfy the child predicate, so we trim it.
+                auto ownedChild = andNode->removeChild(i);
+                --i;
             }
         }
     }

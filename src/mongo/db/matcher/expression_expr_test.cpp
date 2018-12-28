@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -42,6 +44,8 @@ namespace mongo {
 namespace {
 
 using unittest::assertGet;
+
+const double kNaN = std::numeric_limits<double>::quiet_NaN();
 
 class ExprMatchTest : public mongo::unittest::Test {
 public:
@@ -238,7 +242,6 @@ TEST_F(ExprMatchTest, OrMatchesCorrectly) {
     ASSERT_TRUE(matches(BSON("y" << 5)));
 
     ASSERT_FALSE(matches(BSON("x" << 10)));
-    ASSERT_FALSE(matches(BSON("y" << 1)));
 }
 
 TEST_F(ExprMatchTest, AndNestedWithinOrMatchesCorrectly) {
@@ -248,7 +251,6 @@ TEST_F(ExprMatchTest, AndNestedWithinOrMatchesCorrectly) {
     ASSERT_TRUE(matches(BSON("x" << 3 << "z" << 7)));
     ASSERT_TRUE(matches(BSON("y" << 1)));
 
-    ASSERT_FALSE(matches(BSON("x" << 3 << "z" << 3)));
     ASSERT_FALSE(matches(BSON("y" << 5)));
 }
 
@@ -416,6 +418,86 @@ TEST_F(ExprMatchTest, AndWithDistinctMatchAndNonMatchSubTreeMatchesCorrectly) {
     ASSERT_FALSE(matches(BSON("x" << 1 << "y" << 2)));
 }
 
+TEST_F(ExprMatchTest, ExprLtDoesNotUseTypeBracketing) {
+    createMatcher(fromjson("{$expr: {$lt: ['$x', true]}}"));
+
+    ASSERT_TRUE(matches(BSON("x" << false)));
+    ASSERT_TRUE(matches(BSON("x" << BSON("y" << 1))));
+    ASSERT_TRUE(matches(BSONObj()));
+
+    ASSERT_FALSE(matches(BSON("x" << Timestamp(0, 1))));
+}
+
+TEST_F(ExprMatchTest, NullMatchesCorrectly) {
+    createMatcher(fromjson("{$expr: {$eq: ['$x', null]}}"));
+
+    ASSERT_TRUE(matches(BSON("x" << BSONNULL)));
+
+    ASSERT_FALSE(matches(BSON("x" << BSONUndefined)));
+    ASSERT_FALSE(matches(BSONObj()));
+}
+
+TEST_F(ExprMatchTest, UndefinedMatchesCorrectly) {
+    createMatcher(fromjson("{$expr: {$eq: ['$x', undefined]}}"));
+
+    ASSERT_TRUE(matches(BSON("x" << BSONUndefined)));
+    ASSERT_TRUE(matches(BSONObj()));
+
+    ASSERT_FALSE(matches(BSON("x" << BSONNULL)));
+}
+
+
+TEST_F(ExprMatchTest, NaNMatchesCorrectly) {
+    createMatcher(fromjson("{$expr: {$eq: ['$x', NaN]}}"));
+
+    ASSERT_TRUE(matches(BSON("x" << kNaN)));
+
+    ASSERT_FALSE(matches(BSONObj()));
+    ASSERT_FALSE(matches(BSON("x" << 0)));
+    ASSERT_FALSE(matches(BSONObj()));
+
+    createMatcher(fromjson("{$expr: {$lt: ['$x', NaN]}}"));
+
+    ASSERT_TRUE(matches(BSONObj()));
+
+    ASSERT_FALSE(matches(BSON("x" << kNaN)));
+    ASSERT_FALSE(matches(BSON("x" << 0)));
+
+    createMatcher(fromjson("{$expr: {$lte: ['$x', NaN]}}"));
+
+    ASSERT_TRUE(matches(BSONObj()));
+    ASSERT_TRUE(matches(BSON("x" << kNaN)));
+
+    ASSERT_FALSE(matches(BSON("x" << 0)));
+
+    createMatcher(fromjson("{$expr: {$gt: ['$x', NaN]}}"));
+
+    ASSERT_TRUE(matches(BSON("x" << 0)));
+
+    ASSERT_FALSE(matches(BSON("x" << kNaN)));
+    ASSERT_FALSE(matches(BSONObj()));
+
+    createMatcher(fromjson("{$expr: {$gte: ['$x', NaN]}}"));
+
+    ASSERT_TRUE(matches(BSON("x" << 0)));
+    ASSERT_TRUE(matches(BSON("x" << kNaN)));
+
+    ASSERT_FALSE(matches(BSONObj()));
+}
+
+TEST_F(ExprMatchTest, MatchAgainstArrayIsCorrect) {
+    createMatcher(fromjson("{$expr: {$gt: ['$x', 4]}}"));
+
+    // Matches because BSONType Array is greater than BSONType double.
+    ASSERT_TRUE(matches(BSON("x" << BSON_ARRAY(1.0 << 2.0 << 3.0))));
+
+    createMatcher(fromjson("{$expr: {$eq: ['$x', [4]]}}"));
+
+    ASSERT_TRUE(matches(BSON("x" << BSON_ARRAY(4))));
+
+    ASSERT_FALSE(matches(BSON("x" << 4)));
+}
+
 TEST_F(ExprMatchTest, ComplexExprMatchesCorrectly) {
     createMatcher(
         fromjson("{"
@@ -491,6 +573,24 @@ TEST_F(ExprMatchTest, SetCollatorChangesCollationUsedForComparisons) {
                               << "cba")));
 }
 
+TEST_F(ExprMatchTest, FailGracefullyOnInvalidExpression) {
+    ASSERT_THROWS_CODE(createMatcher(fromjson("{$expr: {$anyElementTrue: undefined}}")),
+                       AssertionException,
+                       17041);
+    ASSERT_THROWS_CODE(
+        createMatcher(fromjson("{$and: [{x: 1},{$expr: {$anyElementTrue: undefined}}]}")),
+        AssertionException,
+        17041);
+    ASSERT_THROWS_CODE(
+        createMatcher(fromjson("{$or: [{x: 1},{$expr: {$anyElementTrue: undefined}}]}")),
+        AssertionException,
+        17041);
+    ASSERT_THROWS_CODE(
+        createMatcher(fromjson("{$nor: [{x: 1},{$expr: {$anyElementTrue: undefined}}]}")),
+        AssertionException,
+        17041);
+}
+
 TEST(ExprMatchTest, IdenticalPostOptimizedExpressionsAreEquivalent) {
     BSONObj expression = BSON("$expr" << BSON("$multiply" << BSON_ARRAY(2 << 2)));
     BSONObj expressionEquiv = BSON("$expr" << BSON("$const" << 4));
@@ -519,7 +619,7 @@ TEST(ExprMatchTest, IdenticalPostOptimizedExpressionsAreEquivalent) {
 TEST(ExprMatchTest, ExpressionOptimizeRewritesVariableDereferenceAsConstant) {
     const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto varId = expCtx->variablesParseState.defineVariable("var");
-    expCtx->variables.setValue(varId, Value(4));
+    expCtx->variables.setConstantValue(varId, Value(4));
 
     BSONObj expression = BSON("$expr"
                               << "$$var");
@@ -542,6 +642,46 @@ TEST(ExprMatchTest, ExpressionOptimizeRewritesVariableDereferenceAsConstant) {
     ASSERT_FALSE(pipelineExpr.equivalent(&pipelineExprNotEquiv));
 }
 
+TEST(ExprMatchTest, OptimizingIsANoopWhenAlreadyOptimized) {
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    BSONObj expression = fromjson("{$expr: {$eq: ['$a', 4]}}");
+
+    // Create and optimize an ExprMatchExpression.
+    std::unique_ptr<MatchExpression> singlyOptimized =
+        stdx::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
+    singlyOptimized = MatchExpression::optimize(std::move(singlyOptimized));
+
+    // We expect that the optimized 'matchExpr' is now an $and.
+    ASSERT(dynamic_cast<const AndMatchExpression*>(singlyOptimized.get()));
+
+    // We expect the twice-optimized match expression to be equivalent to the once-optimized one.
+    std::unique_ptr<MatchExpression> doublyOptimized =
+        stdx::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
+    for (size_t i = 0; i < 2u; ++i) {
+        doublyOptimized = MatchExpression::optimize(std::move(doublyOptimized));
+    }
+    ASSERT_TRUE(doublyOptimized->equivalent(singlyOptimized.get()));
+}
+
+TEST(ExprMatchTest, OptimizingAnAlreadyOptimizedCloneIsANoop) {
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    BSONObj expression = fromjson("{$expr: {$eq: ['$a', 4]}}");
+
+    // Create and optimize an ExprMatchExpression.
+    std::unique_ptr<MatchExpression> singlyOptimized =
+        stdx::make_unique<ExprMatchExpression>(expression.firstElement(), expCtx);
+    singlyOptimized = MatchExpression::optimize(std::move(singlyOptimized));
+
+    // We expect that the optimized 'matchExpr' is now an $and.
+    ASSERT(dynamic_cast<const AndMatchExpression*>(singlyOptimized.get()));
+
+    // Clone the match expression and optimize it again. We expect the twice-optimized match
+    // expression to be equivalent to the once-optimized one.
+    std::unique_ptr<MatchExpression> doublyOptimized = singlyOptimized->shallowClone();
+    doublyOptimized = MatchExpression::optimize(std::move(doublyOptimized));
+    ASSERT_TRUE(doublyOptimized->equivalent(singlyOptimized.get()));
+}
+
 TEST(ExprMatchTest, ShallowClonedExpressionIsEquivalentToOriginal) {
     BSONObj expression = BSON("$expr" << BSON("$eq" << BSON_ARRAY("$a" << 5)));
 
@@ -549,6 +689,29 @@ TEST(ExprMatchTest, ShallowClonedExpressionIsEquivalentToOriginal) {
     ExprMatchExpression pipelineExpr(expression.firstElement(), std::move(expCtx));
     auto shallowClone = pipelineExpr.shallowClone();
     ASSERT_TRUE(pipelineExpr.equivalent(shallowClone.get()));
+}
+
+TEST(ExprMatchTest, OptimizingExprAbsorbsAndOfAnd) {
+    BSONObj exprBson = fromjson("{$expr: {$and: [{$eq: ['$a', 1]}, {$eq: ['$b', 2]}]}}");
+
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matchExpr =
+        std::make_unique<ExprMatchExpression>(exprBson.firstElement(), std::move(expCtx));
+    auto optimized = MatchExpression::optimize(std::move(matchExpr));
+
+    // The optimized match expression should not have and AND children of AND nodes. This should be
+    // collapsed during optimization.
+    BSONObj serialized;
+    {
+        BSONObjBuilder builder;
+        optimized->serialize(&builder);
+        serialized = builder.obj();
+    }
+
+    BSONObj expectedSerialization = fromjson(
+        "{$and: [{$expr: {$and: [{$eq: ['$a', {$const: 1}]}, {$eq: ['$b', {$const: 2}]}]}},"
+        "{a: {$_internalExprEq: 1}}, {b: {$_internalExprEq: 2}}]}");
+    ASSERT_BSONOBJ_EQ(serialized, expectedSerialization);
 }
 
 }  // namespace

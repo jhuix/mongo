@@ -1,20 +1,19 @@
 load("jstests/sharding/move_chunk_with_session_helper.js");
 
 (function() {
-
     "use strict";
+
+    load("jstests/libs/retryable_writes_util.js");
+
+    if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
+        jsTestLog("Retryable writes are not supported, skipping test");
+        return;
+    }
 
     var checkFindAndModifyResult = function(expected, toCheck) {
         assert.eq(expected.ok, toCheck.ok);
         assert.eq(expected.value, toCheck.value);
-
-        // TODO: SERVER-30532: after adding upserted, just compare the entire lastErrorObject
-        var expectedLE = expected.lastErrorObject;
-        var toCheckLE = toCheck.lastErrorObject;
-
-        assert.neq(null, toCheckLE);
-        assert.eq(expected.updatedExisting, toCheck.updatedExisting);
-        assert.eq(expected.n, toCheck.n);
+        assert.eq(expected.lastErrorObject, toCheck.lastErrorObject);
     };
 
     var lsid = UUID();

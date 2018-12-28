@@ -97,13 +97,6 @@
     var bigString = new Array(3000).toString();
     assert.writeOK(m2.getCollection("test.foo").insert({m2: 994, m3: bigString}));
 
-    // createIndex with a >1024 byte field fails.
-    var twelfthOp = m2.getCollection("test.foo").getDB().getLastErrorObj().lastOp;
-    assert.commandFailed(m1.getCollection("test.foo").createIndex({m3: 1}));
-    noOp = m1.getCollection("test.foo").getDB().getLastErrorObj().lastOp;
-
-    assert.eq(noOp, twelfthOp);
-
     // No-op insert
     assert.writeOK(m1.getCollection("test.foo").insert({_id: 5, x: 5}));
     var thirteenthOp = m1.getCollection("test.foo").getDB().getLastErrorObj().lastOp;
@@ -130,5 +123,5 @@
     m1.getCollection("test.foo").update({m1: 1}, {$set: {m1: 4}});
     noOp = m1.getCollection("test.foo").getDB().getLastErrorObj().lastOp;
     assert.eq(noOp, fifthteenthOp);
-
+    replTest.stopSet();
 })();

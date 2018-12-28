@@ -15,16 +15,29 @@
  *  - The txnNumber for the first session id is the original value.
  *  - There is no record for the second session id.
  *  - A record for the third session id was created during oplog replay.
- *
  */
 (function() {
     "use strict";
+
+    // This test drops a collection in the config database, which is not allowed under a session. It
+    // also manually simulates a session, which is not compatible with implicit sessions.
+    TestData.disableImplicitSessions = true;
+
+    load("jstests/libs/retryable_writes_util.js");
+
+    if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
+        jsTestLog("Retryable writes are not supported, skipping test");
+        return;
+    }
 
     load("jstests/replsets/rslib.js");
 
     function assertSameRecordOnBothConnections(primary, secondary, lsid) {
         let primaryRecord = primary.getDB("config").transactions.findOne({"_id.id": lsid.id});
         let secondaryRecord = secondary.getDB("config").transactions.findOne({"_id.id": lsid.id});
+
+        jsTestLog("Primary record: " + tojson(primaryRecord));
+        jsTestLog("Secondary record: " + tojson(secondaryRecord));
 
         assert.eq(bsonWoCompare(primaryRecord, secondaryRecord),
                   0,
@@ -53,7 +66,6 @@
             {rsConfig: {arbiterOnly: true}}
         ],
         useBridge: true,
-        nodeOptions: {setParameter: {rollbackMethod: "rollbackViaRefetch"}}
     });
     let nodes = replTest.startSet();
     replTest.initiate();
@@ -214,7 +226,9 @@
     assert.eq(upstream.getDB("config").transactions.find().itcount(), 2);
 
     // Confirm the nodes are consistent.
+    replTest.checkOplogs();
     replTest.checkReplicatedDataHashes(testName);
+    replTest.checkCollectionCounts();
 
     replTest.stopSet();
 }());

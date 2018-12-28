@@ -1,30 +1,32 @@
 // mongo/shell/shell_utils_launcher.cpp
-/*
- *    Copyright 2010 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
@@ -58,8 +60,9 @@
 #include <unistd.h>
 #endif
 
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/destructor_guard.h"
@@ -259,7 +262,7 @@ void ProgramOutputMultiplexer::clear() {
     _buffer.str("");
 }
 
-ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env) {
+ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env, bool isMongo) {
     uassert(ErrorCodes::FailedToParse,
             "cannot pass an empty argument to ProgramRunner",
             !args.isEmpty());
@@ -271,14 +274,19 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env) {
     boost::filesystem::path programPath = findProgram(program);
     boost::filesystem::path programName = programPath.stem();
 
-    string prefix("mongod-");
-    bool isMongodProgram = string("mongod") == programName ||
-        programName.string().compare(0, prefix.size(), prefix) == 0;
-    prefix = "mongos-";
-    bool isMongosProgram = string("mongos") == programName ||
-        programName.string().compare(0, prefix.size(), prefix) == 0;
+    _pipe = -1;
+    _port = -1;
 
-    if (isMongodProgram) {
+    string prefix("mongod-");
+    bool isMongodProgram = isMongo && (string("mongod") == programName ||
+                                       programName.string().compare(0, prefix.size(), prefix) == 0);
+    prefix = "mongos-";
+    bool isMongosProgram = isMongo && (string("mongos") == programName ||
+                                       programName.string().compare(0, prefix.size(), prefix) == 0);
+
+    if (!isMongo) {
+        _name = "sh";
+    } else if (isMongodProgram) {
         _name = "d";
     } else if (isMongosProgram) {
         _name = "s";
@@ -290,11 +298,10 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env) {
 
     _argv.push_back(programPath.string());
 
-    _port = -1;
-
     // Parse individual arguments into _argv
     BSONObjIterator j(args);
     j.next();  // skip program name (handled above)
+
     while (j.more()) {
         BSONElement e = j.next();
         string str;
@@ -306,12 +313,14 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env) {
             verify(e.type() == mongo::String);
             str = e.valuestr();
         }
-        if (str == "--port") {
-            _port = -2;
-        } else if (_port == -2) {
-            _port = strtol(str.c_str(), 0, 10);
-        } else if (isMongodProgram && str == "--configsvr") {
-            _name = "c";
+        if (isMongo) {
+            if (str == "--port") {
+                _port = -2;
+            } else if (_port == -2) {
+                _port = strtol(str.c_str(), 0, 10);
+            } else if (isMongodProgram && str == "--configsvr") {
+                _name = "c";
+            }
         }
         _argv.push_back(str);
     }
@@ -361,10 +370,12 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env) {
         ++environEntry;
     }
 #endif
-    bool needsPort = isMongodProgram || isMongosProgram || (programName == "mongobridge");
+    bool needsPort =
+        isMongo && (isMongodProgram || isMongosProgram || (programName == "mongobridge"));
     if (!needsPort) {
         _port = -1;
     }
+
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "a port number is expected when running " << program
                           << " from the shell",
@@ -449,6 +460,7 @@ void ProgramRunner::start() {
 }
 
 void ProgramRunner::operator()() {
+    invariant(_pipe >= 0);
     // Send the never_close_handle flag so that we can handle closing the fd below with safeClose.
     boost::iostreams::stream_buffer<boost::iostreams::file_descriptor_source> fdBuf(
         _pipe, boost::iostreams::file_descriptor_flags::never_close_handle);
@@ -475,7 +487,18 @@ boost::filesystem::path ProgramRunner::findProgram(const string& prog) {
     // (e.g., mongorestore-2.4) or just <utility>. For windows, the appropriate extension
     // needs to be appended.
     //
-    if (p.extension() != ".exe") {
+
+    auto isExtensionValid = [](std::string extension) {
+        for (auto c : extension) {
+            if (std::isdigit(c)) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    if (!p.has_extension() || !isExtensionValid(p.extension().string())) {
         p = prog + ".exe";
     }
 #endif
@@ -765,7 +788,7 @@ BSONObj WaitProgram(const BSONObj& a, void* data) {
 // an array with all commandline tokens. The Object may have a field named "env" which contains an
 // object of Key Value pairs which will be loaded into the environment of the spawned process.
 BSONObj StartMongoProgram(const BSONObj& a, void* data) {
-    _nokillop = true;
+    shellGlobalParams.nokillop = true;
     BSONObj args = a;
     BSONObj env{};
     BSONElement firstElement = args.firstElement();
@@ -786,7 +809,7 @@ BSONObj StartMongoProgram(const BSONObj& a, void* data) {
         }
     }
 
-    ProgramRunner r(args, env);
+    ProgramRunner r(args, env, true);
     r.start();
     invariant(registry.isPidRegistered(r.pid()));
     stdx::thread t(r);
@@ -794,9 +817,9 @@ BSONObj StartMongoProgram(const BSONObj& a, void* data) {
     return BSON(string("") << r.pid().asLongLong());
 }
 
-BSONObj RunMongoProgram(const BSONObj& a, void* data) {
+BSONObj RunProgram(const BSONObj& a, void* data, bool isMongo) {
     BSONObj env{};
-    ProgramRunner r(a, env);
+    ProgramRunner r(a, env, isMongo);
     r.start();
     invariant(registry.isPidRegistered(r.pid()));
     stdx::thread t(r);
@@ -806,10 +829,21 @@ BSONObj RunMongoProgram(const BSONObj& a, void* data) {
     return BSON(string("") << exit_code);
 }
 
+BSONObj RunMongoProgram(const BSONObj& a, void* data) {
+    return RunProgram(a, data, true);
+}
+
+BSONObj RunNonMongoProgram(const BSONObj& a, void* data) {
+    return RunProgram(a, data, false);
+}
+
 BSONObj ResetDbpath(const BSONObj& a, void* data) {
     verify(a.nFields() == 1);
     string path = a.firstElement().valuestrsafe();
-    verify(!path.empty());
+    if (path.empty()) {
+        warning() << "ResetDbpath(): nothing to do, path was empty";
+        return undefinedReturn;
+    }
     if (boost::filesystem::exists(path))
         boost::filesystem::remove_all(path);
     boost::filesystem::create_directory(path);
@@ -819,7 +853,10 @@ BSONObj ResetDbpath(const BSONObj& a, void* data) {
 BSONObj PathExists(const BSONObj& a, void* data) {
     verify(a.nFields() == 1);
     string path = a.firstElement().valuestrsafe();
-    verify(!path.empty());
+    if (path.empty()) {
+        warning() << "PathExists(): path was empty";
+        return BSON(string("") << false);
+    };
     bool exists = boost::filesystem::exists(path);
     return BSON(string("") << exists);
 }
@@ -856,8 +893,10 @@ BSONObj CopyDbpath(const BSONObj& a, void* data) {
     BSONObjIterator i(a);
     string from = i.next().str();
     string to = i.next().str();
-    verify(!from.empty());
-    verify(!to.empty());
+    if (from.empty() || to.empty()) {
+        warning() << "CopyDbpath(): nothing to do, source or destination path(s) were empty";
+        return undefinedReturn;
+    }
     if (boost::filesystem::exists(to))
         boost::filesystem::remove_all(to);
     boost::filesystem::create_directory(to);
@@ -1040,6 +1079,23 @@ int KillMongoProgramInstances() {
     return returnCode;
 }
 
+std::vector<ProcessId> getRunningMongoChildProcessIds() {
+    std::vector<ProcessId> registeredPids, outPids;
+    registry.getRegisteredPids(registeredPids);
+    // Only return processes that are still alive. A client may have started a program using a mongo
+    // helper but terminated another way. E.g. if a mongod is started with MongoRunner.startMongod
+    // but exited with db.shutdownServer.
+    std::copy_if(registeredPids.begin(),
+                 registeredPids.end(),
+                 std::back_inserter(outPids),
+                 [](const ProcessId& pid) {
+                     const bool block = false;
+                     bool isDead = wait_for_pid(pid, block);
+                     return !isDead;
+                 });
+    return outPids;
+}
+
 MongoProgramScope::~MongoProgramScope() {
     DESTRUCTOR_GUARD(KillMongoProgramInstances(); ClearRawMongoProgramOutput(BSONObj(), 0);)
 }
@@ -1049,6 +1105,7 @@ void installShellUtilsLauncher(Scope& scope) {
     scope.injectNative("runProgram", RunMongoProgram);
     scope.injectNative("run", RunMongoProgram);
     scope.injectNative("_runMongoProgram", RunMongoProgram);
+    scope.injectNative("runNonMongoProgram", RunNonMongoProgram);
     scope.injectNative("_stopMongoProgram", StopMongoProgram);
     scope.injectNative("stopMongoProgramByPid", StopMongoProgramByPid);
     scope.injectNative("rawMongoProgramOutput", RawMongoProgramOutput);

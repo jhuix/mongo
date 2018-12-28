@@ -1,4 +1,10 @@
-// Where we test operations dealing with large chunks
+/**
+ * Where we test operations dealing with large chunks
+ *
+ * This test is labeled resource intensive because its total io_write is 220MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger.
+ * @tags: [resource_intensive]
+ */
 (function() {
     'use strict';
 
@@ -13,7 +19,7 @@
 
     // Turn on sharding on the 'test.foo' collection and generate a large chunk
     assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-    s.ensurePrimaryShard('test', 'shard0001');
+    s.ensurePrimaryShard('test', s.shard1.shardName);
 
     var bigString = "";
     while (bigString.length < 10000) {

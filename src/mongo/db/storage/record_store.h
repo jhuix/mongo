@@ -1,32 +1,32 @@
-// record_store.h
 
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
@@ -35,9 +35,9 @@
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/bson/mutable/damage_vector.h"
 #include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/record_data.h"
-#include "mongo/db/storage/record_fetcher.h"
 
 namespace mongo {
 
@@ -46,15 +46,28 @@ class Collection;
 struct CompactOptions;
 struct CompactStats;
 class MAdvise;
-class NamespaceDetails;
 class OperationContext;
-class RecordFetcher;
 
-class RecordStoreCompactAdaptor;
 class RecordStore;
 
 struct ValidateResults;
 class ValidateAdaptor;
+
+struct CompactOptions {
+    // padding
+    enum PaddingMode { PRESERVE, NONE, MANUAL } paddingMode = NONE;
+
+    // only used if _paddingMode == MANUAL
+    double paddingFactor = 1;  // what to multiple document size by
+    int paddingBytes = 0;      // what to add to ducment size after multiplication
+
+    // other
+    bool validateDocuments = true;
+
+    std::string toString() const;
+};
+
+struct CompactStats {};
 
 /**
  * Allows inserting a Record "in-place" without creating a copy ahead of time.
@@ -73,26 +86,11 @@ protected:
 };
 
 /**
- * @see RecordStore::updateRecord
- */
-class UpdateNotifier {
-public:
-    virtual ~UpdateNotifier() {}
-    virtual Status recordStoreGoingToUpdateInPlace(OperationContext* opCtx,
-                                                   const RecordId& loc) = 0;
-};
-
-/**
  * The data items stored in a RecordStore.
  */
 struct Record {
     RecordId id;
     RecordData data;
-};
-
-struct BsonRecord {
-    RecordId id;
-    const BSONObj* docPtr;
 };
 
 enum ValidateCmdLevel : int {
@@ -114,12 +112,12 @@ enum ValidateCmdLevel : int {
  * inside that context. Any cursor acquired inside a transaction is invalid outside
  * of that transaction, instead use the save and restore methods to reestablish the cursor.
  *
- * Any method other than invalidate and the save methods may throw WriteConflictException. If
- * that happens, the cursor may not be used again until it has been saved and successfully
- * restored. If next() or restore() throw a WCE the cursor's position will be the same as before
- * the call (strong exception guarantee). All other methods leave the cursor in a valid state
- * but with an unspecified position (basic exception guarantee). If any exception other than
- * WCE is thrown, the cursor must be destroyed, which is guaranteed not to leak any resources.
+ * Any method other than the save method may throw WriteConflictException. If that happens, the
+ * cursor may not be used again until it has been saved and successfully restored. If next() or
+ * restore() throw a WCE the cursor's position will be the same as before the call (strong exception
+ * guarantee). All other methods leave the cursor in a valid state but with an unspecified position
+ * (basic exception guarantee). If any exception other than WCE is thrown, the cursor must be
+ * destroyed, which is guaranteed not to leak any resources.
  *
  * Any returned unowned BSON is only valid until the next call to any method on this
  * interface.
@@ -149,7 +147,7 @@ public:
 
     /**
      * Moves forward and returns the new data or boost::none if there is no more data.
-     * Continues returning boost::none once it reaches EOF.
+     * Continues returning boost::none once it reaches EOF unlike stl iterators.
      */
     virtual boost::optional<Record> next() = 0;
 
@@ -169,9 +167,10 @@ public:
     /**
      * Recovers from potential state changes in underlying data.
      *
-     * Returns false if it is invalid to continue using this iterator. This usually means that
-     * capped deletes have caught up to the position of this iterator and continuing could
-     * result in missed data.
+     * Returns false if it is invalid to continue using this Cursor. This usually means that
+     * capped deletes have caught up to the position of this Cursor and continuing could
+     * result in missed data. Note that Cursors, unlike iterators can continue to iterate past the
+     * "end"
      *
      * If the former position no longer exists, but it is safe to continue iterating, the
      * following call to next() will return the next closest position in the direction of the
@@ -197,36 +196,6 @@ public:
      * "saved" state, so callers must still call restoreState to use this object.
      */
     virtual void reattachToOperationContext(OperationContext* opCtx) = 0;
-
-    /**
-     * Inform the cursor that this id is being invalidated. Must be called between save and restore.
-     * The opCtx is that of the operation causing the invalidation, not the opCtx using the cursor.
-     *
-     * WARNING: Storage engines other than MMAPv1 should use the default implementation,
-     *          and not depend on this being called.
-     */
-    virtual void invalidate(OperationContext* opCtx, const RecordId& id) {}
-
-    //
-    // RecordFetchers
-    //
-    // Storage engines which do not support document-level locking hold locks at collection or
-    // database granularity. As an optimization, these locks can be yielded when a record needs
-    // to be fetched from secondary storage. If this method returns non-NULL, then it indicates
-    // that the query system layer should yield its locks, following the protocol defined by the
-    // RecordFetcher class, so that a potential page fault is triggered out of the lock.
-    //
-    // Storage engines which support document-level locking need not implement this.
-    //
-    // TODO see if these can be replaced by WriteConflictException.
-    //
-
-    /**
-     * Returns a RecordFetcher if needed for a call to next() or none if unneeded.
-     */
-    virtual std::unique_ptr<RecordFetcher> fetcherForNext() const {
-        return {};
-    }
 };
 
 /**
@@ -261,19 +230,13 @@ public:
     virtual void saveUnpositioned() {
         save();
     }
-
-    /**
-     * Returns a RecordFetcher if needed to fetch the provided Record or none if unneeded.
-     */
-    virtual std::unique_ptr<RecordFetcher> fetcherForId(const RecordId& id) const {
-        return {};
-    }
 };
 
 /**
- * A RecordStore provides an abstraction used for storing documents in a collection,
- * or entries in an index. In storage engines implementing the KVEngine, record stores
- * are also used for implementing catalogs.
+ * An abstraction used for storing documents in a collection or entries in an index.
+ *
+ * In storage engines implementing the KVEngine, record stores are also used for implementing
+ * catalogs.
  *
  * Many methods take an OperationContext parameter. This contains the RecoveryUnit, with
  * all RecordStore specific transaction information, as well as the LockState. Methods that take
@@ -296,9 +259,19 @@ public:
     // name of the RecordStore implementation
     virtual const char* name() const = 0;
 
-    virtual const std::string& ns() const {
+    const std::string& ns() const {
         return _ns;
     }
+
+    void setNs(NamespaceString ns) {
+        _ns = ns.ns();
+    }
+
+    bool isTemp() const {
+        return ns().size() == 0;
+    }
+
+    virtual const std::string& getIdent() const = 0;
 
     /**
      * The dataSize is an approximation of the sum of the sizes (in bytes) of the
@@ -315,7 +288,7 @@ public:
     virtual bool isCapped() const = 0;
 
     virtual void setCappedCallback(CappedCallback*) {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     /**
@@ -332,15 +305,18 @@ public:
     /**
      * Get the RecordData at loc, which must exist.
      *
-     * If unowned data is returned, it is valid until the next modification of this Record or
-     * the lock on this collection is released.
+     * If unowned data is returned, it is only valid until either of these happens:
+     *  - The record is modified
+     *  - The snapshot from which it was obtained is abandoned
+     *  - The lock on the collection is released
      *
-     * In general, prefer findRecord or RecordCursor::seekExact since they can tell you if a
-     * record has been removed.
+     * In general, prefer findRecord or RecordCursor::seekExact since they can tell you if a record
+     * has been removed.
      */
-    virtual RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const {
+    RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const {
         RecordData data;
-        invariant(findRecord(opCtx, loc, &data));
+        invariant(findRecord(opCtx, loc, &data),
+                  str::stream() << "Didn't find RecordId " << loc << " in record store " << ns());
         return data;
     }
 
@@ -371,29 +347,26 @@ public:
 
     virtual void deleteRecord(OperationContext* opCtx, const RecordId& dl) = 0;
 
-    virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
-                                              const char* data,
-                                              int len,
-                                              Timestamp timestamp,
-                                              bool enforceQuota) = 0;
-
+    /**
+     * Inserts the specified records into this RecordStore by copying the passed-in record data and
+     * updates 'inOutRecords' to contain the ids of the inserted records.
+     */
     virtual Status insertRecords(OperationContext* opCtx,
-                                 std::vector<Record>* records,
-                                 std::vector<Timestamp>* timestamps,
-                                 bool enforceQuota) {
-        int index = 0;
-        for (auto& record : *records) {
-            StatusWith<RecordId> res = insertRecord(opCtx,
-                                                    record.data.data(),
-                                                    record.data.size(),
-                                                    (*timestamps)[index++],
-                                                    enforceQuota);
-            if (!res.isOK())
-                return res.getStatus();
+                                 std::vector<Record>* inOutRecords,
+                                 const std::vector<Timestamp>& timestamps) = 0;
 
-            record.id = res.getValue();
-        }
-        return Status::OK();
+    /**
+     * A thin wrapper around insertRecords() to simplify handling of single document inserts.
+     */
+    StatusWith<RecordId> insertRecord(OperationContext* opCtx,
+                                      const char* data,
+                                      int len,
+                                      Timestamp timestamp) {
+        std::vector<Record> inOutRecords{Record{RecordId(), RecordData(data, len)}};
+        Status status = insertRecords(opCtx, &inOutRecords, std::vector<Timestamp>{timestamp});
+        if (!status.isOK())
+            return status;
+        return inOutRecords.front().id;
     }
 
     /**
@@ -425,23 +398,13 @@ public:
     }
 
     /**
-     * @param notifier - Only used by record stores which do not support doc-locking. Called only
-     *                   in the case of an in-place update. Called just before the in-place write
-     *                   occurs.
-     * @return Status  - If a document move is required (MMAPv1 only) then a status of
-     *                   ErrorCodes::NeedsDocumentMove will be returned. On receipt of this status
-     *                   no update will be performed. It is the caller's responsibility to:
-     *                     1. Remove the existing document and associated index keys.
-     *                     2. Insert a new document and index keys.
-     *
-     * For capped record stores, the record size will never change.
+     * Updates the record with id 'recordId', replacing its contents with those described by
+     * 'data' and 'len'.
      */
     virtual Status updateRecord(OperationContext* opCtx,
-                                const RecordId& oldLocation,
+                                const RecordId& recordId,
                                 const char* data,
-                                int len,
-                                bool enforceQuota,
-                                UpdateNotifier* notifier) = 0;
+                                int len) = 0;
 
     /**
      * @return Returns 'false' if this record store does not implement
@@ -455,7 +418,7 @@ public:
     /**
      * Updates the record positioned at 'loc' in-place using the deltas described by 'damages'. The
      * 'damages' vector describes contiguous ranges of 'damageSource' from which to copy and apply
-     * byte-level changes to the data.
+     * byte-level changes to the data. Behavior is undefined for calling this on a non-existant loc.
      *
      * @return the updated version of the record. If unowned data is returned, then it is valid
      * until the next modification of this Record or the lock on the collection has been released.
@@ -501,17 +464,6 @@ public:
         return {};
     }
 
-    /**
-     * Returns many RecordCursors that partition the RecordStore into many disjoint sets.
-     * Iterating all returned RecordCursors is equivalent to iterating the full store.
-     */
-    virtual std::vector<std::unique_ptr<RecordCursor>> getManyCursors(
-        OperationContext* opCtx) const {
-        std::vector<std::unique_ptr<RecordCursor>> out(1);
-        out[0] = getCursor(opCtx);
-        return out;
-    }
-
     // higher level
 
 
@@ -543,20 +495,16 @@ public:
      * Only called if compactSupported() returns true.
      */
     virtual bool compactsInPlace() const {
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
 
     /**
      * Attempt to reduce the storage space used by this RecordStore.
      *
      * Only called if compactSupported() returns true.
-     * No RecordStoreCompactAdaptor will be passed if compactsInPlace() returns true.
      */
-    virtual Status compact(OperationContext* opCtx,
-                           RecordStoreCompactAdaptor* adaptor,
-                           const CompactOptions* options,
-                           CompactStats* stats) {
-        invariant(false);
+    virtual Status compact(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
     }
 
     /**
@@ -624,8 +572,15 @@ public:
      *
      * Since this is called inside of a WriteUnitOfWork while holding a std::mutex, it is
      * illegal to acquire any LockManager locks inside of this function.
+     *
+     * If `orderedCommit` is true, the storage engine can assume the input `opTime` has become
+     * visible in the oplog. Otherwise the storage engine must continue to maintain its own
+     * visibility management. Calls with `orderedCommit` true will not be concurrent with calls of
+     * `orderedCommit` false.
      */
-    virtual Status oplogDiskLocRegister(OperationContext* opCtx, const Timestamp& opTime) {
+    virtual Status oplogDiskLocRegister(OperationContext* opCtx,
+                                        const Timestamp& opTime,
+                                        bool orderedCommit) {
         return Status::OK();
     }
 
@@ -655,14 +610,6 @@ public:
 
 protected:
     std::string _ns;
-};
-
-class RecordStoreCompactAdaptor {
-public:
-    virtual ~RecordStoreCompactAdaptor() {}
-    virtual bool isDataValid(const RecordData& recData) = 0;
-    virtual size_t dataSize(const RecordData& recData) = 0;
-    virtual void inserted(const RecordData& recData, const RecordId& newLocation) = 0;
 };
 
 struct ValidateResults {

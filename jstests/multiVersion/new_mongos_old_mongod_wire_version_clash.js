@@ -10,6 +10,9 @@
  * ErrorCodes.IncompatibleServerVersion here would generally be an improvement.
  */
 
+// Checking UUID consistency involves talking to a shard node, which in this test is shutdown
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+
 (function() {
 
     'use strict';
@@ -23,6 +26,7 @@
         other: {
             mongosOptions: {binVersion: 'last-stable'},
             shardOptions: {binVersion: 'last-stable'},
+            shardAsReplicaSet: false
         }
     });
 

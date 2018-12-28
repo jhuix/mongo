@@ -1,25 +1,27 @@
 // expression_parser.h
 
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -61,6 +63,7 @@ enum class PathAcceptingKeyword {
     GEO_NEAR,
     GREATER_THAN,
     GREATER_THAN_OR_EQUAL,
+    INTERNAL_EXPR_EQ,
     INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
     INTERNAL_SCHEMA_EQ,
     INTERNAL_SCHEMA_FMOD,
@@ -105,13 +108,6 @@ public:
         AllowedFeatures::kExpr | AllowedFeatures::kJSONSchema;
 
     /**
-     * Constant double representation of 2^63.
-     */
-    static const double kLongLongMaxPlusOneAsDouble;
-
-    static constexpr StringData kAggExpression = "$expr"_sd;
-
-    /**
      * Parses PathAcceptingKeyword from 'typeElem'. Returns 'defaultKeyword' if 'typeElem'
      * doesn't represent a known type, or represents PathAcceptingKeyword::EQUALITY which is not
      * handled by this parser (see SERVER-19565).
@@ -120,22 +116,14 @@ public:
         BSONElement typeElem, boost::optional<PathAcceptingKeyword> defaultKeyword = boost::none);
 
     /**
-     * caller has to maintain ownership obj
-     * the tree has views (BSONElement) into obj
+     * Caller has to maintain ownership of 'obj'.
+     * The tree has views (BSONElement) into 'obj'.
      */
     static StatusWithMatchExpression parse(
         const BSONObj& obj,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const ExtensionsCallback& extensionsCallback = ExtensionsCallbackNoop(),
-        AllowedFeatureSet allowedFeatures = kDefaultSpecialFeatures) {
-        invariant(expCtx.get());
-        try {
-            return MatchExpressionParser(&extensionsCallback)
-                ._parse(obj, expCtx, allowedFeatures, DocumentParseLevel::kPredicateTopLevel);
-        } catch (const DBException& ex) {
-            return {ex.toStatus()};
-        }
-    }
+        AllowedFeatureSet allowedFeatures = kDefaultSpecialFeatures);
 
     /**
      * Parses a BSONElement of any numeric type into a positive long long, failing if the value
@@ -158,216 +146,13 @@ public:
      */
     static StatusWith<long long> parseIntegerElementToLong(BSONElement elem);
 
-private:
     /**
-     * 'DocumentParseLevel' refers to the current position of the parser as it descends a
-     *  MatchExpression tree.
+     * Parses a BSONElement of any numeric type into an integer, failing if the value is:
+     *
+     * - NaN
+     * - a non-integral number
+     * - too large in the positive or negative direction to fit in an int
      */
-    enum class DocumentParseLevel {
-        // Indicates that the parser is looking at the root level of the BSON object containing the
-        // user's query predicate.
-        kPredicateTopLevel,
-        // Indicates that match expression nodes in this position will match against the complete
-        // user document, as opposed to matching against a nested document or a subdocument inside
-        // an array.
-        kUserDocumentTopLevel,
-        // Indicates that match expression nodes in this position will match against a nested
-        // document or a subdocument inside an array.
-        kUserSubDocument,
-    };
-
-    MatchExpressionParser(const ExtensionsCallback* extensionsCallback)
-        : _extensionsCallback(extensionsCallback) {}
-
-    /**
-     * 5 = false
-     * { a : 5 } = false
-     * { $lt : 5 } = true
-     * { $ref: "s", $id: "x" } = false
-     * { $ref: "s", $id: "x", $db: "mydb" } = false
-     * { $ref : "s" } = false (if incomplete DBRef is allowed)
-     * { $id : "x" } = false (if incomplete DBRef is allowed)
-     * { $db : "mydb" } = false (if incomplete DBRef is allowed)
-     */
-    bool _isExpressionDocument(const BSONElement& e, bool allowIncompleteDBRef);
-
-    /**
-     * { $ref: "s", $id: "x" } = true
-     * { $ref : "s" } = true (if incomplete DBRef is allowed)
-     * { $id : "x" } = true (if incomplete DBRef is allowed)
-     * { $db : "x" } = true (if incomplete DBRef is allowed)
-     */
-    bool _isDBRefDocument(const BSONObj& obj, bool allowIncompleteDBRef);
-
-    /**
-     * Parse 'obj' and return either a MatchExpression or an error.
-     */
-    StatusWithMatchExpression _parse(const BSONObj& obj,
-                                     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                     AllowedFeatureSet allowedFeatures,
-                                     DocumentParseLevel currentLevel);
-
-    /**
-     * parses a field in a sub expression
-     * if the query is { x : { $gt : 5, $lt : 8 } }
-     * obj is { $gt : 5, $lt : 8 }
-     */
-    Status _parseSub(const char* name,
-                     const BSONObj& obj,
-                     AndMatchExpression* root,
-                     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                     AllowedFeatureSet allowedFeatures,
-                     DocumentParseLevel currentLevel);
-
-    /**
-     * parses a single field in a sub expression
-     * if the query is { x : { $gt : 5, $lt : 8 } }
-     * e is $gt : 5
-     */
-    StatusWithMatchExpression _parseSubField(const BSONObj& context,
-                                             const AndMatchExpression* andSoFar,
-                                             const char* name,
-                                             const BSONElement& e,
-                                             const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                             AllowedFeatureSet allowedFeatures,
-                                             DocumentParseLevel currentLevel);
-
-    StatusWithMatchExpression _parseComparison(
-        const char* name,
-        ComparisonMatchExpression* cmp,
-        const BSONElement& e,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        AllowedFeatureSet allowedFeatures);
-
-    StatusWithMatchExpression _parseMOD(const char* name, const BSONElement& e);
-
-    StatusWithMatchExpression _parseRegexElement(const char* name, const BSONElement& e);
-
-    StatusWithMatchExpression _parseRegexDocument(const char* name, const BSONObj& doc);
-
-    Status _parseInExpression(InMatchExpression* entries,
-                              const BSONObj& theArray,
-                              const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    template <class T>
-    StatusWithMatchExpression _parseType(const char* name, const BSONElement& elt);
-
-    StatusWithMatchExpression _parseGeo(const char* name,
-                                        PathAcceptingKeyword type,
-                                        const BSONObj& section,
-                                        AllowedFeatureSet allowedFeatures);
-
-    StatusWithMatchExpression _parseExpr(BSONElement elem,
-                                         AllowedFeatureSet allowedFeatures,
-                                         const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    // arrays
-
-    StatusWithMatchExpression _parseElemMatch(const char* name,
-                                              const BSONElement& e,
-                                              const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                              AllowedFeatureSet allowedFeatures);
-
-    StatusWithMatchExpression _parseAll(const char* name,
-                                        const BSONElement& e,
-                                        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                        AllowedFeatureSet allowedFeatures);
-
-    // tree
-
-    Status _parseTreeList(const BSONObj& arr,
-                          ListOfMatchExpression* out,
-                          const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                          AllowedFeatureSet allowedFeatures,
-                          DocumentParseLevel currentLevel);
-
-    StatusWithMatchExpression _parseNot(const char* name,
-                                        const BSONElement& e,
-                                        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                        AllowedFeatureSet allowedFeatures,
-                                        DocumentParseLevel currentLevel);
-
-    /**
-     * Parses 'e' into a BitTestMatchExpression.
-     */
-    template <class T>
-    StatusWithMatchExpression _parseBitTest(const char* name, const BSONElement& e);
-
-    /**
-     * Converts 'theArray', a BSONArray of integers, into a std::vector of integers.
-     */
-    StatusWith<std::vector<uint32_t>> _parseBitPositionsArray(const BSONObj& theArray);
-
-    StatusWithMatchExpression _parseInternalSchemaFmod(const char* name, const BSONElement& e);
-
-    /**
-     * Looks at the field named 'exprWithPlaceholderFieldName' within 'containingObject' and parses
-     * an ExpressionWithPlaceholder from that element. Fails if an error occurs during parsing, or
-     * if the ExpressionWithPlaceholder has a different name placeholder than 'expectedPlaceholder'.
-     * 'expressionName' is the name of the expression that requires the ExpressionWithPlaceholder
-     * and is used to generate helpful error messages.
-     */
-    StatusWith<std::unique_ptr<ExpressionWithPlaceholder>> _parseExprWithPlaceholder(
-        const BSONObj& containingObject,
-        StringData exprWithPlaceholderFieldName,
-        StringData expressionName,
-        StringData expectedPlaceholder,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        AllowedFeatureSet allowedFeatures,
-        DocumentParseLevel currentLevel);
-
-    StatusWith<std::vector<InternalSchemaAllowedPropertiesMatchExpression::PatternSchema>>
-    _parsePatternProperties(BSONElement patternPropertiesElem,
-                            StringData expectedPlaceholder,
-                            const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                            AllowedFeatureSet allowedFeatures,
-                            DocumentParseLevel currentLevel);
-
-    /**
-     * Parses a MatchExpression which takes a fixed-size array of MatchExpressions as arguments.
-     */
-    template <class T>
-    StatusWithMatchExpression _parseInternalSchemaFixedArityArgument(
-        StringData name,
-        const BSONElement& elem,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        AllowedFeatureSet allowedFeatures,
-        DocumentParseLevel currentLevel);
-
-    /**
-     * Parses the given BSONElement into a single integer argument and creates a MatchExpression
-     * of type 'T' that gets initialized with the resulting integer.
-     */
-    template <class T>
-    StatusWithMatchExpression _parseInternalSchemaSingleIntegerArgument(
-        const char* name, const BSONElement& elem) const;
-
-    /**
-     * Same as the  _parseInternalSchemaSingleIntegerArgument function, but for top-level
-     * operators which don't have paths.
-     */
-    template <class T>
-    StatusWithMatchExpression _parseTopLevelInternalSchemaSingleIntegerArgument(
-        const BSONElement& elem) const;
-
-    /**
-     * Parses 'elem' into an InternalSchemaMatchArrayIndexMatchExpression.
-     */
-    StatusWithMatchExpression _parseInternalSchemaMatchArrayIndex(
-        const char* path,
-        const BSONElement& elem,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        AllowedFeatureSet allowedFeatures,
-        DocumentParseLevel currentLevel);
-
-    StatusWithMatchExpression _parseInternalSchemaAllowedProperties(
-        const BSONElement& elem,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        AllowedFeatureSet allowedFeatures,
-        DocumentParseLevel currentLevel);
-
-    // Performs parsing for the match extensions. We do not own this pointer - it has to live
-    // as long as the parser is active.
-    const ExtensionsCallback* _extensionsCallback;
+    static StatusWith<int> parseIntegerElementToInt(BSONElement elem);
 };
 }  // namespace mongo

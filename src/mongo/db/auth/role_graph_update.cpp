@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -203,18 +205,15 @@ Status handleOplogUpdate(OperationContext* opCtx,
         return status;
 
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, nullptr));
-    UpdateDriver::Options updateOptions(std::move(expCtx));
-    updateOptions.modOptions.fromOplogApplication = true;
-    UpdateDriver driver(updateOptions);
+    UpdateDriver driver(std::move(expCtx));
+    driver.setFromOplogApplication(true);
 
     // Oplog updates do not have array filters.
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
-    status = driver.parse(updatePattern, arrayFilters);
-    if (!status.isOK())
-        return status;
+    driver.parse(updatePattern, arrayFilters);
 
     mutablebson::Document roleDocument;
-    status = AuthorizationManager::getBSONForRole(roleGraph, roleToUpdate, roleDocument.root());
+    status = RoleGraph::getBSONForRole(roleGraph, roleToUpdate, roleDocument.root());
     if (status == ErrorCodes::RoleNotFound) {
         // The query pattern will only contain _id, no other immutable fields are present
         const FieldRef idFieldRef("_id");
@@ -226,13 +225,9 @@ Status handleOplogUpdate(OperationContext* opCtx,
     if (!status.isOK())
         return status;
 
-    // The original document can be empty because it is only needed for validation of immutable
-    // paths.
-    const BSONObj emptyOriginal;
     const bool validateForStorage = false;
     const FieldRefSet emptyImmutablePaths;
-    status = driver.update(
-        StringData(), emptyOriginal, &roleDocument, validateForStorage, emptyImmutablePaths);
+    status = driver.update(StringData(), &roleDocument, validateForStorage, emptyImmutablePaths);
     if (!status.isOK())
         return status;
 
@@ -300,10 +295,11 @@ Status handleOplogCommand(RoleGraph* roleGraph, const BSONObj& cmdObj) {
         }
         return Status::OK();
     }
+
     if (cmdName == "dropIndexes" || cmdName == "deleteIndexes") {
         return Status::OK();
     }
-    if ((cmdName == "collMod" || cmdName == "emptycapped") &&
+    if ((cmdName == "collMod" || cmdName == "emptycapped" || cmdName == "createIndexes") &&
         cmdObj.firstElement().str() != rolesCollectionNamespace.coll()) {
         // We don't care about these if they're not on the roles collection.
         return Status::OK();

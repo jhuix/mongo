@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -30,7 +30,7 @@ __drop_file(
 	WT_RET(__wt_schema_backup_check(session, filename));
 	/* Close all btree handles associated with this file. */
 	WT_WITH_HANDLE_LIST_WRITE_LOCK(session,
-	    ret = __wt_conn_dhandle_close_all(session, uri, force));
+	    ret = __wt_conn_dhandle_close_all(session, uri, true, force));
 	WT_RET(ret);
 
 	/* Remove the metadata entry (ignore missing items). */
@@ -124,7 +124,14 @@ __drop_table(
 	 * being reopened while it is being dropped.  One issue is that the
 	 * WT_WITHOUT_LOCKS macro can drop and reacquire the global table lock,
 	 * avoiding deadlocks while waiting for LSM operation to quiesce.
+	 *
+	 * Temporarily getting the table exclusively serves the purpose
+	 * of ensuring that cursors on the table that are already open
+	 * must at least be closed before this call proceeds.
 	 */
+	WT_ERR(__wt_schema_get_table_uri(session, uri, true,
+	    WT_DHANDLE_EXCLUSIVE, &table));
+	WT_ERR(__wt_schema_release_table(session, table));
 	WT_ERR(__wt_schema_get_table_uri(session, uri, true, 0, &table));
 
 	/* Drop the column groups. */
@@ -175,11 +182,11 @@ err:	if (table != NULL && !tracked)
 }
 
 /*
- * __wt_schema_drop --
+ * __schema_drop --
  *	Process a WT_SESSION::drop operation for all supported types.
  */
-int
-__wt_schema_drop(WT_SESSION_IMPL *session, const char *uri, const char *cfg[])
+static int
+__schema_drop(WT_SESSION_IMPL *session, const char *uri, const char *cfg[])
 {
 	WT_CONFIG_ITEM cval;
 	WT_DATA_SOURCE *dsrc;
@@ -221,5 +228,21 @@ __wt_schema_drop(WT_SESSION_IMPL *session, const char *uri, const char *cfg[])
 
 	WT_TRET(__wt_meta_track_off(session, true, ret != 0));
 
+	return (ret);
+}
+
+/*
+ * __wt_schema_drop --
+ *	Process a WT_SESSION::drop operation for all supported types.
+ */
+int
+__wt_schema_drop(WT_SESSION_IMPL *session, const char *uri, const char *cfg[])
+{
+	WT_DECL_RET;
+	WT_SESSION_IMPL *int_session;
+
+	WT_RET(__wt_schema_internal_session(session, &int_session));
+	ret = __schema_drop(int_session, uri, cfg);
+	WT_TRET(__wt_schema_session_release(session, int_session));
 	return (ret);
 }

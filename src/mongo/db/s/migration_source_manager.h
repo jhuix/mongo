@@ -1,46 +1,47 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include <string>
+#include <boost/optional.hpp>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/db/s/metadata_manager.h"
-#include "mongo/s/move_chunk_request.h"
-#include "mongo/s/shard_key_pattern.h"
-#include "mongo/util/concurrency/notification.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/migration_chunk_cloner_source.h"
+#include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
-class MigrationChunkClonerSource;
 class OperationContext;
+struct ShardingStatistics;
 
 /**
  * The donor-side migration state machine. This object must be created and owned by a single thread,
@@ -71,6 +72,11 @@ class MigrationSourceManager {
     MONGO_DISALLOW_COPYING(MigrationSourceManager);
 
 public:
+    static MigrationSourceManager* get(CollectionShardingRuntime& csr);
+    static MigrationSourceManager* get(CollectionShardingRuntime* csr) {
+        return get(*csr);
+    }
+
     /**
      * Instantiates a new migration source manager with the specified migration parameters. Must be
      * called with the distributed lock acquired in advance (not asserted).
@@ -157,13 +163,6 @@ public:
     void cleanupOnError(OperationContext* opCtx);
 
     /**
-     * Returns the key pattern object for the stored committed metadata.
-     */
-    BSONObj getKeyPattern() const {
-        return _keyPattern;
-    }
-
-    /**
      * Returns the cloner which is being used for this migration. This value is available only if
      * the migration source manager is currently in the clone phase (i.e. the previous call to
      * startClone has succeeded).
@@ -173,16 +172,6 @@ public:
     MigrationChunkClonerSource* getCloner() const {
         return _cloneDriver.get();
     }
-
-    /**
-     * Retrieves a critical section object to wait on. Will return nullptr if the migration is not
-     * yet in the critical section or if the caller is a reader and the migration is still in the
-     * process of transferring the last batch of chunk modifications.
-     *
-     * Must be called with some form of lock on the collection namespace.
-     */
-    std::shared_ptr<Notification<void>> getMigrationCriticalSectionSignal(
-        bool isForReadOnlyOperation) const;
 
     /**
      * Returns a report on the active migration.
@@ -195,6 +184,16 @@ private:
     // Used to track the current state of the source manager. See the methods above, which have
     // comments explaining the various state transitions.
     enum State { kCreated, kCloning, kCloneCaughtUp, kCriticalSection, kCloneCompleted, kDone };
+
+    ScopedCollectionMetadata _getCurrentMetadataAndCheckEpoch(OperationContext* opCtx);
+
+    /**
+     * If this donation moves the first chunk to the recipient (i.e., the recipient didn't have any
+     * chunks), this function writes a no-op message to the oplog, so that change stream will notice
+     * that and close the cursor in order to notify mongos to target the new shard as well.
+     */
+    void _notifyChangeStreamsOnRecipientFirstChunk(OperationContext* opCtx,
+                                                   const ScopedCollectionMetadata& metadata);
 
     /**
      * Called when any of the states fails. May only be called once and will put the migration
@@ -211,21 +210,25 @@ private:
     // The resolved primary of the recipient shard
     const HostAndPort _recipientHost;
 
-    // Gets initialized at creation time and will time the entire move chunk operation
-    const Timer _startTime;
+    // Stores a reference to the process sharding statistics object which needs to be updated
+    ShardingStatistics& _stats;
+
+    // Times the entire moveChunk operation
+    const Timer _entireOpTimer;
+
+    // Starts counting from creation time and is used to time various parts from the lifetime of the
+    // move chunk sequence
+    Timer _cloneAndCommitTimer;
 
     // The current state. Used only for diagnostics and validation.
     State _state{kCreated};
 
-    // The cached collection metadata at the time the migration started.
-    ScopedCollectionMetadata _collectionMetadata;
-
-    // The key pattern of the collection whose chunks are being moved.
-    BSONObj _keyPattern;
+    // The version of the collection at the time migration started.
+    OID _collectionEpoch;
 
     // The UUID of the the collection whose chunks are being moved. Default to empty if the
     // collection doesn't have UUID.
-    UUID _collectionUuid;
+    boost::optional<UUID> _collectionUuid;
 
     // The chunk cloner source. Only available if there is an active migration going on. To set and
     // remove it, global S lock needs to be acquired first in order to block all logOp calls and
@@ -233,18 +236,10 @@ private:
     // completed.
     std::unique_ptr<MigrationChunkClonerSource> _cloneDriver;
 
-    // Whether the source manager is in a critical section. Tracked as a shared pointer so that
-    // callers don't have to hold collection lock in order to wait on it. Available after the
-    // critical section stage has completed.
-    std::shared_ptr<Notification<void>> _critSecSignal;
+    // The statistics about a chunk migration to be included in moveChunk.commit
+    BSONObj _recipientCloneCounts;
 
-    // Used to delay blocking reads up until the commit of the metadata on the config server needs
-    // to happen. This allows the shard to serve reads during transfer of the last batch of mods in
-    // the migration critical section.
-    //
-    // The transition from false to true is protected by the collection X-lock, which happens just
-    // before the config server metadata commit is scheduled.
-    bool _readsShouldWaitOnCritSec{false};
+    boost::optional<CollectionCriticalSection> _critSec;
 };
 
 }  // namespace mongo

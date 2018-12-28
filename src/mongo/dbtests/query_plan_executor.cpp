@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 
@@ -99,9 +101,8 @@ public:
         Collection* coll,
         BSONObj& filterObj,
         PlanExecutor::YieldPolicy yieldPolicy = PlanExecutor::YieldPolicy::YIELD_MANUAL,
-        TailableMode tailableMode = TailableMode::kNormal) {
+        TailableModeEnum tailableMode = TailableModeEnum::kNormal) {
         CollectionScanParams csparams;
-        csparams.collection = coll;
         csparams.direction = CollectionScanParams::FORWARD;
         unique_ptr<WorkingSet> ws(new WorkingSet());
 
@@ -116,7 +117,7 @@ public:
 
         // Make the stage.
         unique_ptr<PlanStage> root(
-            new CollectionScan(&_opCtx, csparams, ws.get(), cq.get()->root()));
+            new CollectionScan(&_opCtx, coll, csparams, ws.get(), cq.get()->root()));
 
         // Hand the plan off to the executor.
         auto statusWithPlanExecutor = PlanExecutor::make(
@@ -141,13 +142,12 @@ public:
                                                                       int start,
                                                                       int end) {
         // Build the index scan stage.
-        IndexScanParams ixparams;
-        ixparams.descriptor = getIndex(db, indexSpec);
+        auto descriptor = getIndex(db, indexSpec);
+        IndexScanParams ixparams(&_opCtx, descriptor);
         ixparams.bounds.isSimpleRange = true;
         ixparams.bounds.startKey = BSON("" << start);
         ixparams.bounds.endKey = BSON("" << end);
         ixparams.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
-        ixparams.direction = 1;
 
         const Collection* coll = db->getCollection(&_opCtx, nss);
 
@@ -177,9 +177,9 @@ protected:
     OperationContext& _opCtx = *_opCtxPtr;
 
 private:
-    IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
+    const IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
         Collection* collection = db->getCollection(&_opCtx, nss);
-        std::vector<IndexDescriptor*> indexes;
+        std::vector<const IndexDescriptor*> indexes;
         collection->getIndexCatalog()->findIndexesByKeyPattern(&_opCtx, obj, false, &indexes);
         ASSERT_LTE(indexes.size(), 1U);
         return indexes.size() == 0 ? nullptr : indexes[0];
@@ -189,55 +189,10 @@ private:
 };
 
 /**
- * Test dropping the collection while the
- * PlanExecutor is doing a collection scan.
- */
-TEST_F(PlanExecutorTest, DropCollScan) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
-    insert(BSON("_id" << 1));
-    insert(BSON("_id" << 2));
-
-    BSONObj filterObj = fromjson("{_id: {$gt: 0}}");
-
-    Collection* coll = ctx.getCollection();
-    auto exec = makeCollScanExec(coll, filterObj);
-
-    BSONObj objOut;
-    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, NULL));
-    ASSERT_EQUALS(1, objOut["_id"].numberInt());
-
-    // After dropping the collection, the plan executor should be dead.
-    dropCollection();
-    ASSERT_EQUALS(PlanExecutor::DEAD, exec->getNext(&objOut, NULL));
-}
-
-/**
- * Test dropping the collection while the PlanExecutor is doing an index scan.
- */
-TEST_F(PlanExecutorTest, DropIndexScan) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
-    insert(BSON("_id" << 1 << "a" << 6));
-    insert(BSON("_id" << 2 << "a" << 7));
-    insert(BSON("_id" << 3 << "a" << 8));
-    BSONObj indexSpec = BSON("a" << 1);
-    addIndex(indexSpec);
-
-    auto exec = makeIndexScanExec(ctx.db(), indexSpec, 7, 10);
-
-    BSONObj objOut;
-    ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, NULL));
-    ASSERT_EQUALS(7, objOut["a"].numberInt());
-
-    // After dropping the collection, the plan executor should be dead.
-    dropCollection();
-    ASSERT_EQUALS(PlanExecutor::DEAD, exec->getNext(&objOut, NULL));
-}
-
-/**
  * Test dropping the collection while an agg PlanExecutor is doing an index scan.
  */
 TEST_F(PlanExecutorTest, DropIndexScanAgg) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
 
     insert(BSON("_id" << 1 << "a" << 6));
     insert(BSON("_id" << 2 << "a" << 7));
@@ -282,7 +237,7 @@ TEST_F(PlanExecutorTest, DropIndexScanAgg) {
 }
 
 TEST_F(PlanExecutorTest, ShouldReportErrorIfExceedsTimeLimitDuringYield) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     insert(BSON("_id" << 1));
     insert(BSON("_id" << 2));
 
@@ -296,8 +251,8 @@ TEST_F(PlanExecutorTest, ShouldReportErrorIfExceedsTimeLimitDuringYield) {
     ASSERT_EQ(ErrorCodes::ExceededTimeLimit, WorkingSetCommon::getMemberObjectStatus(resultObj));
 }
 
-TEST_F(PlanExecutorTest, ShouldReportEOFIfExceedsTimeLimitDuringYieldButIsTailableAndAwaitData) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYieldButIsTailableAndAwaitData) {
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     insert(BSON("_id" << 1));
     insert(BSON("_id" << 2));
 
@@ -307,14 +262,15 @@ TEST_F(PlanExecutorTest, ShouldReportEOFIfExceedsTimeLimitDuringYieldButIsTailab
     auto exec = makeCollScanExec(coll,
                                  filterObj,
                                  PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT,
-                                 TailableMode::kTailableAndAwaitData);
+                                 TailableModeEnum::kTailableAndAwaitData);
 
     BSONObj resultObj;
-    ASSERT_EQ(PlanExecutor::IS_EOF, exec->getNext(&resultObj, nullptr));
+    ASSERT_EQ(PlanExecutor::DEAD, exec->getNext(&resultObj, nullptr));
+    ASSERT_EQ(ErrorCodes::ExceededTimeLimit, WorkingSetCommon::getMemberObjectStatus(resultObj));
 }
 
 TEST_F(PlanExecutorTest, ShouldNotSwallowExceedsTimeLimitDuringYieldButIsTailableButNotAwaitData) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     insert(BSON("_id" << 1));
     insert(BSON("_id" << 2));
 
@@ -322,7 +278,7 @@ TEST_F(PlanExecutorTest, ShouldNotSwallowExceedsTimeLimitDuringYieldButIsTailabl
 
     Collection* coll = ctx.getCollection();
     auto exec = makeCollScanExec(
-        coll, filterObj, PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT, TailableMode::kTailable);
+        coll, filterObj, PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT, TailableModeEnum::kTailable);
 
     BSONObj resultObj;
     ASSERT_EQ(PlanExecutor::DEAD, exec->getNext(&resultObj, nullptr));
@@ -330,7 +286,7 @@ TEST_F(PlanExecutorTest, ShouldNotSwallowExceedsTimeLimitDuringYieldButIsTailabl
 }
 
 TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYield) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     insert(BSON("_id" << 1));
     insert(BSON("_id" << 2));
 
@@ -394,7 +350,7 @@ protected:
  * scan.
  */
 TEST_F(PlanExecutorSnapshotTest, SnapshotControl) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     setupCollection();
 
     BSONObj filterObj = fromjson("{a: {$gte: 2}}");
@@ -418,7 +374,7 @@ TEST_F(PlanExecutorSnapshotTest, SnapshotControl) {
  * index scan.
  */
 TEST_F(PlanExecutorSnapshotTest, SnapshotTest) {
-    OldClientWriteContext ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     setupCollection();
     BSONObj indexSpec = BSON("_id" << 1);
     addIndex(indexSpec);

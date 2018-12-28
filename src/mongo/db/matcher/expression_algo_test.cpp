@@ -1,25 +1,27 @@
 // expression_algo_test.cpp
 
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -70,8 +72,8 @@ private:
 };
 
 TEST(ExpressionAlgoIsSubsetOf, NullAndOmittedField) {
-    // Verify that ComparisonMatchExpression::init() prohibits creating a match expression with
-    // an Undefined type.
+    // Verify that the ComparisonMatchExpression constructor prohibits creating a match expression
+    // with an Undefined type.
     BSONObj undefined = fromjson("{a: undefined}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     ASSERT_EQUALS(ErrorCodes::BadValue,
@@ -709,6 +711,22 @@ TEST(ExpressionAlgoIsSubsetOf, NonMatchingCollationsNoStringComparison) {
     ASSERT_TRUE(expression::isSubsetOf(lhs.get(), rhs.get()));
 }
 
+TEST(ExpressionAlgoIsSubsetOf, InternalExprEqIsSubsetOfNothing) {
+    ParsedMatchExpression exprEq("{a: {$_internalExprEq: 0}}");
+    ParsedMatchExpression regularEq("{a: {$eq: 0}}");
+    {
+        ParsedMatchExpression rhs("{a: {$gte: 0}}");
+        ASSERT_FALSE(expression::isSubsetOf(exprEq.get(), rhs.get()));
+        ASSERT_TRUE(expression::isSubsetOf(regularEq.get(), rhs.get()));
+    }
+
+    {
+        ParsedMatchExpression rhs("{a: {$lte: 0}}");
+        ASSERT_FALSE(expression::isSubsetOf(exprEq.get(), rhs.get()));
+        ASSERT_TRUE(expression::isSubsetOf(regularEq.get(), rhs.get()));
+    }
+}
+
 TEST(IsIndependent, AndIsIndependentOnlyIfChildrenAre) {
     BSONObj matchPredicate = fromjson("{$and: [{a: 1}, {b: 1}]}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -1166,6 +1184,25 @@ TEST(SplitMatchExpression, ShouldMoveMaxLengthAcrossRename) {
     BSONObjBuilder firstBob;
     splitExpr.first->serialize(&firstBob);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{c: {$_internalSchemaMaxLength: 3}}"));
+
+    ASSERT_FALSE(splitExpr.second.get());
+}
+
+TEST(SplitMatchExpression, ShouldMoveIndependentPredicateWhenThereAreMultipleRenames) {
+    // Designed to reproduce SERVER-32690.
+    BSONObj matchPredicate = fromjson("{y: 3}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(matcher.getStatus());
+
+    StringMap<std::string> renames{{"y", "x"}, {"x", "x"}};
+    std::pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> splitExpr =
+        expression::splitMatchExpressionBy(std::move(matcher.getValue()), {}, renames);
+
+    ASSERT_TRUE(splitExpr.first.get());
+    BSONObjBuilder firstBob;
+    splitExpr.first->serialize(&firstBob);
+    ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{x: {$eq: 3}}"));
 
     ASSERT_FALSE(splitExpr.second.get());
 }

@@ -1,42 +1,41 @@
-/*
- * Copyright (C) 2013 10gen, Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #ifdef _WIN32
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
-#define SECURITY_WIN32 1  // Required for SSPI support.
-
 #include "mongo/platform/basic.h"
 
 #include <sasl/sasl.h>
 #include <sasl/saslplug.h>
-#include <sspi.h>
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
@@ -52,12 +51,6 @@ extern "C" int plain_client_plug_init(const sasl_utils_t* utils,
                                       sasl_client_plug_t** pluglist,
                                       int* plugcount);
 
-extern "C" int crammd5_client_plug_init(const sasl_utils_t* utils,
-                                        int maxversion,
-                                        int* out_version,
-                                        sasl_client_plug_t** pluglist,
-                                        int* plugcount);
-
 namespace mongo {
 namespace {
 /*
@@ -66,6 +59,10 @@ namespace {
 
 // The SSPI plugin implements the GSSAPI interface.
 char sspiPluginName[] = "GSSAPI";
+
+void saslSetError(const sasl_utils_t* utils, const std::string& msg) {
+    utils->seterror(utils->conn, 0, "%s", msg.c_str());
+}
 
 // This structure is passed through each callback to us by the sasl glue code.
 struct SspiConnContext {
@@ -103,7 +100,7 @@ void HandleLastError(const sasl_utils_t* utils, DWORD errCode, const char* msg) 
     }
 
     std::string buffer(mongoutils::str::stream() << "SSPI: " << msg << ": " << err);
-    utils->seterror(utils->conn, 0, "%s", buffer.c_str());
+    saslSetError(utils, buffer);
     LocalFree(err);
 }
 
@@ -120,7 +117,7 @@ int sspiClientMechNew(void* glob_context,
     int ret = cparams->utils->getcallback(
         cparams->utils->conn, SASL_CB_USER, (sasl_callback_ft*)&user_cb, &user_context);
     if (ret != SASL_OK) {
-        cparams->utils->seterror(cparams->utils->conn, 0, "getcallback user failed");
+        saslSetError(cparams->utils, "getcallback user failed");
         return ret;
     }
     const char* rawUserPlusRealm;
@@ -128,7 +125,7 @@ int sspiClientMechNew(void* glob_context,
 
     ret = user_cb(user_context, SASL_CB_USER, &rawUserPlusRealm, &rawUserPlusRealmLength);
     if (ret != SASL_OK) {
-        cparams->utils->seterror(cparams->utils->conn, 0, "user callback failed");
+        saslSetError(cparams->utils, "user callback failed");
         return ret;
     }
     std::string userPlusRealm(rawUserPlusRealm, rawUserPlusRealmLength);
@@ -136,7 +133,7 @@ int sspiClientMechNew(void* glob_context,
     // Parse out the username and realm.
     size_t atSign = userPlusRealm.find('@');
     if (atSign == std::string::npos) {
-        cparams->utils->seterror(cparams->utils->conn, 0, "no @REALM found in username");
+        saslSetError(cparams->utils, "no @REALM found in username");
         return SASL_BADPARAM;
     }
     std::string utf8Username(userPlusRealm, 0, atSign);
@@ -196,7 +193,7 @@ int sspiClientMechNew(void* glob_context,
 
     // Compose target name token. First, verify that a hostname has been provided.
     if (cparams->serverFQDN == NULL || strlen(cparams->serverFQDN) == 0) {
-        cparams->utils->seterror(cparams->utils->conn, 0, "SSPI: no serverFQDN");
+        saslSetError(cparams->utils, "SSPI: no serverFQDN");
         return SASL_FAIL;
     }
 
@@ -261,15 +258,14 @@ int sspiValidateServerSecurityLayerOffering(SspiConnContext* pcctx,
     // Validate the server's plaintext message.
     // Length (as per RFC 4752)
     if (wrapBufs[1].cbBuffer < 4) {
-        cparams->utils->seterror(cparams->utils->conn, 0, "SSPI: server message is too short");
+        saslSetError(cparams->utils, "SSPI: server message is too short");
         return SASL_FAIL;
     }
     // First bit of first byte set, indicating that the client may elect to use no
     // security layer. As a client we are uninterested in any of the other features the
     // server offers and thus we ignore the other bits.
     if (!(static_cast<char*>(wrapBufs[1].pvBuffer)[0] & 1)) {
-        cparams->utils->seterror(
-            cparams->utils->conn, 0, "SSPI: server does not support the required security layer");
+        saslSetError(cparams->utils, "SSPI: server does not support the required security layer");
         return SASL_BADAUTH;
     }
     return SASL_OK;
@@ -464,7 +460,7 @@ int sspiClientPluginInit(const sasl_utils_t* utils,
                          sasl_client_plug_t** pluglist,
                          int* plugcount) {
     if (max_version < SASL_CLIENT_PLUG_VERSION) {
-        utils->seterror(utils->conn, 0, "Wrong SSPI version");
+        saslSetError(utils, "Wrong SSPI version");
         return SASL_BADVERS;
     }
 
@@ -487,20 +483,6 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SaslSspiClientPlugin,
     if (SASL_OK != ret) {
         return Status(ErrorCodes::UnknownError,
                       mongoutils::str::stream() << "could not add SASL Client SSPI plugin "
-                                                << sspiPluginName
-                                                << ": "
-                                                << sasl_errstring(ret, NULL, NULL));
-    }
-
-    return Status::OK();
-}
-MONGO_INITIALIZER_WITH_PREREQUISITES(SaslCramClientPlugin,
-                                     ("CyrusSaslAllocatorsAndMutexes", "CyrusSaslClientContext"))
-(InitializerContext*) {
-    int ret = sasl_client_add_plugin("CRAMMD5", crammd5_client_plug_init);
-    if (SASL_OK != ret) {
-        return Status(ErrorCodes::UnknownError,
-                      mongoutils::str::stream() << "Could not add SASL Client CRAM-MD5 plugin "
                                                 << sspiPluginName
                                                 << ": "
                                                 << sasl_errstring(ret, NULL, NULL));

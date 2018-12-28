@@ -22,7 +22,7 @@
     assert.commandWorked(st.splitAt('TestDB.TestColl', {Key: 20}));
     assert.commandWorked(st.splitAt('TestDB.TestColl', {Key: 30}));
 
-    // Move two of the chunks to shard0001 so we have option to do parallel balancing
+    // Move two of the chunks to st.shard1.shardName so we have option to do parallel balancing
     assert.commandWorked(st.moveChunk('TestDB.TestColl', {Key: 20}, st.shard1.shardName));
     assert.commandWorked(st.moveChunk('TestDB.TestColl', {Key: 30}, st.shard1.shardName));
 
@@ -37,7 +37,7 @@
 
     // Do enable the balancer and wait for a single balancer round
     st.startBalancer();
-    st.awaitBalancerRound();
+    st.waitForBalancer(true, 60000);
     st.stopBalancer();
 
     assert.eq(1,

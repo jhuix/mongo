@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,21 +32,19 @@
 
 #include <memory>
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/index_spec.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/sessions_collection.h"
 #include "mongo/db/sessions_collection_standalone.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/time_support.h"
 
-namespace LogicalSessionTests {
-
+namespace mongo {
 namespace {
+
 constexpr StringData kTestNS = "config.system.sessions"_sd;
 
 LogicalSessionRecord makeRecord(Date_t time = Date_t::now()) {
@@ -72,7 +72,7 @@ BSONObj lsidQuery(const LogicalSessionId& lsid) {
 StatusWith<LogicalSessionRecord> fetchRecord(OperationContext* opCtx,
                                              const LogicalSessionId& lsid) {
     DBDirectClient client(opCtx);
-    auto cursor = client.query(kTestNS.toString(), lsidQuery(lsid), 1);
+    auto cursor = client.query(NamespaceString(kTestNS), lsidQuery(lsid), 1);
     if (!cursor->more()) {
         return {ErrorCodes::NoSuchSession, "No matching record in the sessions collection"};
     }
@@ -84,8 +84,6 @@ StatusWith<LogicalSessionRecord> fetchRecord(OperationContext* opCtx,
         return exceptionToStatus();
     }
 }
-
-}  // namespace
 
 class SessionsCollectionStandaloneTest {
 public:
@@ -102,16 +100,16 @@ public:
         _opCtx.reset();
     }
 
-    SessionsCollectionStandalone* collection() {
+    SessionsCollectionStandalone* collection() const {
         return _collection.get();
     }
 
-    OperationContext* opCtx() {
+    OperationContext* opCtx() const {
         return _opCtx.get();
     }
 
-    std::string ns() {
-        return SessionsCollection::kSessionsFullNS.toString();
+    const std::string& ns() const {
+        return NamespaceString::kLogicalSessionsNamespace.ns();
     }
 
 private:
@@ -272,6 +270,7 @@ public:
         }
     }
 };
+
 class All : public Suite {
 public:
     All() : Suite("logical_sessions") {}
@@ -285,4 +284,5 @@ public:
 
 SuiteInstance<All> all;
 
-}  // namespace LogicalSessionTests
+}  // namespace
+}  // namespace mongo

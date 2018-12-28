@@ -1,22 +1,25 @@
-/** *    Copyright (C) 2015 MongoDB Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -42,6 +45,8 @@ TimerImpl::~TimerImpl() {
 }
 
 void TimerImpl::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
+    _timers.erase(this);
+
     _cb = std::move(cb);
     _expiration = _global->now() + timeout;
 
@@ -50,10 +55,14 @@ void TimerImpl::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
 
 void TimerImpl::cancelTimeout() {
     _timers.erase(this);
+    _cb = TimeoutCallback{};
 }
 
 void TimerImpl::clear() {
-    _timers.clear();
+    while (!_timers.empty()) {
+        auto* timer = *_timers.begin();
+        timer->cancelTimeout();
+    }
 }
 
 void TimerImpl::fireIfNecessary() {
@@ -122,6 +131,7 @@ void ConnectionImpl::pushSetup(PushSetupCallback status) {
         _pushSetupQueue.pop_front();
 
         auto cb = connPtr->_setupCallback;
+        connPtr->indicateUsed();
         cb(connPtr, callback());
     }
 }
@@ -145,6 +155,7 @@ void ConnectionImpl::pushRefresh(PushRefreshCallback status) {
         _pushRefreshQueue.pop_front();
 
         auto cb = connPtr->_refreshCallback;
+        connPtr->indicateUsed();
         cb(connPtr, callback());
     }
 }
@@ -189,6 +200,7 @@ void ConnectionImpl::setup(Milliseconds timeout, SetupCallback cb) {
         _pushSetupQueue.pop_front();
 
         auto refreshCb = connPtr->_setupCallback;
+        connPtr->indicateUsed();
         refreshCb(connPtr, callback());
     }
 }
@@ -210,6 +222,7 @@ void ConnectionImpl::refresh(Milliseconds timeout, RefreshCallback cb) {
         _pushRefreshQueue.pop_front();
 
         auto refreshCb = connPtr->_refreshCallback;
+        connPtr->indicateUsed();
         refreshCb(connPtr, callback());
     }
 }
@@ -224,12 +237,12 @@ std::deque<ConnectionImpl*> ConnectionImpl::_setupQueue;
 std::deque<ConnectionImpl*> ConnectionImpl::_refreshQueue;
 size_t ConnectionImpl::_idCounter = 1;
 
-std::unique_ptr<ConnectionPool::ConnectionInterface> PoolImpl::makeConnection(
-    const HostAndPort& hostAndPort, size_t generation) {
-    return stdx::make_unique<ConnectionImpl>(hostAndPort, generation, this);
+std::shared_ptr<ConnectionPool::ConnectionInterface> PoolImpl::makeConnection(
+    const HostAndPort& hostAndPort, transport::ConnectSSLMode sslMode, size_t generation) {
+    return std::make_shared<ConnectionImpl>(hostAndPort, generation, this);
 }
 
-std::unique_ptr<ConnectionPool::TimerInterface> PoolImpl::makeTimer() {
+std::shared_ptr<ConnectionPool::TimerInterface> PoolImpl::makeTimer() {
     return stdx::make_unique<TimerImpl>(this);
 }
 

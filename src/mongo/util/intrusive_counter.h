@@ -1,29 +1,31 @@
+
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -37,54 +39,6 @@
 #include "mongo/util/allocator.h"
 
 namespace mongo {
-
-/*
-  IntrusiveCounter is a sharable implementation of a reference counter that
-  objects can use to be compatible with boost::intrusive_ptr<>.
-
-  Some objects that use IntrusiveCounter are immutable, and only have
-  const methods.  This may require their pointers to be declared as
-  intrusive_ptr<const ClassName> .  In order to be able to share pointers to
-  these immutables, the methods associated with IntrusiveCounter are declared
-  as const, and the counter itself is marked as mutable.
-
-  IntrusiveCounter itself is abstract, allowing for multiple implementations.
-  For example, IntrusiveCounterUnsigned uses ordinary unsigned integers for
-  the reference count, and is good for situations where thread safety is not
-  required.  For others, other implementations using atomic integers should
-  be used.  For static objects, the implementations of addRef() and release()
-  can be overridden to do nothing.
- */
-class IntrusiveCounter {
-    MONGO_DISALLOW_COPYING(IntrusiveCounter);
-
-public:
-    IntrusiveCounter() = default;
-    virtual ~IntrusiveCounter(){};
-
-    // these are here for the boost intrusive_ptr<> class
-    friend inline void intrusive_ptr_add_ref(const IntrusiveCounter* pIC) {
-        pIC->addRef();
-    };
-    friend inline void intrusive_ptr_release(const IntrusiveCounter* pIC) {
-        pIC->release();
-    };
-
-    virtual void addRef() const = 0;
-    virtual void release() const = 0;
-};
-
-class IntrusiveCounterUnsigned : public IntrusiveCounter {
-public:
-    // virtuals from IntrusiveCounter
-    virtual void addRef() const;
-    virtual void release() const;
-
-    IntrusiveCounterUnsigned();
-
-private:
-    mutable unsigned counter;
-};
 
 /// This is an alternative base class to the above ones (will replace them eventually)
 class RefCountable {
@@ -151,11 +105,4 @@ private:
     int _size;  // does NOT include trailing NUL byte.
     // char[_size+1] array allocated past end of class
 };
-};
-
-/* ======================= INLINED IMPLEMENTATIONS ========================== */
-
-namespace mongo {
-
-inline IntrusiveCounterUnsigned::IntrusiveCounterUnsigned() : counter(0) {}
-};
+}  // namespace mongo

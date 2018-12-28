@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -47,18 +49,19 @@ class OperationContext;
 class SessionsCollection {
 
 public:
+    static constexpr StringData kSessionsTTLIndex = "lsidTTLIndex"_sd;
+
     virtual ~SessionsCollection();
-
-    static constexpr StringData kSessionsDb = "config"_sd;
-    static constexpr StringData kSessionsCollection = "system.sessions"_sd;
-    static constexpr StringData kSessionsFullNS = "config.system.sessions"_sd;
-
-    static const NamespaceString kSessionsNamespaceString;
 
     /**
      * Ensures that the sessions collection exists and has the proper indexes.
      */
     virtual Status setupSessionsCollection(OperationContext* opCtx) = 0;
+
+    /**
+     * Checks if the sessions collection exists and has the proper indexes.
+     */
+    virtual Status checkSessionsCollectionExists(OperationContext* opCtx) = 0;
 
     /**
      * Updates the last-use times on the given sessions to be greater than
@@ -93,6 +96,11 @@ public:
      */
     static BSONObj generateCreateIndexesCmd();
 
+    /*
+     * Generates a collMod command for the sessions collection TTL index.
+     */
+    static BSONObj generateCollModCmd();
+
 protected:
     /**
      * Makes a send function for the given client.
@@ -109,9 +117,6 @@ protected:
     Status doRefresh(const NamespaceString& ns,
                      const LogicalSessionRecordSet& sessions,
                      SendBatchFn send);
-    Status doRefreshExternal(const NamespaceString& ns,
-                             const LogicalSessionRecordSet& sessions,
-                             SendBatchFn send);
 
     /**
      * Formats and sends batches of deletes for the given set of sessions.
@@ -119,9 +124,6 @@ protected:
     Status doRemove(const NamespaceString& ns,
                     const LogicalSessionIdSet& sessions,
                     SendBatchFn send);
-    Status doRemoveExternal(const NamespaceString& ns,
-                            const LogicalSessionIdSet& sessions,
-                            SendBatchFn send);
 
     /**
      * Formats and sends batches of fetches for the given set of sessions.

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -144,7 +146,23 @@ struct QuerySolutionNode {
         }
     }
 
+    /**
+     * Adds a vector of query solution nodes to the list of children of this node.
+     *
+     * TODO SERVER-35512: Once 'children' are held by unique_ptr, this method should no longer be
+     * necessary.
+     */
+    void addChildren(std::vector<std::unique_ptr<QuerySolutionNode>> newChildren) {
+        children.reserve(children.size() + newChildren.size());
+        std::transform(newChildren.begin(),
+                       newChildren.end(),
+                       std::back_inserter(children),
+                       [](auto& child) { return child.release(); });
+    }
+
     // These are owned here.
+    //
+    // TODO SERVER-35512: Make this a vector of unique_ptr.
     std::vector<QuerySolutionNode*> children;
 
     // If a stage has a non-NULL filter all values outputted from that stage must pass that
@@ -250,6 +268,13 @@ struct TextNode : public QuerySolutionNode {
     IndexEntry index;
     std::unique_ptr<fts::FTSQuery> ftsQuery;
 
+    // The number of fields in the prefix of the text index. For example, if the key pattern is
+    //
+    //   { a: 1, b: 1, _fts: "text", _ftsx: 1, c: 1 }
+    //
+    // then the number of prefix fields is 2, because of "a" and "b".
+    size_t numPrefixFields = 0u;
+
     // "Prefix" fields of a text index can handle equality predicates.  We group them with the
     // text node while creating the text leaf node and convert them into a BSONObj index prefix
     // when we finish the text leaf node.
@@ -296,8 +321,8 @@ struct CollectionScanNode : public QuerySolutionNode {
 
     int direction;
 
-    // maxScan option to .find() limits how many docs we look at.
-    int maxScan;
+    // Whether or not to wait for oplog visibility on oplog collection scans.
+    bool shouldWaitForOplogVisibility = false;
 };
 
 struct AndHashNode : public QuerySolutionNode {
@@ -479,15 +504,20 @@ struct IndexScanNode : public QuerySolutionNode {
 
     int direction;
 
-    // maxScan option to .find() limits how many docs we look at.
-    int maxScan;
-
     // If there's a 'returnKey' projection we add key metadata.
     bool addKeyMetadata;
+
+    bool shouldDedup = false;
 
     IndexBounds bounds;
 
     const CollatorInterface* queryCollator;
+
+    // The set of paths in the index key pattern which have at least one multikey path component, or
+    // empty if the index either is not multikey or does not have path-level multikeyness metadata.
+    //
+    // The correct set of paths is computed and stored here by computeProperties().
+    std::set<StringData> multikeyFields;
 };
 
 struct ProjectionNode : public QuerySolutionNode {
@@ -822,44 +852,6 @@ struct ShardingFilterNode : public QuerySolutionNode {
 };
 
 /**
- * If documents mutate or are deleted during a query, we can (in some cases) fetch them
- * and still return them.  This stage merges documents that have been mutated or deleted
- * into the query result stream.
- */
-struct KeepMutationsNode : public QuerySolutionNode {
-    KeepMutationsNode() : sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()) {}
-
-    virtual ~KeepMutationsNode() {}
-
-    virtual StageType getType() const {
-        return STAGE_KEEP_MUTATIONS;
-    }
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
-
-    // Any flagged results are OWNED_OBJ and therefore we're covered if our child is.
-    bool fetched() const {
-        return children[0]->fetched();
-    }
-
-    // Any flagged results are OWNED_OBJ and as such they'll have any field we need.
-    bool hasField(const std::string& field) const {
-        return children[0]->hasField(field);
-    }
-
-    bool sortedByDiskLoc() const {
-        return false;
-    }
-    const BSONObjSet& getSort() const {
-        return sorts;
-    }
-
-    QuerySolutionNode* clone() const;
-
-    // Since we merge in flagged results we have no sort order.
-    BSONObjSet sorts;
-};
-
-/**
  * Distinct queries only want one value for a given field.  We run an index scan but
  * *always* skip over the current key to the next key.
  */
@@ -891,13 +883,18 @@ struct DistinctNode : public QuerySolutionNode {
 
     QuerySolutionNode* clone() const;
 
+    virtual void computeProperties();
+
     BSONObjSet sorts;
 
     IndexEntry index;
-    int direction;
     IndexBounds bounds;
+
+    const CollatorInterface* queryCollator;
+
     // We are distinct-ing over the 'fieldNo'-th field of 'index.keyPattern'.
-    int fieldNo;
+    int fieldNo{0};
+    int direction{1};
 };
 
 /**

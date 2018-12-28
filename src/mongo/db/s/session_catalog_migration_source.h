@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,9 +34,10 @@
 #include <memory>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -82,9 +85,7 @@ public:
         bool shouldWaitForMajority = false;
     };
 
-    explicit SessionCatalogMigrationSource(NamespaceString ns);
-
-    void init(OperationContext* opCtx);
+    SessionCatalogMigrationSource(OperationContext* opCtx, NamespaceString ns);
 
     /**
      * Returns true if there are more oplog entries to fetch at this moment. Note that new writes
@@ -110,7 +111,44 @@ public:
      */
     void notifyNewWriteOpTime(repl::OpTime opTimestamp);
 
+    /**
+     * Returns the rollback ID recorded at the beginning of session migration.
+     */
+    int getRollbackIdAtInit() const {
+        return _rollbackIdAtInit;
+    }
+
 private:
+    /**
+     * An iterator for extracting session write oplogs that need to be cloned during migration.
+     */
+    class SessionOplogIterator {
+    public:
+        SessionOplogIterator(SessionTxnRecord txnRecord, int expectedRollbackId);
+
+        /**
+          * Returns true if there are more oplog entries to fetch for this session.
+          */
+        bool hasNext() const;
+
+        /**
+         * Returns the next oplog write that happened in this session. If the oplog is lost
+         * because the oplog rolled over, this will return a sentinel oplog entry instead with
+         * type 'n' and o2 field set to Session::kDeadEndSentinel. This will also mean that
+         * next subsequent calls to hasNext will return false.
+         */
+        repl::OplogEntry getNext(OperationContext* opCtx);
+
+        BSONObj toBSON() const {
+            return _record.toBSON();
+        }
+
+    private:
+        const SessionTxnRecord _record;
+        const int _initialRollbackId;
+        std::unique_ptr<TransactionHistoryIterator> _writeHistoryIterator;
+    };
+
     ///////////////////////////////////////////////////////////////////////////
     // Methods for extracting the oplog entries from session information.
 
@@ -126,11 +164,6 @@ private:
      * catalog. Returns true if a document was actually fetched.
      */
     bool _fetchNextOplogFromSessionCatalog(OperationContext* opCtx);
-
-    /**
-     * Returns the document that was last fetched by fetchNextOplogFromSessionCatalog.
-     */
-    repl::OplogEntry _getLastFetchedOplogFromSessionCatalog();
 
     /**
      * Extracts oplog information from the current writeHistoryIterator to _lastFetchedOplog. This
@@ -154,25 +187,24 @@ private:
      */
     bool _fetchNextNewWriteOplog(OperationContext* opCtx);
 
-    /**
-     * Returns the oplog that was last fetched by fetchNextNewWriteOplog.
-     */
-    repl::OplogEntry _getLastFetchedNewWriteOplog();
-
+    // Namespace for which the migration is happening
     const NamespaceString _ns;
 
-    // Protects _alreadyInitialized, _sessionCatalogCursor, _writeHistoryIterator
+    // The rollback id just before migration started. This value is needed so that step-down
+    // followed by step-up situations can be discovered.
+    const int _rollbackIdAtInit;
+
+    // Protects _sessionCatalogCursor, _sessionOplogIterators, _currentOplogIterator,
     // _lastFetchedOplogBuffer, _lastFetchedOplog
     stdx::mutex _sessionCloneMutex;
 
-    bool _alreadyInitialized = false;
+    // List of remaining session records that needs to be cloned.
+    std::vector<std::unique_ptr<SessionOplogIterator>> _sessionOplogIterators;
 
-    std::set<repl::OpTime> _sessionLastWriteOpTimes;
+    // Points to the current session record eing cloned.
+    std::unique_ptr<SessionOplogIterator> _currentOplogIterator;
 
-    // Iterator for oplog entries for a specific transaction.
-    std::unique_ptr<TransactionHistoryIterator> _writeHistoryIterator;
-
-    // Used for temporarily storing oplog entries for operations that has more than one entry.
+    // Used for temporarily storng oplog entries for operations that has more than one entry.
     // For example, findAndModify generates one for the actual operation and another for the
     // pre/post image.
     std::vector<repl::OplogEntry> _lastFetchedOplogBuffer;

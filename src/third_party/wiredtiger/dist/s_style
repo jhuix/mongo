@@ -61,6 +61,15 @@ else
 		cat $t
 	fi
 
+	if ! expr "$f" : 'examples/c/.*' > /dev/null &&
+	   ! expr "$f" : 'ext/.*' > /dev/null &&
+	   ! expr "$f" : 'src/include/wiredtiger_ext\.h' > /dev/null &&
+	   ! expr "$f" : 'src/txn/txn_ext\.c' > /dev/null &&
+	   grep WT_TXN_ISO_ $f; then
+		echo "$f: WT_TXN_ISO_XXX constants only for the extension API"
+		cat $t
+	fi
+
 	if ! expr "$f" : 'src/include/queue\.h' > /dev/null &&
 	    egrep 'STAILQ_|SLIST_|\bLIST_' $f ; then
 		echo "$f: use TAILQ for all lists"
@@ -91,6 +100,12 @@ else
 		echo "$f: off_t type declaration, use wt_off_t"
 		cat $t
 	}
+
+	if ! expr "$f" : 'src/include/misc.h' > /dev/null &&
+	    grep '[[:space:]]qsort(' $f > $t; then
+		echo "$f: qsort call, use WiredTiger __wt_qsort instead"
+		cat $t
+	fi
 
 	if ! expr "$f" : 'src/.*/os_setvbuf.c' > /dev/null &&
 	    egrep -w 'setvbuf' $f > $t; then

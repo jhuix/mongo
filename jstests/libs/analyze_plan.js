@@ -2,6 +2,8 @@
 // plan. For instance, there are helpers for checking whether a plan is a collection
 // scan or whether the plan is covered (index only).
 
+load("jstests/libs/fixture_helpers.js");  // For FixtureHelpers.
+
 /**
  * Given the root stage of explain's JSON representation of a query plan ('root'), returns all
  * subdocuments whose stage is 'stage'. Returns an empty array if the plan does not have the
@@ -56,6 +58,22 @@ function getPlanStage(root, stage) {
 }
 
 /**
+ * Returns the set of rejected plans from the given replset or sharded explain output.
+ */
+function getRejectedPlans(root) {
+    if (root.queryPlanner.winningPlan.hasOwnProperty("shards")) {
+        const rejectedPlans = [];
+        for (let shard of root.queryPlanner.winningPlan.shards) {
+            for (let rejectedPlan of shard.rejectedPlans) {
+                rejectedPlans.push(Object.assign({shardName: shard.shardName}, rejectedPlan));
+            }
+        }
+        return rejectedPlans;
+    }
+    return root.queryPlanner.rejectedPlans;
+}
+
+/**
  * Given the root stage of explain's JSON representation of a query plan ('root'), returns true if
  * the query planner reports at least one rejected alternative plan, and false otherwise.
  */
@@ -92,9 +110,25 @@ function hasRejectedPlans(root) {
         }
         // This is a sharded explain. Each entry in the shards array contains a 'winningPlan' and
         // 'rejectedPlans'.
-        return root.queryPlanner.shards.find((shard) => sectionHasRejectedPlans(shard)) !==
-            undefined;
+        return root.queryPlanner.winningPlan.shards.find(
+                   (shard) => sectionHasRejectedPlans(shard)) !== undefined;
     }
+}
+
+/**
+ * Returns an array of execution stages from the given replset or sharded explain output.
+ */
+function getExecutionStages(root) {
+    if (root.executionStats.executionStages.hasOwnProperty("shards")) {
+        const executionStages = [];
+        for (let shard of root.executionStats.executionStages.shards) {
+            executionStages.push(Object.assign(
+                {shardName: shard.shardName, executionSuccess: shard.executionSuccess},
+                shard.executionStages));
+        }
+        return executionStages;
+    }
+    return [root.executionStats.executionStages];
 }
 
 /**
@@ -120,16 +154,33 @@ function getAggPlanStages(root, stage) {
         return results;
     }
 
+    function getStagesFromInsideCursorStage(cursorStage) {
+        let results = [];
+
+        assert(cursorStage.hasOwnProperty("queryPlanner"));
+        assert(cursorStage.queryPlanner.hasOwnProperty("winningPlan"));
+
+        // If execution stats are available, then use the execution stats tree. Otherwise use the
+        // plan info from the "queryPlanner" section.
+        if (cursorStage.hasOwnProperty("executionStats")) {
+            assert(cursorStage.executionStats.hasOwnProperty("executionStages"));
+            results =
+                results.concat(getPlanStages(cursorStage.executionStats.executionStages, stage));
+        } else {
+            results = results.concat(getPlanStages(cursorStage.queryPlanner.winningPlan, stage));
+        }
+
+        return results;
+    }
+
     if (root.hasOwnProperty("stages")) {
         assert(root.stages.constructor === Array);
 
         results = results.concat(getDocumentSources(root.stages));
 
-        assert(root.stages[0].hasOwnProperty("$cursor"));
-        assert(root.stages[0].$cursor.hasOwnProperty("queryPlanner"));
-        assert(root.stages[0].$cursor.queryPlanner.hasOwnProperty("winningPlan"));
-        results =
-            results.concat(getPlanStages(root.stages[0].$cursor.queryPlanner.winningPlan, stage));
+        if (root.stages[0].hasOwnProperty("$cursor")) {
+            results = results.concat(getStagesFromInsideCursorStage(root.stages[0].$cursor));
+        }
     }
 
     if (root.hasOwnProperty("shards")) {
@@ -138,11 +189,10 @@ function getAggPlanStages(root, stage) {
 
             results = results.concat(getDocumentSources(root.shards[elem].stages));
 
-            assert(root.shards[elem].stages[0].hasOwnProperty("$cursor"));
-            assert(root.shards[elem].stages[0].$cursor.hasOwnProperty("queryPlanner"));
-            assert(root.shards[elem].stages[0].$cursor.queryPlanner.hasOwnProperty("winningPlan"));
-            results = results.concat(
-                getPlanStages(root.shards[elem].stages[0].$cursor.queryPlanner.winningPlan, stage));
+            const firstStage = root.shards[elem].stages[0];
+            if (firstStage.hasOwnProperty("$cursor")) {
+                results = results.concat(getStagesFromInsideCursorStage(firstStage.$cursor));
+            }
         }
     }
 
@@ -180,8 +230,18 @@ function aggPlanHasStage(root, stage) {
  * Given the root stage of explain's BSON representation of a query plan ('root'),
  * returns true if the plan has a stage called 'stage'.
  */
-function planHasStage(root, stage) {
-    return getPlanStage(root, stage) !== null;
+function planHasStage(db, root, stage) {
+    const matchingStages = getPlanStages(root, stage);
+
+    // If we are executing against a mongos, we may get more than one occurrence of the stage.
+    if (FixtureHelpers.isMongos(db)) {
+        return matchingStages.length >= 1;
+    } else {
+        assert.lt(matchingStages.length,
+                  2,
+                  `Expected to find 0 or 1 matching stages: ${tojson(matchingStages)}`);
+        return matchingStages.length === 1;
+    }
 }
 
 /**
@@ -190,32 +250,32 @@ function planHasStage(root, stage) {
  * Given the root stage of explain's BSON representation of a query plan ('root'),
  * returns true if the plan is index only. Otherwise returns false.
  */
-function isIndexOnly(root) {
-    return !planHasStage(root, "FETCH") && !planHasStage(root, "COLLSCAN");
+function isIndexOnly(db, root) {
+    return !planHasStage(db, root, "FETCH") && !planHasStage(db, root, "COLLSCAN");
 }
 
 /**
  * Returns true if the BSON representation of a plan rooted at 'root' is using
  * an index scan, and false otherwise.
  */
-function isIxscan(root) {
-    return planHasStage(root, "IXSCAN");
+function isIxscan(db, root) {
+    return planHasStage(db, root, "IXSCAN");
 }
 
 /**
  * Returns true if the BSON representation of a plan rooted at 'root' is using
  * the idhack fast path, and false otherwise.
  */
-function isIdhack(root) {
-    return planHasStage(root, "IDHACK");
+function isIdhack(db, root) {
+    return planHasStage(db, root, "IDHACK");
 }
 
 /**
  * Returns true if the BSON representation of a plan rooted at 'root' is using
  * a collection scan, and false otherwise.
  */
-function isCollscan(root) {
-    return planHasStage(root, "COLLSCAN");
+function isCollscan(db, root) {
+    return planHasStage(db, root, "COLLSCAN");
 }
 
 /**
@@ -235,4 +295,45 @@ function getChunkSkips(root) {
     }
 
     return 0;
+}
+
+/**
+ * Given explain output at executionStats level verbosity, confirms that the root stage is COUNT or
+ * RECORD_STORE_FAST_COUNT and that the result of the count is equal to 'expectedCount'.
+ */
+function assertExplainCount({explainResults, expectedCount}) {
+    const execStages = explainResults.executionStats.executionStages;
+
+    // If passed through mongos, then the root stage should be the mongos SINGLE_SHARD stage or
+    // SHARD_MERGE stages, with COUNT as the root stage on each shard. If explaining directly on the
+    // shard, then COUNT is the root stage.
+    if ("SINGLE_SHARD" == execStages.stage || "SHARD_MERGE" == execStages.stage) {
+        let totalCounted = 0;
+        for (let shardExplain of execStages.shards) {
+            const countStage = shardExplain.executionStages;
+            assert(countStage.stage === "COUNT" || countStage.stage === "RECORD_STORE_FAST_COUNT",
+                   "root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT");
+            totalCounted += countStage.nCounted;
+        }
+        assert.eq(totalCounted, expectedCount, "wrong count result");
+    } else {
+        assert(execStages.stage === "COUNT" || execStages.stage === "RECORD_STORE_FAST_COUNT",
+               "root stage on shard is not COUNT or RECORD_STORE_FAST_COUNT");
+        assert.eq(execStages.nCounted, expectedCount, "wrong count result");
+    }
+}
+
+/**
+ * Verifies that a given query uses an index and is covered when used in a count command.
+ */
+function assertCoveredQueryAndCount({collection, query, project, count}) {
+    let explain = collection.find(query, project).explain();
+    assert(isIndexOnly(db, explain.queryPlanner.winningPlan),
+           "Winning plan was not covered: " + tojson(explain.queryPlanner.winningPlan));
+
+    // Same query as a count command should also be covered.
+    explain = collection.explain("executionStats").find(query).count();
+    assert(isIndexOnly(db, explain.queryPlanner.winningPlan),
+           "Winning plan for count was not covered: " + tojson(explain.queryPlanner.winningPlan));
+    assertExplainCount({explainResults: explain, expectedCount: count});
 }

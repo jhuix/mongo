@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,7 +34,6 @@
 
 #include "mongo/db/s/shard_metadata_util.h"
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/write_concern_options.h"
@@ -40,6 +41,7 @@
 #include "mongo/rpc/unique_message.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_shard_collection.h"
+#include "mongo/s/catalog/type_shard_database.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/memory.h"
@@ -87,13 +89,6 @@ std::string RefreshState::toString() const {
                          << lastRefreshedCollectionVersion.toString();
 }
 
-Status setPersistedRefreshFlags(OperationContext* opCtx, const NamespaceString& nss) {
-    // Set 'refreshing' to true.
-    BSONObj update = BSON(ShardCollectionType::refreshing() << true);
-    return updateShardCollectionsEntry(
-        opCtx, BSON(ShardCollectionType::uuid() << nss.ns()), update, false /*upsert*/);
-}
-
 Status unsetPersistedRefreshFlags(OperationContext* opCtx,
                                   const NamespaceString& nss,
                                   const ChunkVersion& refreshedVersion) {
@@ -104,8 +99,9 @@ Status unsetPersistedRefreshFlags(OperationContext* opCtx,
                                   refreshedVersion.toLong());
 
     return updateShardCollectionsEntry(opCtx,
-                                       BSON(ShardCollectionType::uuid() << nss.ns()),
+                                       BSON(ShardCollectionType::ns() << nss.ns()),
                                        updateBuilder.obj(),
+                                       BSONObj(),
                                        false /*upsert*/);
 }
 
@@ -142,16 +138,16 @@ StatusWith<RefreshState> getPersistedRefreshFlags(OperationContext* opCtx,
 StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCtx,
                                                           const NamespaceString& nss) {
 
-    Query fullQuery(BSON(ShardCollectionType::uuid() << nss.ns()));
+    Query fullQuery(BSON(ShardCollectionType::ns() << nss.ns()));
 
     try {
         DBDirectClient client(opCtx);
         std::unique_ptr<DBClientCursor> cursor =
-            client.query(ShardCollectionType::ConfigNS.c_str(), fullQuery, 1);
+            client.query(NamespaceString::kShardConfigCollectionsNamespace, fullQuery, 1);
         if (!cursor) {
             return Status(ErrorCodes::OperationFailed,
                           str::stream() << "Failed to establish a cursor for reading "
-                                        << ShardCollectionType::ConfigNS
+                                        << NamespaceString::kShardConfigCollectionsNamespace.ns()
                                         << " from local storage");
         }
 
@@ -169,35 +165,118 @@ StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCt
 
         return statusWithCollectionEntry.getValue();
     } catch (const DBException& ex) {
-        return {ex.toStatus().code(),
-                str::stream() << "Failed to read the '" << nss.ns()
-                              << "' entry locally from config.collections"
-                              << causedBy(ex.toStatus())};
+        return ex.toStatus(str::stream() << "Failed to read the '" << nss.ns()
+                                         << "' entry locally from config.collections");
+    }
+}
+
+StatusWith<ShardDatabaseType> readShardDatabasesEntry(OperationContext* opCtx, StringData dbName) {
+    Query fullQuery(BSON(ShardDatabaseType::name() << dbName.toString()));
+
+    try {
+        DBDirectClient client(opCtx);
+        std::unique_ptr<DBClientCursor> cursor =
+            client.query(NamespaceString::kShardConfigDatabasesNamespace, fullQuery, 1);
+        if (!cursor) {
+            return Status(ErrorCodes::OperationFailed,
+                          str::stream() << "Failed to establish a cursor for reading "
+                                        << NamespaceString::kShardConfigDatabasesNamespace.ns()
+                                        << " from local storage");
+        }
+
+        if (!cursor->more()) {
+            // The database has been dropped.
+            return Status(ErrorCodes::NamespaceNotFound,
+                          str::stream() << "database " << dbName.toString() << " not found");
+        }
+
+        BSONObj document = cursor->nextSafe();
+        auto statusWithDatabaseEntry = ShardDatabaseType::fromBSON(document);
+        if (!statusWithDatabaseEntry.isOK()) {
+            return statusWithDatabaseEntry.getStatus();
+        }
+
+        return statusWithDatabaseEntry.getValue();
+    } catch (const DBException& ex) {
+        return ex.toStatus(str::stream() << "Failed to read the '" << dbName.toString()
+                                         << "' entry locally from config.databases");
     }
 }
 
 Status updateShardCollectionsEntry(OperationContext* opCtx,
                                    const BSONObj& query,
                                    const BSONObj& update,
+                                   const BSONObj& inc,
                                    const bool upsert) {
     invariant(query.hasField("_id"));
     if (upsert) {
         // If upserting, this should be an update from the config server that does not have shard
-        // refresh information.
-        invariant(!update.hasField(ShardCollectionType::refreshing()));
+        // refresh / migration inc signal information.
         invariant(!update.hasField(ShardCollectionType::lastRefreshedCollectionVersion()));
+        invariant(inc.isEmpty());
     }
 
     try {
         DBDirectClient client(opCtx);
 
+        BSONObjBuilder builder;
+        if (!update.isEmpty()) {
+            // Want to modify the document if it already exists, not replace it.
+            builder.append("$set", update);
+        }
+        if (!inc.isEmpty()) {
+            builder.append("$inc", inc);
+        }
+
         auto commandResponse = client.runCommand([&] {
-            write_ops::Update updateOp(NamespaceString{ShardCollectionType::ConfigNS});
+            write_ops::Update updateOp(NamespaceString::kShardConfigCollectionsNamespace);
             updateOp.setUpdates({[&] {
                 write_ops::UpdateOpEntry entry;
                 entry.setQ(query);
-                // Want to modify the document, not replace it
-                entry.setU(BSON("$set" << update));
+                entry.setU(builder.obj());
+                entry.setUpsert(upsert);
+                return entry;
+            }()});
+            return updateOp.serialize({});
+        }());
+        uassertStatusOK(getStatusFromWriteCommandResponse(commandResponse->getCommandReply()));
+
+        return Status::OK();
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+Status updateShardDatabasesEntry(OperationContext* opCtx,
+                                 const BSONObj& query,
+                                 const BSONObj& update,
+                                 const BSONObj& inc,
+                                 const bool upsert) {
+    invariant(query.hasField("_id"));
+    if (upsert) {
+        // If upserting, this should be an update from the config server that does not have shard
+        // migration inc signal information.
+        invariant(inc.isEmpty());
+    }
+
+    try {
+        DBDirectClient client(opCtx);
+
+        BSONObjBuilder builder;
+        if (!update.isEmpty()) {
+            // Want to modify the document if it already exists, not replace it.
+            builder.append("$set", update);
+        }
+        if (!inc.isEmpty()) {
+            builder.append("$inc", inc);
+        }
+
+        auto commandResponse = client.runCommand([&] {
+            write_ops::Update updateOp(NamespaceString::kShardConfigDatabasesNamespace);
+            updateOp.setUpdates({[&] {
+                write_ops::UpdateOpEntry entry;
+                entry.setQ(query);
+                entry.setU(builder.obj());
                 entry.setUpsert(upsert);
                 return entry;
             }()});
@@ -226,7 +305,7 @@ StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
         const std::string chunkMetadataNs = ChunkType::ShardNSPrefix + nss.ns();
 
         std::unique_ptr<DBClientCursor> cursor =
-            client.query(chunkMetadataNs, fullQuery, limit.get_value_or(0));
+            client.query(NamespaceString(chunkMetadataNs), fullQuery, limit.get_value_or(0));
         uassert(ErrorCodes::OperationFailed,
                 str::stream() << "Failed to establish a cursor for reading " << chunkMetadataNs
                               << " from local storage",
@@ -237,10 +316,8 @@ StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
             BSONObj document = cursor->nextSafe().getOwned();
             auto statusWithChunk = ChunkType::fromShardBSON(document, epoch);
             if (!statusWithChunk.isOK()) {
-                return {statusWithChunk.getStatus().code(),
-                        str::stream() << "Failed to parse chunk '" << document.toString()
-                                      << "' due to "
-                                      << statusWithChunk.getStatus().reason()};
+                return statusWithChunk.getStatus().withContext(
+                    str::stream() << "Failed to parse chunk '" << document.toString() << "'");
             }
 
             chunks.push_back(std::move(statusWithChunk.getValue()));
@@ -290,7 +367,7 @@ Status updateShardChunks(OperationContext* opCtx,
          *
          */
         for (auto& chunk : chunks) {
-            invariant(chunk.getVersion().hasEqualEpoch(currEpoch));
+            invariant(chunk.getVersion().epoch() == currEpoch);
 
             // Delete any overlapping chunk ranges. Overlapping chunks will have a min value
             // ("_id") between (chunk.min, chunk.max].
@@ -331,11 +408,10 @@ Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const Namesp
         DBDirectClient client(opCtx);
 
         auto deleteCommandResponse = client.runCommand([&] {
-            write_ops::Delete deleteOp(
-                NamespaceString{NamespaceString::kShardConfigCollectionsCollectionName});
+            write_ops::Delete deleteOp(NamespaceString::kShardConfigCollectionsNamespace);
             deleteOp.setDeletes({[&] {
                 write_ops::DeleteOpEntry entry;
-                entry.setQ(BSON(ShardCollectionType::uuid << nss.ns()));
+                entry.setQ(BSON(ShardCollectionType::ns << nss.ns()));
                 entry.setMulti(true);
                 return entry;
             }()});
@@ -355,6 +431,30 @@ Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const Namesp
         }
 
         LOG(1) << "Successfully cleared persisted chunk metadata for collection '" << nss << "'.";
+        return Status::OK();
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
+}
+
+Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
+    try {
+        DBDirectClient client(opCtx);
+
+        auto deleteCommandResponse = client.runCommand([&] {
+            write_ops::Delete deleteOp(NamespaceString::kShardConfigDatabasesNamespace);
+            deleteOp.setDeletes({[&] {
+                write_ops::DeleteOpEntry entry;
+                entry.setQ(BSON(ShardDatabaseType::name << dbName.toString()));
+                entry.setMulti(false);
+                return entry;
+            }()});
+            return deleteOp.serialize({});
+        }());
+        uassertStatusOK(
+            getStatusFromWriteCommandResponse(deleteCommandResponse->getCommandReply()));
+
+        LOG(1) << "Successfully cleared persisted metadata for db '" << dbName.toString() << "'.";
         return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();

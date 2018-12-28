@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -71,12 +71,12 @@ lrt(void *arg)
 	for (pinned = 0;;) {
 		if (pinned) {
 			/* Re-read the record at the end of the table. */
-			while ((ret = read_row(
-			    cursor, &key, &value, saved_keyno)) == WT_ROLLBACK)
+			while ((ret = read_row_worker(cursor,
+			    saved_keyno, &key, &value, false)) == WT_ROLLBACK)
 				;
 			if (ret != 0)
 				testutil_die(ret,
-				    "read_row %" PRIu64, saved_keyno);
+				    "read_row_worker %" PRIu64, saved_keyno);
 
 			/* Compare the previous value with the current one. */
 			if (g.type == FIX) {
@@ -110,8 +110,15 @@ lrt(void *arg)
 			 */
 			testutil_check(session->snapshot(session, "name=test"));
 			__wt_sleep(1, 0);
-			testutil_check(session->begin_transaction(
-			    session, "snapshot=test"));
+			/*
+			 * Keep trying to start a new transaction if it's
+			 * timing out - we know there aren't any resources
+			 * pinned so it should succeed eventually.
+			 */
+			while ((ret = session->begin_transaction(
+			    session, "snapshot=test")) == WT_CACHE_FULL)
+				;
+			testutil_check(ret);
 			testutil_check(session->snapshot(
 			    session, "drop=(all)"));
 			testutil_check(session->commit_transaction(
@@ -123,21 +130,24 @@ lrt(void *arg)
 			 * positioned. As soon as the cursor loses its position
 			 * a new snapshot will be allocated.
 			 */
-			testutil_check(session->begin_transaction(
-			    session, "isolation=snapshot"));
+			while ((ret = session->begin_transaction(
+			    session, "snapshot=snapshot")) == WT_CACHE_FULL)
+				;
+			testutil_check(ret);
 
 			/* Read a record at the end of the table. */
 			do {
 				saved_keyno = mmrand(NULL,
 				    (u_int)(g.key_cnt - g.key_cnt / 10),
 				    (u_int)g.key_cnt);
-				while ((ret = read_row(cursor,
-				    &key, &value, saved_keyno)) == WT_ROLLBACK)
+				while ((ret = read_row_worker(cursor,
+				    saved_keyno,
+				    &key, &value, false)) == WT_ROLLBACK)
 					;
 			} while (ret == WT_NOTFOUND);
 			if (ret != 0)
 				testutil_die(ret,
-				    "read_row %" PRIu64, saved_keyno);
+				    "read_row_worker %" PRIu64, saved_keyno);
 
 			/* Copy the cursor's value. */
 			if (g.type == FIX) {
@@ -160,12 +170,13 @@ lrt(void *arg)
 			 */
 			do {
 				keyno = mmrand(NULL, 1, (u_int)g.key_cnt / 5);
-				while ((ret = read_row(cursor,
-				    &key, &value, keyno)) == WT_ROLLBACK)
+				while ((ret = read_row_worker(cursor,
+				    keyno, &key, &value, false)) == WT_ROLLBACK)
 					;
 			} while (ret == WT_NOTFOUND);
 			if (ret != 0)
-				testutil_die(ret, "read_row %" PRIu64, keyno);
+				testutil_die(ret,
+				    "read_row_worker %" PRIu64, keyno);
 
 			pinned = 1;
 		}

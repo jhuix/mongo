@@ -1,6 +1,7 @@
 /**
  * Test that latency reported in the profiler and logs include lock acquisition time for various
  * CRUD operations.
+ * @tags: [requires_profiling]
  */
 (function() {
     "use strict";
@@ -150,4 +151,5 @@
     conn.forceWriteMode("compatibility");
     conn.forceReadMode("legacy");
     runTests();
+    MongoRunner.stopMongod(conn);
 }());

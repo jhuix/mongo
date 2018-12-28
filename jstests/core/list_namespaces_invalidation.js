@@ -1,4 +1,4 @@
-// SERVER-27996/SERVER-28022 Missing invalidation for system.namespaces writes
+// @tags: [requires_non_retryable_commands, requires_fastcount]
 (function() {
     'use strict';
     let dbInvalidName = 'system_namespaces_invalidations';
@@ -15,10 +15,8 @@
             assert.commandWorked(dbInvalid.createCollection('coll' + i.toString()));
         }
 
-        // Get the first two namespaces. Use find on 'system.namespaces' on MMAPv1, listCollections
-        // otherwise.
-        let cmd = dbInvalid.system.indexes.count() ? {find: 'system.namespaces'}
-                                                   : {listCollections: dbInvalidName};
+        // Get the first two namespaces using listCollections.
+        let cmd = {listCollections: dbInvalidName};
         Object.extend(cmd, {batchSize: batchSize});
         let res = dbInvalid.runCommand(cmd);
         assert.commandWorked(res, 'could not run ' + tojson(cmd));

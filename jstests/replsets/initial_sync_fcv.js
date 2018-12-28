@@ -7,6 +7,7 @@
 (function() {
     'use strict';
 
+    load("jstests/libs/feature_compatibility_version.js");
     load('jstests/libs/check_log.js');
 
     const rst = new ReplSetTest({nodes: 2});
@@ -25,8 +26,8 @@
 
     assert.writeOK(primary.getDB(dbName).getCollection(collName).insert({a: 1}));
 
-    function runInitialSync(cmd, expectedLog) {
-        assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: '3.6'}));
+    function runInitialSync(cmd, initialFCV) {
+        assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: initialFCV}));
 
         jsTestLog('Testing setting fCV with ' + tojson(cmd));
 
@@ -41,9 +42,8 @@
         const secondary = rst.nodes[1];
 
         // Initial sync clones the 'admin' database first, which will set the fCV on the
-        // secondary to 3.6. We then block the secondary before issuing 'listCollections' on the
-        // test database and set the fCV on the primary to 3.4 so that it clones the test
-        // collection without UUIDs, even though it is still in fCV 3.6 itself.
+        // secondary to initialFCV. We then block the secondary before issuing 'listCollections' on
+        // the test database.
         checkLog.contains(secondary,
                           'initial sync - initialSyncHangBeforeListCollections fail point enabled');
 
@@ -55,7 +55,8 @@
         // version change.
         assert.commandWorked(secondary.adminCommand(
             {configureFailPoint: 'initialSyncHangBeforeListCollections', mode: 'off'}));
-        checkLog.contains(secondary, expectedLog);
+        checkLog.contains(secondary,
+                          'Applying operation on feature compatibility version document');
 
         jsTestLog('Wait for both nodes to be up-to-date');
         rst.awaitSecondaryNodes();
@@ -70,14 +71,20 @@
         rst.checkReplicatedDataHashes();
     }
 
-    runInitialSync({setFeatureCompatibilityVersion: '3.4'},
-                   'Attempt to assign UUID to replicated collection');
+    // Ensure that attempting to downgrade the featureCompatibilityVersion during initial sync
+    // fails.
+    runInitialSync({setFeatureCompatibilityVersion: lastStableFCV}, /*initialFCV*/ latestFCV);
+
+    // Ensure that attempting to upgrade the featureCompatibilityVersion during initial sync fails.
+    runInitialSync({setFeatureCompatibilityVersion: latestFCV}, /*initialFCV*/ lastStableFCV);
 
     // Modifications to the featureCompatibilityVersion document during initial sync should be
     // caught and cause initial sync to fail.
-    runInitialSync(
-        {delete: 'system.version', deletes: [{q: {_id: "featureCompatibilityVersion"}, limit: 1}]},
-        'Applying operation on feature compatibility version document');
+    runInitialSync({
+        update: 'system.version',
+        updates: [{q: {_id: 'featureCompatibilityVersion'}, u: {'version': lastStableFCV}}]
+    },
+                   /*initialFCV*/ latestFCV);
 
     rst.stopSet();
 })();

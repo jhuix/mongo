@@ -1,3 +1,5 @@
+// @tags: [does_not_support_stepdowns, requires_profiling]
+
 // Confirms that profiled find execution contains all expected metrics with proper values.
 
 (function() {
@@ -109,7 +111,16 @@
         assert.writeOK(coll.insert({a: 5, b: i}));
         assert.writeOK(coll.insert({a: i, b: 10}));
     }
+
+    // Until we get the failpoint described in the above comment (regarding SERVER-23620), we must
+    // run the query twice. The first time will create an inactive cache entry. The second run will
+    // take the same number of works, and create an active cache entry.
     assert.neq(coll.findOne({a: 5, b: 15}), null);
+    assert.neq(coll.findOne({a: 5, b: 15}), null);
+
+    // Run a query with the same shape, but with different parameters. The plan cached for the
+    // query above will perform poorly (since the selectivities are different) and we will be
+    // forced to replan.
     assert.neq(coll.findOne({a: 15, b: 10}), null);
     profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
 
@@ -130,10 +141,6 @@
     profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq(profileObj.command.comment, "a comment", tojson(profileObj));
 
-    assert.eq(coll.find().maxScan(3000).itcount(), 1);
-    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
-    assert.eq(profileObj.command.maxScan, 3000, tojson(profileObj));
-
     var maxTimeMS = 100000;
     assert.eq(coll.find().maxTimeMS(maxTimeMS).itcount(), 1);
     profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
@@ -151,10 +158,6 @@
     profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq(profileObj.command.returnKey, true, tojson(profileObj));
 
-    assert.eq(coll.find().snapshot().itcount(), 1);
-    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
-    assert.eq(profileObj.command.snapshot, true, tojson(profileObj));
-
     //
     // Confirm that queries are truncated in the profiler as { $truncated: <string>, comment:
     // <string> }
@@ -169,4 +172,13 @@
     profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq((typeof profileObj.command.$truncated), "string", tojson(profileObj));
     assert.eq(profileObj.command.comment, "profile_find", tojson(profileObj));
+
+    //
+    // Confirm that a query whose filter contains a field named 'query' appears as expected in the
+    // profiler. This test ensures that upconverting a legacy query correctly identifies this as a
+    // user field rather than a wrapped filter spec.
+    //
+    coll.find({query: "foo"}).itcount();
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
+    assert.eq(profileObj.command.filter, {query: "foo"}, tojson(profileObj));
 })();

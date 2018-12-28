@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,8 +37,9 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/service_entry_point_utils.h"
+#include "mongo/transport/service_executor_task_names.h"
+#include "mongo/transport/thread_idle_callback.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/thread_idle_callback.h"
 #include "mongo/util/processinfo.h"
 
 namespace mongo {
@@ -59,13 +62,7 @@ thread_local int64_t ServiceExecutorSynchronous::_localThreadIdleCounter = 0;
 ServiceExecutorSynchronous::ServiceExecutorSynchronous(ServiceContext* ctx) {}
 
 Status ServiceExecutorSynchronous::start() {
-    _numHardwareCores = [] {
-        ProcessInfo p;
-        if (auto availCores = p.getNumAvailableCores()) {
-            return static_cast<size_t>(*availCores);
-        }
-        return static_cast<size_t>(p.getNumCores());
-    }();
+    _numHardwareCores = static_cast<size_t>(ProcessInfo::getNumAvailableCores());
 
     _stillRunning.store(true);
 
@@ -88,13 +85,19 @@ Status ServiceExecutorSynchronous::shutdown(Milliseconds timeout) {
                  "passthrough executor couldn't shutdown all worker threads within time limit.");
 }
 
-Status ServiceExecutorSynchronous::schedule(Task task, ScheduleFlags flags) {
+Status ServiceExecutorSynchronous::schedule(Task task,
+                                            ScheduleFlags flags,
+                                            ServiceExecutorTaskName taskName) {
+    if (!_stillRunning.load()) {
+        return Status{ErrorCodes::ShutdownInProgress, "Executor is not running"};
+    }
+
     if (!_localWorkQueue.empty()) {
         /*
-        * In perf testing we found that yielding after running a each request produced
-        * at 5% performance boost in microbenchmarks if the number of worker threads
-        * was greater than the number of available cores.
-        */
+         * In perf testing we found that yielding after running a each request produced
+         * at 5% performance boost in microbenchmarks if the number of worker threads
+         * was greater than the number of available cores.
+         */
         if (flags & ScheduleFlags::kMayYieldBeforeSchedule) {
             if ((_localThreadIdleCounter++ & 0xf) == 0) {
                 markThreadIdle();
@@ -141,9 +144,8 @@ Status ServiceExecutorSynchronous::schedule(Task task, ScheduleFlags flags) {
 }
 
 void ServiceExecutorSynchronous::appendStats(BSONObjBuilder* bob) const {
-    BSONObjBuilder section(bob->subobjStart("serviceExecutorTaskStats"));
-    section << kExecutorLabel << kExecutorName << kThreadsRunning
-            << static_cast<int>(_numRunningWorkerThreads.loadRelaxed());
+    *bob << kExecutorLabel << kExecutorName << kThreadsRunning
+         << static_cast<int>(_numRunningWorkerThreads.loadRelaxed());
 }
 
 }  // namespace transport

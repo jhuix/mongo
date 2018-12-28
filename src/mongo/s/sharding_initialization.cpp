@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,15 +37,11 @@
 #include <string>
 
 #include "mongo/base/status.h"
-#include "mongo/client/remote_command_targeter_factory_impl.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/keys_collection_manager_sharding.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
-#include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/sharding_task_executor.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
@@ -66,13 +64,13 @@
 #include "mongo/s/client/sharding_network_connection_hook.h"
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/periodic_balancer_settings_refresher.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/sharding_task_executor.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
 
@@ -125,15 +123,18 @@ std::unique_ptr<ShardingCatalogClient> makeCatalogClient(ServiceContext* service
 std::unique_ptr<TaskExecutorPool> makeShardingTaskExecutorPool(
     std::unique_ptr<NetworkInterface> fixedNet,
     rpc::ShardingEgressMetadataHookBuilder metadataHookBuilder,
-    ConnectionPool::Options connPoolOptions) {
+    ConnectionPool::Options connPoolOptions,
+    boost::optional<size_t> taskExecutorPoolSize) {
     std::vector<std::unique_ptr<executor::TaskExecutor>> executors;
 
-    for (size_t i = 0; i < TaskExecutorPool::getSuggestedPoolSize(); ++i) {
-        auto exec = makeShardingTaskExecutor(executor::makeNetworkInterface(
-            "NetworkInterfaceASIO-TaskExecutorPool-" + std::to_string(i),
-            stdx::make_unique<ShardingNetworkConnectionHook>(),
-            metadataHookBuilder(),
-            connPoolOptions));
+    const auto poolSize = taskExecutorPoolSize.value_or(TaskExecutorPool::getSuggestedPoolSize());
+
+    for (size_t i = 0; i < poolSize; ++i) {
+        auto exec = makeShardingTaskExecutor(
+            executor::makeNetworkInterface("TaskExecutorPool-" + std::to_string(i),
+                                           stdx::make_unique<ShardingNetworkConnectionHook>(),
+                                           metadataHookBuilder(),
+                                           connPoolOptions));
 
         executors.emplace_back(std::move(exec));
     }
@@ -172,7 +173,8 @@ Status initializeGlobalShardingState(OperationContext* opCtx,
                                      StringData distLockProcessId,
                                      std::unique_ptr<ShardFactory> shardFactory,
                                      std::unique_ptr<CatalogCache> catalogCache,
-                                     rpc::ShardingEgressMetadataHookBuilder hookBuilder) {
+                                     rpc::ShardingEgressMetadataHookBuilder hookBuilder,
+                                     boost::optional<size_t> taskExecutorPoolSize) {
     if (configCS.type() == ConnectionString::INVALID) {
         return {ErrorCodes::BadValue, "Unrecognized connection string."};
     }
@@ -217,13 +219,13 @@ Status initializeGlobalShardingState(OperationContext* opCtx,
     }
 
     auto network =
-        executor::makeNetworkInterface("NetworkInterfaceASIO-ShardRegistry",
+        executor::makeNetworkInterface("ShardRegistry",
                                        stdx::make_unique<ShardingNetworkConnectionHook>(),
                                        hookBuilder(),
                                        connPoolOptions);
     auto networkPtr = network.get();
-    auto executorPool =
-        makeShardingTaskExecutorPool(std::move(network), hookBuilder, connPoolOptions);
+    auto executorPool = makeShardingTaskExecutorPool(
+        std::move(network), hookBuilder, connPoolOptions, taskExecutorPoolSize);
     executorPool->startup();
 
     auto const grid = Grid::get(opCtx);
@@ -244,30 +246,14 @@ Status initializeGlobalShardingState(OperationContext* opCtx,
 
     auto keysCollectionClient =
         stdx::make_unique<KeysCollectionClientSharded>(grid->catalogClient());
-    auto keyManager = std::make_shared<KeysCollectionManagerSharding>(
-        KeysCollectionManager::kKeyManagerPurposeString,
-        std::move(keysCollectionClient),
-        Seconds(KeysRotationIntervalSec));
+    auto keyManager =
+        std::make_shared<KeysCollectionManager>(KeysCollectionManager::kKeyManagerPurposeString,
+                                                std::move(keysCollectionClient),
+                                                Seconds(KeysRotationIntervalSec));
     keyManager->startMonitoring(opCtx->getServiceContext());
 
     LogicalTimeValidator::set(opCtx->getServiceContext(),
                               stdx::make_unique<LogicalTimeValidator>(keyManager));
-
-    auto replCoord = repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
-        replCoord->getMemberState().primary()) {
-        LogicalTimeValidator::get(opCtx)->enableKeyGenerator(opCtx, true);
-    } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-        // Determine primary/secondary/standalone state in order to properly set up the refresher.
-        bool isReplSet =
-            replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-        bool isStandaloneOrPrimary =
-            !isReplSet || (repl::ReplicationCoordinator::get(opCtx)->getMemberState() ==
-                           repl::MemberState::RS_PRIMARY);
-
-        PeriodicBalancerSettingsRefresher::create(opCtx->getServiceContext(),
-                                                  isStandaloneOrPrimary);
-    }
 
     return Status::OK();
 }
@@ -286,7 +272,7 @@ Status waitForShardRegistryReload(OperationContext* opCtx) {
         try {
             uassertStatusOK(ClusterIdentityLoader::get(opCtx)->loadClusterId(
                 opCtx, repl::ReadConcernLevel::kMajorityReadConcern));
-            if (grid.shardRegistry()->isUp()) {
+            if (Grid::get(opCtx)->shardRegistry()->isUp()) {
                 return Status::OK();
             }
             sleepFor(kRetryInterval);

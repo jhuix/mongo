@@ -1,28 +1,31 @@
-/*    Copyright 2014 MongoDB Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -39,6 +42,7 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
@@ -90,8 +94,8 @@ public:
      * Known errors are:
      *  FailedToSatisfyReadPreference, if node cannot be found, which matches the read preference.
      */
-    StatusWith<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
-                                             Milliseconds maxWait = kDefaultFindHostTimeout);
+    SharedSemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
+                                                   Milliseconds maxWait = kDefaultFindHostTimeout);
 
     /**
      * Returns the host we think is the current master or uasserts.
@@ -101,13 +105,6 @@ public:
      * rather than returning an empty HostAndPort.
      */
     HostAndPort getMasterOrUassert();
-
-    /**
-     * Returns a refresher object that can be used to update our view of the set.
-     * If a refresh is currently in-progress, the returned Refresher will participate in the
-     * current refresh round.
-     */
-    Refresher startOrContinueRefresh();
 
     /**
      * Notifies this Monitor that a host has failed because of the specified error 'status' and
@@ -149,8 +146,15 @@ public:
     /**
      * Returns a std::string with the format name/server1,server2.
      * If name is empty, returns just comma-separated list of servers.
+     * It IS updated to reflect the current members of the set.
      */
     std::string getServerAddress() const;
+
+    /**
+     * Returns the URI that was used to construct this monitor.
+     * It IS NOT updated to reflect the current members of the set.
+     */
+    const MongoURI& getOriginalUri() const;
 
     /**
      * Is server part of this set? Uses only cached information.
@@ -225,9 +229,20 @@ public:
     static void cleanup();
 
     /**
+     * Use these to speed up tests by disabling the sleep-and-retry loops and cause errors to be
+     * reported immediately.
+     */
+    static void disableRefreshRetries_forTest();
+
+    /**
      * Permanently stops all monitoring on replica sets.
      */
     static void shutdown();
+
+    /**
+     * Returns the refresh period that is given to all new SetStates.
+     */
+    static Seconds getDefaultRefreshPeriod();
 
     //
     // internal types (defined in replica_set_monitor_internal.h)
@@ -260,19 +275,26 @@ public:
      */
     static bool useDeterministicHostSelection;
 
+    /**
+     * This is for use in tests using MockReplicaSet to ensure that a full scan completes before
+     * continuing.
+     */
+    void runScanForMockReplicaSet();
+
 private:
     /**
-     * A callback passed to a task executor to refresh the replica set. It reschedules itself until
-     * its canceled in d-tor.
+     * Schedules a refresh via the task executor. (Task is automatically canceled in the d-tor.)
      */
-    void _refresh(const executor::TaskExecutor::CallbackArgs&);
+    void _scheduleRefresh(Date_t when, WithLock);
 
-    // Serializes refresh and protects _refresherHandle
-    stdx::mutex _mutex;
+    /**
+     * This function refreshes the replica set and calls _scheduleRefresh() again.
+     */
+    void _doScheduledRefresh(const executor::TaskExecutor::CallbackHandle& currentHandle);
+
     executor::TaskExecutor::CallbackHandle _refresherHandle;
 
     const SetStatePtr _state;
-    executor::TaskExecutor* _executor;
     AtomicBool _isRemovedFromManager{false};
 };
 
@@ -280,42 +302,24 @@ private:
 /**
  * Refreshes the local view of a replica set.
  *
- * Use ReplicaSetMonitor::startOrContinueRefresh() to obtain a Refresher.
- *
- * Multiple threads can refresh a single set without any additional synchronization, however
- * they must each use their own Refresher object.
- *
  * All logic related to choosing the hosts to contact and updating the SetState based on replies
  * lives in this class.
  */
 class ReplicaSetMonitor::Refresher {
 public:
     /**
-     * Contact hosts in the set to refresh our view, but stop once a host matches criteria.
-     * Returns the matching host or empty if none match after a refresh.
-     *
-     * This is called by ReplicaSetMonitor::getHostWithRefresh()
+     * If no scan is in-progress, this function is responsible for setting up a new scan. Otherwise,
+     * does nothing.
      */
-    HostAndPort refreshUntilMatches(const ReadPreferenceSetting& criteria);
-
-    /**
-     * Refresh all hosts. Equivalent to refreshUntilMatches with a criteria that never
-     * matches.
-     *
-     * This is intended to be called periodically, possibly from a background thread.
-     */
-    void refreshAll();
+    static void ensureScanInProgress(const SetStatePtr&, WithLock);
 
     //
     // Remaining methods are only for testing and internal use.
-    // Callers are responsible for holding SetState::mutex before calling any of these methods.
+    // Callers are responsible for holding SetState::mutex before calling any of these methods, but
+    // not all of them take a WithLock because they predate its introduction, and because they are
+    // mostly called from single-threaded unit tests.
     //
 
-    /**
-     * Any passed-in pointers are shared with caller.
-     *
-     * If no scan is in-progress, this function is responsible for setting up a new scan.
-     */
     explicit Refresher(const SetStatePtr& setState);
 
     struct NextStep {
@@ -371,18 +375,19 @@ private:
     Status receivedIsMasterFromMaster(const HostAndPort& from, const IsMasterReply& reply);
 
     /**
+     * Schedules isMaster requests to all hosts that currently need to be contacted.
+     * Does nothing if requests have already been sent to all known hosts.
+     */
+    void scheduleNetworkRequests(WithLock);
+
+    void scheduleIsMaster(const HostAndPort& host, WithLock);
+
+    /**
      * Adjusts the _scan work queue based on information from this host.
      * This should only be called with replies from non-masters.
      * Does not update _set at all.
      */
     void receivedIsMasterBeforeFoundMaster(const IsMasterReply& reply);
-
-    /**
-     * Shared implementation of refreshUntilMatches and refreshAll.
-     * NULL criteria means refresh every host.
-     * Handles own locking.
-     */
-    HostAndPort _refreshUntilMatches(const ReadPreferenceSetting* criteria);
 
     // Both pointers are never NULL
     SetStatePtr _set;

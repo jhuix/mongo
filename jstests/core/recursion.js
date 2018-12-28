@@ -1,5 +1,10 @@
-// Basic tests for a form of stack recursion that's been shown to cause C++
-// side stack overflows in the past. See SERVER-19614.
+// Basic tests for a form of stack recursion that's been shown to cause C++ side stack overflows in
+// the past. See SERVER-19614.
+//
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_non_retryable_commands,
+// ]
 
 (function() {
     "use strict";
@@ -11,17 +16,6 @@
         shellRecursion.apply();
     }
     assert.throws(shellRecursion);
-
-    // Make sure db.eval doesn't blow up
-    function dbEvalRecursion() {
-        db.eval(function() {
-            function recursion() {
-                recursion.apply();
-            }
-            recursion();
-        });
-    }
-    assert.commandFailedWithCode(assert.throws(dbEvalRecursion), ErrorCodes.JSInterpreterFailure);
 
     // Make sure mapReduce doesn't blow up
     function mapReduceRecursion() {

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2012-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -659,15 +661,15 @@ TEST(ReplicaSetMonitor, SlavesUsableEvenIfNoMaster) {
                                     << "ok"
                                     << true));
 
-    // Check intended conditions for entry to refreshUntilMatches.
+    // Check intended conditions for entry to getNextStep().
     ASSERT(state->currentScan->hostsToScan.empty());
     ASSERT(state->currentScan->waitingFor.empty());
     ASSERT(state->currentScan->possibleNodes == state->currentScan->triedHosts);
     ASSERT(state->getMatchingHost(secondary).empty());
 
-    // This calls getNextStep after not finding a matching host. We want to ensure that it checks
-    // again after being told that there are no more hosts to contact.
-    ASSERT(!refresher.refreshUntilMatches(secondary).empty());
+    // getNextStep() should add the possible nodes to the replica set provisionally after being told
+    // that there are no more hosts to contact. That is the final act of the scan.
+    ASSERT_EQ(refresher.getNextStep().step, Refresher::NextStep::DONE);
 
     // Future calls should be able to return directly from the cached data.
     ASSERT(!state->getMatchingHost(secondary).empty());
@@ -932,7 +934,7 @@ TEST(ReplicaSetMonitor, GetMatchingDuringScan) {
 TEST(ReplicaSetMonitor, OutOfBandFailedHost) {
     SetStatePtr state = std::make_shared<SetState>("name", basicSeedsSet);
     ReplicaSetMonitorPtr rsm = std::make_shared<ReplicaSetMonitor>(state);
-    Refresher refresher = rsm->startOrContinueRefresh();
+    Refresher refresher(state);
 
     for (size_t i = 0; i != basicSeeds.size(); ++i) {
         NextStep ns = refresher.getNextStep();
@@ -999,20 +1001,21 @@ TEST(ReplicaSetMonitorTests, NewPrimaryWithMaxElectionId) {
 
         refresher.receivedIsMaster(basicSeeds[i],
                                    -1,
-                                   BSON("setName"
-                                        << "name"
-                                        << "ismaster"
-                                        << true
-                                        << "secondary"
-                                        << false
-                                        << "hosts"
-                                        << BSON_ARRAY("a"
-                                                      << "b"
-                                                      << "c")
-                                        << "electionId"
-                                        << OID::gen()
-                                        << "ok"
-                                        << true));
+                                   BSON(
+                                       "setName"
+                                       << "name"
+                                       << "ismaster"
+                                       << true
+                                       << "secondary"
+                                       << false
+                                       << "hosts"
+                                       << BSON_ARRAY("a"
+                                                     << "b"
+                                                     << "c")
+                                       << "electionId"
+                                       << OID::fromTerm(i)  // electionId must increase every cycle.
+                                       << "ok"
+                                       << true));
 
         // Ensure the set primary is the host we just got a reply from
         HostAndPort currentPrimary = state->getMatchingHost(primaryOnly);

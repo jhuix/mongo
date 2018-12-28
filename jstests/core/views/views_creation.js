@@ -6,25 +6,19 @@
     // For arrayEq.
     load("jstests/aggregation/extras/utils.js");
 
-    let viewsDB = db.getSiblingDB("views_creation");
+    const viewsDBName = "views_creation";
+
+    let viewsDB = db.getSiblingDB(viewsDBName);
     assert.commandWorked(viewsDB.dropDatabase());
 
     let collNames = viewsDB.getCollectionNames();
     assert.eq(0, collNames.length, tojson(collNames));
 
     // You cannot create a view that starts with 'system.'.
-    assert.commandFailedWithCode(viewsDB.runCommand({create: "system.views", viewOn: "collection"}),
-                                 ErrorCodes.InvalidNamespace,
-                                 "Created an illegal view named 'system.views'");
-
-    // We don't run this check on MMAPv1 as it automatically creates a system.indexes collection
-    // when creating a database, which causes this command to fail with NamespaceAlreadyExists.
-    if (jsTest.options().storageEngine !== "mmapv1") {
-        assert.commandFailedWithCode(
-            viewsDB.runCommand({create: "system.indexes", viewOn: "collection"}),
-            ErrorCodes.InvalidNamespace,
-            "Created an illegal view named 'system.indexes'");
-    }
+    assert.commandFailedWithCode(
+        viewsDB.runCommand({create: "system.special", viewOn: "collection"}),
+        ErrorCodes.InvalidNamespace,
+        "Created an illegal view named 'system.views'");
 
     // Collections that start with 'system.' that are not special to MongoDB fail with a different
     // error code.
@@ -44,7 +38,7 @@
     collNames = viewsDB.getCollectionNames().filter((function(coll) {
         return !coll.startsWith("system.");
     }));
-    assert.eq(2, collNames.length, collNames);
+    assert.eq(2, collNames.length, tojson(collNames));
     let res = viewsDB.runCommand({listCollections: 1, filter: {type: "view"}});
     assert.commandWorked(res);
 
@@ -83,4 +77,35 @@
     assert.commandFailedWithCode(
         viewsDB.runCommand({create: "dollar$", viewOn: "collection", pipeline: pipe}),
         ErrorCodes.InvalidNamespace);
+
+    // You cannot create a view with a $out stage, by itself or nested inside of a different stage.
+    const outStage = {$out: "nonExistentCollection"};
+    assert.commandFailedWithCode(
+        viewsDB.runCommand({create: "viewWithOut", viewOn: "collection", pipeline: [outStage]}),
+        ErrorCodes.OptionNotSupportedOnView);
+    assert.commandFailedWithCode(viewsDB.runCommand({
+        create: "viewWithOutInLookup",
+        viewOn: "collection",
+        pipeline: [{$lookup: {from: "other", pipeline: [outStage], as: "result"}}]
+    }),
+                                 ErrorCodes.OptionNotSupportedOnView);
+    assert.commandFailedWithCode(viewsDB.runCommand({
+        create: "viewWithOutInFacet",
+        viewOn: "collection",
+        pipeline: [{$facet: {output: [outStage]}}]
+    }),
+                                 40600);
+
+    // These test that, when an existing view in system.views is invalid because of a $out in the
+    // pipeline, the database errors on creation of a new view.
+    assert.commandWorked(viewsDB.system.views.insert({
+        _id: `${viewsDBName}.invalidView`,
+        viewOn: "collection",
+        pipeline: [{$project: {_id: false}}, {$out: "notExistingCollection"}]
+    }));
+    assert.commandFailedWithCode(
+        viewsDB.runCommand({create: "viewWithBadViewCatalog", viewOn: "collection", pipeline: []}),
+        ErrorCodes.OptionNotSupportedOnView);
+    assert.commandWorked(
+        viewsDB.system.views.remove({_id: `${viewsDBName}.invalidView`}, {justOne: true}));
 }());

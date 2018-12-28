@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2016 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
@@ -44,6 +46,7 @@
 #include "mongo/db/views/view_graph.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -136,37 +139,39 @@ public:
     }
 
 private:
-    Status _createOrUpdateView_inlock(OperationContext* opCtx,
-                                      const NamespaceString& viewName,
-                                      const NamespaceString& viewOn,
-                                      const BSONArray& pipeline,
-                                      std::unique_ptr<CollatorInterface> collator);
+    Status _createOrUpdateView(WithLock,
+                               OperationContext* opCtx,
+                               const NamespaceString& viewName,
+                               const NamespaceString& viewOn,
+                               const BSONArray& pipeline,
+                               std::unique_ptr<CollatorInterface> collator);
     /**
      * Parses the view definition pipeline, attempts to upsert into the view graph, and refreshes
      * the graph if necessary. Returns an error status if the resulting graph would be invalid.
      */
-    Status _upsertIntoGraph(OperationContext* opCtx, const ViewDefinition& viewDef);
+    Status _upsertIntoGraph(WithLock, OperationContext* opCtx, const ViewDefinition& viewDef);
 
     /**
      * Returns Status::OK with the set of involved namespaces if the given pipeline is eligible to
      * act as a view definition. Otherwise, returns ErrorCodes::OptionNotSupportedOnView.
      */
-    StatusWith<stdx::unordered_set<NamespaceString>> _validatePipeline_inlock(
-        OperationContext* opCtx, const ViewDefinition& viewDef) const;
+    StatusWith<stdx::unordered_set<NamespaceString>> _validatePipeline(
+        WithLock, OperationContext* opCtx, const ViewDefinition& viewDef) const;
 
     /**
      * Returns Status::OK if each view namespace in 'refs' has the same default collation as 'view'.
      * Otherwise, returns ErrorCodes::OptionNotSupportedOnView.
      */
-    Status _validateCollation_inlock(OperationContext* opCtx,
-                                     const ViewDefinition& view,
-                                     const std::vector<NamespaceString>& refs);
+    Status _validateCollation(WithLock,
+                              OperationContext* opCtx,
+                              const ViewDefinition& view,
+                              const std::vector<NamespaceString>& refs);
 
-    std::shared_ptr<ViewDefinition> _lookup_inlock(OperationContext* opCtx, StringData ns);
-    Status _reloadIfNeeded_inlock(OperationContext* opCtx);
+    std::shared_ptr<ViewDefinition> _lookup(WithLock, OperationContext* opCtx, StringData ns);
+    Status _reloadIfNeeded(WithLock, OperationContext* opCtx);
 
-    void _requireValidCatalog_inlock(OperationContext* opCtx) {
-        uassertStatusOK(_reloadIfNeeded_inlock(opCtx));
+    void _requireValidCatalog(WithLock lk, OperationContext* opCtx) {
+        uassertStatusOK(_reloadIfNeeded(lk, opCtx));
         invariant(_valid.load());
     }
 

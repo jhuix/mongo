@@ -2,26 +2,28 @@
     compaction of deleted space in pdfiles (datafiles)
 */
 
+
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- *    This program is distributed in the hope that it will be useful,b
+ *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,7 +39,6 @@
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -49,9 +50,7 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
-
-using std::string;
-using std::stringstream;
+namespace {
 
 class TouchCmd : public ErrmsgCommandDeprecated {
 public:
@@ -61,21 +60,21 @@ public:
     virtual bool adminOnly() const {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool maintenanceMode() const {
         return true;
     }
-    virtual void help(stringstream& help) const {
-        help << "touch collection\n"
-                "Page in all pages of memory containing every extent for the given collection\n"
-                "{ touch : <collection_name>, [data : true] , [index : true] }\n"
-                " at least one of data or index must be true; default is both are false\n";
+    std::string help() const override {
+        return "touch collection\n"
+               "Page in all pages of memory containing every extent for the given collection\n"
+               "{ touch : <collection_name>, [data : true] , [index : true] }\n"
+               " at least one of data or index must be true; default is both are false\n";
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::touch);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -83,11 +82,11 @@ public:
     TouchCmd() : ErrmsgCommandDeprecated("touch") {}
 
     virtual bool errmsgRun(OperationContext* opCtx,
-                           const string& dbname,
+                           const std::string& dbname,
                            const BSONObj& cmdObj,
-                           string& errmsg,
+                           std::string& errmsg,
                            BSONObjBuilder& result) {
-        const NamespaceString nss = parseNsCollectionRequired(dbname, cmdObj);
+        const NamespaceString nss = CommandHelpers::parseNsCollectionRequired(dbname, cmdObj);
         if (!nss.isNormal()) {
             errmsg = "bad namespace name";
             return false;
@@ -109,9 +108,11 @@ public:
             return false;
         }
 
-        return appendCommandStatus(result,
-                                   collection->touch(opCtx, touch_data, touch_indexes, &result));
+        uassertStatusOK(collection->touch(opCtx, touch_data, touch_indexes, &result));
+        return true;
     }
-};
-static TouchCmd touchCmd;
-}
+
+} touchCmd;
+
+}  // namespace
+}  // namespace mongo

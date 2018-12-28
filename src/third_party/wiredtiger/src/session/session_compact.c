@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -250,7 +250,7 @@ __compact_worker(WT_SESSION_IMPL *session)
 {
 	WT_DECL_RET;
 	u_int i, loop;
-	bool didwork;
+	bool another_pass;
 
 	/*
 	 * Reset the handles' compaction skip flag (we don't bother setting
@@ -274,7 +274,8 @@ __compact_worker(WT_SESSION_IMPL *session)
 	 */
 	for (loop = 0; loop < 100; ++loop) {
 		/* Step through the list of files being compacted. */
-		for (didwork = false, i = 0; i < session->op_handle_next; ++i) {
+		for (another_pass = false,
+		    i = 0; i < session->op_handle_next; ++i) {
 			/* Skip objects where there's no more work. */
 			if (session->op_handle[i]->compact_skip)
 				continue;
@@ -282,15 +283,43 @@ __compact_worker(WT_SESSION_IMPL *session)
 			session->compact_state = WT_COMPACT_RUNNING;
 			WT_WITH_DHANDLE(session,
 			    session->op_handle[i], ret = __wt_compact(session));
-			WT_ERR(ret);
 
-			/* If we did no work, skip this file in the future. */
-			if (session->compact_state == WT_COMPACT_SUCCESS)
-				didwork = true;
-			else
-				session->op_handle[i]->compact_skip = true;
+			/*
+			 * If successful and we did work, schedule another pass.
+			 * If successful and we did no work, skip this file in
+			 * the future.
+			 */
+			if (ret == 0) {
+				if (session->
+				    compact_state == WT_COMPACT_SUCCESS)
+					another_pass = true;
+				else
+					session->
+					    op_handle[i]->compact_skip = true;
+				continue;
+			}
+
+			/*
+			 * If compaction failed because checkpoint was running,
+			 * continue with the next handle. We might continue to
+			 * race with checkpoint on each handle, but that's OK,
+			 * we'll step through all the handles, and then we'll
+			 * block until a checkpoint completes.
+			 *
+			 * Just quit if eviction is the problem.
+			 */
+			if (ret == EBUSY) {
+				if (__wt_cache_stuck(session)) {
+					WT_ERR_MSG(session, EBUSY,
+					    "compaction halted by eviction "
+					    "pressure");
+				}
+				ret = 0;
+				another_pass = true;
+			}
+			WT_ERR(ret);
 		}
-		if (!didwork)
+		if (!another_pass)
 			break;
 
 		/*
@@ -320,9 +349,22 @@ __wt_session_compact(
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
 	u_int i;
+	bool ignore_cache_size_set;
+
+	ignore_cache_size_set = false;
 
 	session = (WT_SESSION_IMPL *)wt_session;
 	SESSION_API_CALL(session, compact, config, cfg);
+
+	/*
+	 * The compaction thread should not block when the cache is full: it is
+	 * holding locks blocking checkpoints and once the cache is full, it can
+	 * spend a long time doing eviction.
+	 */
+	if (!F_ISSET(session, WT_SESSION_IGNORE_CACHE_SIZE)) {
+		ignore_cache_size_set = true;
+		F_SET(session, WT_SESSION_IGNORE_CACHE_SIZE);
+	}
 
 	/* In-memory ignores compaction operations. */
 	if (F_ISSET(S2C(session), WT_CONN_IN_MEMORY))
@@ -363,10 +405,15 @@ __wt_session_compact(
 	session->compact->max_time = (uint64_t)cval.val;
 	__wt_epoch(session, &session->compact->begin);
 
-	/* Find the types of data sources being compacted. */
+	/*
+	 * Find the types of data sources being compacted.  This could involve
+	 * opening indexes for a table, so acquire the table lock in write
+	 * mode.
+	 */
 	WT_WITH_SCHEMA_LOCK(session,
-	    ret = __wt_schema_worker(session, uri,
-	    __compact_handle_append, __compact_uri_analyze, cfg, 0));
+	    WT_WITH_TABLE_WRITE_LOCK(session,
+		ret = __wt_schema_worker(session, uri,
+		__compact_handle_append, __compact_uri_analyze, cfg, 0)));
 	WT_ERR(ret);
 
 	if (session->compact->lsm_count != 0)
@@ -392,6 +439,9 @@ err:	session->compact = NULL;
 	 * significant reconciliation structures/memory).
 	 */
 	WT_TRET(__wt_session_release_resources(session));
+
+	if (ignore_cache_size_set)
+		F_CLR(session, WT_SESSION_IGNORE_CACHE_SIZE);
 
 	if (ret != 0)
 		WT_STAT_CONN_INCR(session, session_table_compact_fail);

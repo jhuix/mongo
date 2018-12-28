@@ -1,6 +1,18 @@
 /**
  * 1. check top numbers are correct
+ *
+ * This test attempts to perform read operations and get statistics using the top command. The
+ * former operation may be routed to a secondary in the replica set, whereas the latter must be
+ * routed to the primary.
+ *
+ * @tags: [
+ *  assumes_read_preference_unchanged,
+ *  requires_fastcount,
+ *
+ *  # top command is not available on embedded
+ *  incompatible_with_embedded]
  */
+
 (function() {
     load("jstests/libs/stats.js");
 
@@ -93,4 +105,19 @@
         assert.eq(res.value.x, i + 1, tojson(res));
     }
     lastTop = assertTopDiffEq(testColl, lastTop, "commands", numRecords);
+
+    // getIndexes
+    assert.eq(1, testColl.getIndexes().length);
+    assertTopDiffEq(testColl, lastTop, "commands", 1);
+    lastTop = assertTopDiffEq(testColl, lastTop, "readLock", 1);
+
+    // createIndex
+    res = assert.commandWorked(testColl.createIndex({x: 1}));
+    assertTopDiffEq(testColl, lastTop, "writeLock", 1);
+    lastTop = assertTopDiffEq(testColl, lastTop, "commands", 1);
+
+    // dropIndex
+    res = assert.commandWorked(testColl.dropIndex({x: 1}));
+    assertTopDiffEq(testColl, lastTop, "commands", 1);
+    lastTop = assertTopDiffEq(testColl, lastTop, "writeLock", 1);
 }());

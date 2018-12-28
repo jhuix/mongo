@@ -1,3 +1,7 @@
+// @tags: [
+//   requires_non_retryable_commands,
+// ]
+
 t = db.jstests_rename4;
 t.drop();
 

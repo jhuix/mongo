@@ -1,4 +1,9 @@
 // Tests to see what validity checks are done for 10gen specific object construction
+//
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_non_retryable_commands,
+// ]
 
 // Takes a list of constructors and returns a new list with an extra entry for each constructor with
 // "new" prepended
@@ -28,24 +33,6 @@ function clientEvalConstructorTest(constructorList) {
         assert.throws(function() {
             eval(constructor);
         }, [], "invalid constructor did not throw error in eval context: " + constructor);
-    });
-}
-
-function dbEvalConstructorTest(constructorList) {
-    assert.writeOK(db.evalConstructors.insert({}), "db must exist for eval to succeed");
-    assert(db.evalConstructors.drop());
-    constructorList = addConstructorsWithNew(constructorList);
-    constructorList.valid.forEach(function(constructor) {
-        try {
-            db.eval(constructor);
-        } catch (e) {
-            throw("valid constructor: " + constructor + " failed in db.eval context: " + e);
-        }
-    });
-    constructorList.invalid.forEach(function(constructor) {
-        assert.throws(function() {
-            db.eval(constructor);
-        }, [], "invalid constructor did not throw error in db.eval context: " + constructor);
     });
 }
 
@@ -283,16 +270,6 @@ clientEvalConstructorTest(uuidConstructors);
 clientEvalConstructorTest(md5Constructors);
 clientEvalConstructorTest(hexdataConstructors);
 clientEvalConstructorTest(dateConstructors);
-
-dbEvalConstructorTest(dbrefConstructors);
-dbEvalConstructorTest(dbpointerConstructors);
-dbEvalConstructorTest(objectidConstructors);
-dbEvalConstructorTest(timestampConstructors);
-dbEvalConstructorTest(bindataConstructors);
-dbEvalConstructorTest(uuidConstructors);
-dbEvalConstructorTest(md5Constructors);
-dbEvalConstructorTest(hexdataConstructors);
-dbEvalConstructorTest(dateConstructors);
 
 mapReduceConstructorTest(dbrefConstructors);
 mapReduceConstructorTest(dbpointerConstructors);

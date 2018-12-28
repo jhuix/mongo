@@ -12,6 +12,17 @@
 
 (function() {
     "use strict";
+
+    // Arbiters don't replicate the admin.system.keys collection, so they can never validate or sign
+    // clusterTime. Gossiping a clusterTime to an arbiter as a user other than __system will fail,
+    // so we skip gossiping for this test.
+    //
+    // TODO SERVER-32639: remove this flag.
+    TestData.skipGossipingClusterTime = true;
+
+    // TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+    TestData.disableImplicitSessions = true;
+
     // helper function for verifying contents at the end of the test
     var checkFinalResults = function(db) {
         assert.commandWorked(db.runCommand({dbStats: 1}));
@@ -119,7 +130,7 @@
         } catch (e) {
             return false;
         }
-    }, "B didn't become master", 60000, 1000);
+    }, "B didn't become master");
     printjson(b.adminCommand('replSetGetStatus'));
 
     // Modify the the user and role in a way that will be rolled back.
@@ -154,7 +165,7 @@
         } catch (e) {
             return false;
         }
-    }, "A didn't become master", 60000, 1000);
+    }, "A didn't become master");
 
     // A should not have the new data as it was down
     assert.commandWorked(a.runCommand({dbStats: 1}));
@@ -189,15 +200,22 @@
     // bring B back in contact with A
     // as A is primary, B will roll back and then catch up
     replTest.restart(1);
-    authutil.asCluster(replTest.nodes, 'jstests/libs/key1', function() {
-        replTest.awaitReplication();
-    });
-    assert.soon(function() {
+    assert.soonNoExcept(function() {
+        authutil.asCluster(replTest.nodes, 'jstests/libs/key1', function() {
+            replTest.awaitReplication();
+        });
+
         return b.auth('spencer', 'pwd');
     });
     // Now both A and B should agree
     checkFinalResults(a);
     checkFinalResults(b);
 
+    // Verify data consistency between nodes.
+    authutil.asCluster(replTest.nodes, 'jstests/libs/key1', function() {
+        replTest.checkOplogs();
+    });
+
+    // DB hash check is done in stopSet.
     replTest.stopSet();
 }());

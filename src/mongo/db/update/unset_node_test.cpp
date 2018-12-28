@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -85,6 +87,7 @@ TEST_F(UnsetNodeTest, UnsetNoOp) {
     ASSERT_EQUALS(fromjson("{b: 5}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
 TEST_F(UnsetNodeTest, UnsetNoOpDottedPath) {
@@ -103,6 +106,7 @@ TEST_F(UnsetNodeTest, UnsetNoOpDottedPath) {
     ASSERT_EQUALS(fromjson("{a: 5}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 
 TEST_F(UnsetNodeTest, UnsetNoOpThroughArray) {
@@ -121,6 +125,7 @@ TEST_F(UnsetNodeTest, UnsetNoOpThroughArray) {
     ASSERT_EQUALS(fromjson("{a:[{b:1}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 
 TEST_F(UnsetNodeTest, UnsetNoOpEmptyDoc) {
@@ -138,6 +143,7 @@ TEST_F(UnsetNodeTest, UnsetNoOpEmptyDoc) {
     ASSERT_EQUALS(fromjson("{}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
 TEST_F(UnsetNodeTest, UnsetTopLevelPath) {
@@ -155,6 +161,7 @@ TEST_F(UnsetNodeTest, UnsetTopLevelPath) {
     ASSERT_EQUALS(fromjson("{}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$unset: {a: true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
 TEST_F(UnsetNodeTest, UnsetNestedPath) {
@@ -172,6 +179,7 @@ TEST_F(UnsetNodeTest, UnsetNestedPath) {
     ASSERT_EQUALS(fromjson("{a: {b: {}}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$unset: {'a.b.c': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b.c}");
 }
 
 TEST_F(UnsetNodeTest, UnsetObject) {
@@ -189,6 +197,7 @@ TEST_F(UnsetNodeTest, UnsetObject) {
     ASSERT_EQUALS(fromjson("{a: {}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$unset: {'a.b': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 
 TEST_F(UnsetNodeTest, UnsetArrayElement) {
@@ -200,12 +209,13 @@ TEST_F(UnsetNodeTest, UnsetArrayElement) {
     mutablebson::Document doc(fromjson("{a:[1], b:1}"));
     setPathTaken("a.0");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["0"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][0]));
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a:[null], b:1}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$unset: {'a.0': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0}");
 }
 
 TEST_F(UnsetNodeTest, UnsetPositional) {
@@ -218,12 +228,13 @@ TEST_F(UnsetNodeTest, UnsetPositional) {
     setPathTaken("a.1");
     setMatchedField("1");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["1"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][1]));
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: [0, null, 2]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$unset: {'a.1': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.1}");
 }
 
 TEST_F(UnsetNodeTest, UnsetEntireArray) {
@@ -241,6 +252,7 @@ TEST_F(UnsetNodeTest, UnsetEntireArray) {
     ASSERT_EQUALS(fromjson("{}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$unset: {a: true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
 TEST_F(UnsetNodeTest, UnsetFromObjectInArray) {
@@ -252,12 +264,13 @@ TEST_F(UnsetNodeTest, UnsetFromObjectInArray) {
     mutablebson::Document doc(fromjson("{a: [{b: 1}]}"));
     setPathTaken("a.0.b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["0"]["b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][0]["b"]));
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a:[{}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$unset: {'a.0.b': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.b}");
 }
 
 TEST_F(UnsetNodeTest, CanUnsetInvalidField) {
@@ -269,12 +282,13 @@ TEST_F(UnsetNodeTest, CanUnsetInvalidField) {
     mutablebson::Document doc(fromjson("{b: 1, a: [{$b: 1}]}"));
     setPathTaken("a.0.$b");
     addIndexedPath("a");
-    auto result = node.apply(getApplyParams(doc.root()["a"]["0"]["$b"]));
+    auto result = node.apply(getApplyParams(doc.root()["a"][0]["$b"]));
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{b: 1, a: [{}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$unset: {'a.0.$b': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.0.$b}");
 }
 
 TEST_F(UnsetNodeTest, ApplyNoIndexDataNoLogBuilder) {
@@ -291,6 +305,7 @@ TEST_F(UnsetNodeTest, ApplyNoIndexDataNoLogBuilder) {
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
 TEST_F(UnsetNodeTest, ApplyDoesNotAffectIndexes) {
@@ -308,6 +323,7 @@ TEST_F(UnsetNodeTest, ApplyDoesNotAffectIndexes) {
     ASSERT_EQUALS(fromjson("{}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$unset: {a: true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a}");
 }
 
 TEST_F(UnsetNodeTest, ApplyFieldWithDot) {
@@ -325,6 +341,7 @@ TEST_F(UnsetNodeTest, ApplyFieldWithDot) {
     ASSERT_EQUALS(fromjson("{'a.b':4, a: {}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$unset: {'a.b': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b}");
 }
 
 TEST_F(UnsetNodeTest, ApplyCannotRemoveRequiredPartOfDBRef) {
@@ -359,6 +376,7 @@ TEST_F(UnsetNodeTest, ApplyCanRemoveRequiredPartOfDBRefIfValidateForStorageIsFal
     ASSERT_EQUALS(updated, doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{$unset: {'a.$id': true}}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.$id}");
 }
 
 TEST_F(UnsetNodeTest, ApplyCannotRemoveImmutablePath) {
@@ -426,6 +444,7 @@ TEST_F(UnsetNodeTest, ApplyCanRemoveImmutablePathIfNoop) {
     ASSERT_EQUALS(fromjson("{a: {b: 1}}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_EQUALS(getModifiedPaths(), "{a.b.c}");
 }
 
 }  // namespace

@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -66,15 +68,18 @@ typedef std::vector<std::pair<BSONObj, BSONObj>> BoundList;
 class ShardKeyPattern {
 public:
     // Maximum size of shard key
-    static const int kMaxShardKeySizeBytes;
-
-    // Maximum number of intervals produced by $in queries.
-    static const unsigned int kMaxFlattenedInCombinations;
+    static constexpr int kMaxShardKeySizeBytes = 512;
 
     /**
      * Helper to check shard key size and generate an appropriate error message.
      */
     static Status checkShardKeySize(const BSONObj& shardKey);
+
+    /**
+     * Validates whether the specified shard key is valid to be written as part of the sharding
+     * metadata.
+     */
+    static Status checkShardKeyIsValidForMetadataStorage(const BSONObj& shardKey);
 
     /**
      * Constructs a shard key pattern from a BSON pattern document.  If the document is not a
@@ -87,7 +92,10 @@ public:
      */
     explicit ShardKeyPattern(const KeyPattern& keyPattern);
 
-    bool isValid() const;
+    /**
+     * Returns whether the provided element is hashed.
+     */
+    static bool isHashedPatternEl(const BSONElement& el);
 
     bool isHashedPattern() const;
 
@@ -142,6 +150,14 @@ public:
      * See above.
      */
     BSONObj extractShardKeyFromDoc(const BSONObj& doc) const;
+
+    /**
+     * Returns the set of shard key fields which are absent from the given document. Note that the
+     * vector returned by this method contains StringData elements pointing into ShardKeyPattern's
+     * underlying BSONObj. If the fieldnames are required to survive beyond the lifetime of this
+     * ShardKeyPattern, callers should create their own copies.
+     */
+    std::vector<StringData> findMissingShardKeyFieldsFromDoc(const BSONObj doc) const;
 
     /**
      * Given a simple BSON query, extracts the shard key corresponding to the key pattern
@@ -233,10 +249,10 @@ public:
     };
 
 private:
+    KeyPattern _keyPattern;
+
     // Ordered, parsed paths
     std::vector<std::unique_ptr<FieldRef>> _keyPatternPaths;
-
-    KeyPattern _keyPattern;
 
     bool _hasId;
 };

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -112,17 +114,18 @@ SolutionCacheData* createSolutionCacheData() {
 /**
  * Utility function to create a PlanRankingDecision
  */
-PlanRankingDecision* createDecision(size_t numPlans) {
+std::unique_ptr<PlanRankingDecision> createDecision(size_t numPlans, size_t works = 0) {
     unique_ptr<PlanRankingDecision> why(new PlanRankingDecision());
     for (size_t i = 0; i < numPlans; ++i) {
         CommonStats common("COLLSCAN");
         auto stats = stdx::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
         stats->specific.reset(new CollectionScanStats());
         why->stats.push_back(std::move(stats));
+        why->stats[i]->common.works = works;
         why->scores.push_back(0U);
         why->candidateOrder.push_back(i);
     }
-    return why.release();
+    return why;
 }
 
 TEST(PlanCacheCommandsTest, planCacheListQueryShapesEmpty) {
@@ -151,7 +154,10 @@ TEST(PlanCacheCommandsTest, planCacheListQueryShapesOneKey) {
     qs.cacheData.reset(createSolutionCacheData());
     std::vector<QuerySolution*> solns;
     solns.push_back(&qs);
-    planCache.add(*cq, solns, createDecision(1U)).transitional_ignore();
+    ASSERT_OK(planCache.set(*cq,
+                            solns,
+                            createDecision(1U),
+                            opCtx->getServiceContext()->getPreciseClockSource()->now()));
 
     vector<BSONObj> shapes = getShapes(planCache);
     ASSERT_EQUALS(shapes.size(), 1U);
@@ -183,7 +189,10 @@ TEST(PlanCacheCommandsTest, planCacheClearAllShapes) {
     qs.cacheData.reset(createSolutionCacheData());
     std::vector<QuerySolution*> solns;
     solns.push_back(&qs);
-    planCache.add(*cq, solns, createDecision(1U)).transitional_ignore();
+    ASSERT_OK(planCache.set(*cq,
+                            solns,
+                            createDecision(1U),
+                            opCtx->getServiceContext()->getPreciseClockSource()->now()));
     ASSERT_EQUALS(getShapes(planCache).size(), 1U);
 
     // Clear cache and confirm number of keys afterwards.
@@ -230,7 +239,6 @@ TEST(PlanCacheCommandsTest, Canonicalize) {
         PlanCacheCommand::canonicalize(opCtx.get(), nss.ns(), fromjson("{query: {a: 1, b: 1}}"));
     ASSERT_OK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> query = std::move(statusWithCQ.getValue());
-
 
     // Equivalent query should generate same key.
     statusWithCQ =
@@ -322,8 +330,14 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKey) {
     qs.cacheData.reset(createSolutionCacheData());
     std::vector<QuerySolution*> solns;
     solns.push_back(&qs);
-    planCache.add(*cqA, solns, createDecision(1U)).transitional_ignore();
-    planCache.add(*cqB, solns, createDecision(1U)).transitional_ignore();
+    ASSERT_OK(planCache.set(*cqA,
+                            solns,
+                            createDecision(1U),
+                            opCtx->getServiceContext()->getPreciseClockSource()->now()));
+    ASSERT_OK(planCache.set(*cqB,
+                            solns,
+                            createDecision(1U),
+                            opCtx->getServiceContext()->getPreciseClockSource()->now()));
 
     // Check keys in cache before dropping {b: 1}
     vector<BSONObj> shapesBefore = getShapes(planCache);
@@ -336,11 +350,13 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKey) {
                 << cqB->getQueryRequest().getProj());
     ASSERT_TRUE(
         std::find_if(shapesBefore.begin(), shapesBefore.end(), [&shapeA](const BSONObj& obj) {
-            return SimpleBSONObjComparator::kInstance.evaluate(shapeA == obj);
+            auto filteredObj = obj.removeField("queryHash");
+            return SimpleBSONObjComparator::kInstance.evaluate(shapeA == filteredObj);
         }) != shapesBefore.end());
     ASSERT_TRUE(
         std::find_if(shapesBefore.begin(), shapesBefore.end(), [&shapeB](const BSONObj& obj) {
-            return SimpleBSONObjComparator::kInstance.evaluate(shapeB == obj);
+            auto filteredObj = obj.removeField("queryHash");
+            return SimpleBSONObjComparator::kInstance.evaluate(shapeB == filteredObj);
         }) != shapesBefore.end());
 
     // Drop {b: 1} from cache. Make sure {a: 1} is still in cache afterwards.
@@ -350,7 +366,8 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKey) {
         opCtx.get(), &planCache, nss.ns(), BSON("query" << cqB->getQueryObj())));
     vector<BSONObj> shapesAfter = getShapes(planCache);
     ASSERT_EQUALS(shapesAfter.size(), 1U);
-    ASSERT_BSONOBJ_EQ(shapesAfter[0], shapeA);
+    auto filteredShape0 = shapesAfter[0].removeField("queryHash");
+    ASSERT_BSONOBJ_EQ(filteredShape0, shapeA);
 }
 
 TEST(PlanCacheCommandsTest, planCacheClearOneKeyCollation) {
@@ -373,14 +390,25 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKeyCollation) {
     // Create plan cache with 2 entries. Add an index so that indexability is included in the plan
     // cache keys.
     PlanCache planCache;
-    planCache.notifyOfIndexEntries(
-        {IndexEntry(fromjson("{a: 1}"), false, false, false, "index_name", NULL, BSONObj())});
+    const auto keyPattern = fromjson("{a: 1}");
+    planCache.notifyOfIndexUpdates(
+        {CoreIndexInfo(keyPattern,
+                       IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                       false,                                   // sparse
+                       IndexEntry::Identifier{"indexName"})});  // name
+
     QuerySolution qs;
     qs.cacheData.reset(createSolutionCacheData());
     std::vector<QuerySolution*> solns;
     solns.push_back(&qs);
-    planCache.add(*cq, solns, createDecision(1U)).transitional_ignore();
-    planCache.add(*cqCollation, solns, createDecision(1U)).transitional_ignore();
+    ASSERT_OK(planCache.set(*cq,
+                            solns,
+                            createDecision(1U),
+                            opCtx->getServiceContext()->getPreciseClockSource()->now()));
+    ASSERT_OK(planCache.set(*cqCollation,
+                            solns,
+                            createDecision(1U),
+                            opCtx->getServiceContext()->getPreciseClockSource()->now()));
 
     // Check keys in cache before dropping the query with collation.
     vector<BSONObj> shapesBefore = getShapes(planCache);
@@ -396,13 +424,16 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKeyCollation) {
                                               << cqCollation->getCollator()->getSpec().toBSON());
     ASSERT_TRUE(
         std::find_if(shapesBefore.begin(), shapesBefore.end(), [&shape](const BSONObj& obj) {
-            return SimpleBSONObjComparator::kInstance.evaluate(shape == obj);
+            auto filteredObj = obj.removeField("queryHash");
+            return SimpleBSONObjComparator::kInstance.evaluate(shape == filteredObj);
         }) != shapesBefore.end());
-    ASSERT_TRUE(
-        std::find_if(
-            shapesBefore.begin(), shapesBefore.end(), [&shapeWithCollation](const BSONObj& obj) {
-                return SimpleBSONObjComparator::kInstance.evaluate(shapeWithCollation == obj);
-            }) != shapesBefore.end());
+    ASSERT_TRUE(std::find_if(shapesBefore.begin(),
+                             shapesBefore.end(),
+                             [&shapeWithCollation](const BSONObj& obj) {
+                                 auto filteredObj = obj.removeField("queryHash");
+                                 return SimpleBSONObjComparator::kInstance.evaluate(
+                                     shapeWithCollation == filteredObj);
+                             }) != shapesBefore.end());
 
     // Drop query with collation from cache. Make other query is still in cache afterwards.
     BSONObjBuilder bob;
@@ -410,7 +441,8 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKeyCollation) {
     ASSERT_OK(PlanCacheClear::clear(opCtx.get(), &planCache, nss.ns(), shapeWithCollation));
     vector<BSONObj> shapesAfter = getShapes(planCache);
     ASSERT_EQUALS(shapesAfter.size(), 1U);
-    ASSERT_BSONOBJ_EQ(shapesAfter[0], shape);
+    auto filteredShape0 = shapesAfter[0].removeField("queryHash");
+    ASSERT_BSONOBJ_EQ(filteredShape0, shape);
 }
 
 /**
@@ -450,14 +482,12 @@ BSONObj getPlan(const BSONElement& elt) {
     return obj.getOwned();
 }
 
-/**
- * Utility function to get list of plan IDs for a query in the cache.
- */
-vector<BSONObj> getPlans(const PlanCache& planCache,
-                         const BSONObj& query,
-                         const BSONObj& sort,
-                         const BSONObj& projection,
-                         const BSONObj& collation) {
+BSONObj getCmdResult(const PlanCache& planCache,
+                     const BSONObj& query,
+                     const BSONObj& sort,
+                     const BSONObj& projection,
+                     const BSONObj& collation) {
+
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
@@ -472,6 +502,22 @@ vector<BSONObj> getPlans(const PlanCache& planCache,
     BSONObj cmdObj = cmdObjBuilder.obj();
     ASSERT_OK(PlanCacheListPlans::list(opCtx.get(), planCache, nss.ns(), cmdObj, &bob));
     BSONObj resultObj = bob.obj();
+
+    return resultObj;
+}
+
+/**
+ * Utility function to get list of plan IDs for a query in the cache.
+ */
+vector<BSONObj> getPlans(const PlanCache& planCache,
+                         const BSONObj& query,
+                         const BSONObj& sort,
+                         const BSONObj& projection,
+                         const BSONObj& collation) {
+    BSONObj resultObj = getCmdResult(planCache, query, sort, projection, collation);
+    ASSERT_TRUE(resultObj.hasField("isActive"));
+    ASSERT_TRUE(resultObj.hasField("works"));
+
     BSONElement plansElt = resultObj.getField("plans");
     ASSERT_EQUALS(plansElt.type(), mongo::Array);
     vector<BSONElement> planEltArray = plansElt.Array();
@@ -522,14 +568,20 @@ TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionTrue) {
     qs.cacheData.reset(createSolutionCacheData());
     std::vector<QuerySolution*> solns;
     solns.push_back(&qs);
-    planCache.add(*cq, solns, createDecision(1U)).transitional_ignore();
+    ASSERT_OK(planCache.set(*cq,
+                            solns,
+                            createDecision(1U, 123),
+                            opCtx->getServiceContext()->getPreciseClockSource()->now()));
 
-    vector<BSONObj> plans = getPlans(planCache,
+    BSONObj resultObj = getCmdResult(planCache,
                                      cq->getQueryObj(),
                                      cq->getQueryRequest().getSort(),
                                      cq->getQueryRequest().getProj(),
                                      cq->getQueryRequest().getCollation());
-    ASSERT_EQUALS(plans.size(), 1U);
+
+    ASSERT_EQ(resultObj["plans"].Array().size(), 1u);
+    ASSERT_EQ(resultObj.getBoolField("isActive"), false);
+    ASSERT_EQ(resultObj.getIntField("works"), 123L);
 }
 
 TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionFalse) {
@@ -551,14 +603,20 @@ TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionFalse) {
     std::vector<QuerySolution*> solns;
     solns.push_back(&qs);
     solns.push_back(&qs);
-    planCache.add(*cq, solns, createDecision(2U)).transitional_ignore();
+    ASSERT_OK(planCache.set(*cq,
+                            solns,
+                            createDecision(2U, 333),
+                            opCtx->getServiceContext()->getPreciseClockSource()->now()));
 
-    vector<BSONObj> plans = getPlans(planCache,
+    BSONObj resultObj = getCmdResult(planCache,
                                      cq->getQueryObj(),
                                      cq->getQueryRequest().getSort(),
                                      cq->getQueryRequest().getProj(),
                                      cq->getQueryRequest().getCollation());
-    ASSERT_EQUALS(plans.size(), 2U);
+
+    ASSERT_EQ(resultObj["plans"].Array().size(), 2u);
+    ASSERT_EQ(resultObj.getBoolField("isActive"), false);
+    ASSERT_EQ(resultObj.getIntField("works"), 333);
 }
 
 
@@ -582,17 +640,28 @@ TEST(PlanCacheCommandsTest, planCacheListPlansCollation) {
     // Create plan cache with 2 entries. Add an index so that indexability is included in the plan
     // cache keys. Give query with collation two solutions.
     PlanCache planCache;
-    planCache.notifyOfIndexEntries(
-        {IndexEntry(fromjson("{a: 1}"), false, false, false, "index_name", NULL, BSONObj())});
+    const auto keyPattern = fromjson("{a: 1}");
+    planCache.notifyOfIndexUpdates(
+        {CoreIndexInfo(keyPattern,
+                       IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                       false,                                   // sparse
+                       IndexEntry::Identifier{"indexName"})});  // name
+
     QuerySolution qs;
     qs.cacheData.reset(createSolutionCacheData());
     std::vector<QuerySolution*> solns;
     solns.push_back(&qs);
-    planCache.add(*cq, solns, createDecision(1U)).transitional_ignore();
+    ASSERT_OK(planCache.set(*cq,
+                            solns,
+                            createDecision(1U),
+                            opCtx->getServiceContext()->getPreciseClockSource()->now()));
     std::vector<QuerySolution*> twoSolns;
     twoSolns.push_back(&qs);
     twoSolns.push_back(&qs);
-    planCache.add(*cqCollation, twoSolns, createDecision(2U)).transitional_ignore();
+    ASSERT_OK(planCache.set(*cqCollation,
+                            twoSolns,
+                            createDecision(2U),
+                            opCtx->getServiceContext()->getPreciseClockSource()->now()));
 
     // Normal query should have one solution.
     vector<BSONObj> plans = getPlans(planCache,
@@ -609,6 +678,31 @@ TEST(PlanCacheCommandsTest, planCacheListPlansCollation) {
                                               cqCollation->getQueryRequest().getProj(),
                                               cqCollation->getQueryRequest().getCollation());
     ASSERT_EQUALS(plansCollation.size(), 2U);
+}
+
+TEST(PlanCacheCommandsTest, planCacheListPlansTimeOfCreationIsCorrect) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    // Create a canonical query.
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(fromjson("{a: 1}"));
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(qr));
+    ASSERT_OK(statusWithCQ.getStatus());
+    auto cq = std::move(statusWithCQ.getValue());
+
+    // Plan cache with one entry.
+    PlanCache planCache;
+    QuerySolution qs;
+    qs.cacheData.reset(createSolutionCacheData());
+    std::vector<QuerySolution*> solns;
+    solns.push_back(&qs);
+    auto now = opCtx->getServiceContext()->getPreciseClockSource()->now();
+    ASSERT_OK(planCache.set(*cq, solns, createDecision(1U), now));
+
+    auto entry = unittest::assertGet(planCache.getEntry(*cq));
+
+    ASSERT_EQ(entry->timeOfCreation, now);
 }
 
 }  // namespace

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,45 +36,68 @@
 
 #include "mongo/bson/bsontypes.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
 namespace {
 
+const char kCursorsField[] = "cursors";
 const char kCursorField[] = "cursor";
 const char kIdField[] = "id";
 const char kNsField[] = "ns";
 const char kBatchField[] = "nextBatch";
 const char kBatchFieldInitial[] = "firstBatch";
+const char kBatchDocSequenceField[] = "cursor.nextBatch";
+const char kBatchDocSequenceFieldInitial[] = "cursor.firstBatch";
 const char kInternalLatestOplogTimestampField[] = "$_internalLatestOplogTimestamp";
+const char kPostBatchResumeTokenField[] = "postBatchResumeToken";
 
 }  // namespace
 
-CursorResponseBuilder::CursorResponseBuilder(bool isInitialResponse,
-                                             BSONObjBuilder* commandResponse)
-    : _responseInitialLen(commandResponse->bb().len()),
-      _commandResponse(commandResponse),
-      _cursorObject(commandResponse->subobjStart(kCursorField)),
-      _batch(_cursorObject.subarrayStart(isInitialResponse ? kBatchFieldInitial : kBatchField)) {}
+CursorResponseBuilder::CursorResponseBuilder(rpc::ReplyBuilderInterface* replyBuilder,
+                                             Options options = Options())
+    : _options(options), _replyBuilder(replyBuilder) {
+    if (_options.useDocumentSequences) {
+        _docSeqBuilder.emplace(_replyBuilder->getDocSequenceBuilder(
+            _options.isInitialResponse ? kBatchDocSequenceFieldInitial : kBatchDocSequenceField));
+    } else {
+        _bodyBuilder.emplace(_replyBuilder->getBodyBuilder());
+        _cursorObject.emplace(_bodyBuilder->subobjStart(kCursorField));
+        _batch.emplace(_cursorObject->subarrayStart(_options.isInitialResponse ? kBatchFieldInitial
+                                                                               : kBatchField));
+    }
+}
 
 void CursorResponseBuilder::done(CursorId cursorId, StringData cursorNamespace) {
     invariant(_active);
-    _batch.doneFast();
-    _cursorObject.append(kIdField, cursorId);
-    _cursorObject.append(kNsField, cursorNamespace);
-    _cursorObject.doneFast();
-    if (!_latestOplogTimestamp.isNull()) {
-        _commandResponse->append(kInternalLatestOplogTimestampField, _latestOplogTimestamp);
+    if (_options.useDocumentSequences) {
+        _docSeqBuilder.reset();
+        _bodyBuilder.emplace(_replyBuilder->getBodyBuilder());
+        _cursorObject.emplace(_bodyBuilder->subobjStart(kCursorField));
+    } else {
+        _batch.reset();
     }
+    if (!_postBatchResumeToken.isEmpty()) {
+        _cursorObject->append(kPostBatchResumeTokenField, _postBatchResumeToken);
+    }
+    _cursorObject->append(kIdField, cursorId);
+    _cursorObject->append(kNsField, cursorNamespace);
+    _cursorObject.reset();
+
+    if (!_latestOplogTimestamp.isNull()) {
+        _bodyBuilder->append(kInternalLatestOplogTimestampField, _latestOplogTimestamp);
+    }
+    _bodyBuilder.reset();
     _active = false;
 }
 
 void CursorResponseBuilder::abandon() {
     invariant(_active);
-    _batch.doneFast();
-    _cursorObject.doneFast();
-    _commandResponse->bb().setlen(_responseInitialLen);  // Removes everything we've added.
+    _batch.reset();
+    _cursorObject.reset();
+    _bodyBuilder.reset();
+    _replyBuilder->reset();
+    _numDocs = 0;
     _active = false;
 }
 
@@ -103,24 +128,44 @@ CursorResponse::CursorResponse(NamespaceString nss,
                                std::vector<BSONObj> batch,
                                boost::optional<long long> numReturnedSoFar,
                                boost::optional<Timestamp> latestOplogTimestamp,
+                               boost::optional<BSONObj> postBatchResumeToken,
                                boost::optional<BSONObj> writeConcernError)
     : _nss(std::move(nss)),
       _cursorId(cursorId),
       _batch(std::move(batch)),
       _numReturnedSoFar(numReturnedSoFar),
       _latestOplogTimestamp(latestOplogTimestamp),
+      _postBatchResumeToken(std::move(postBatchResumeToken)),
       _writeConcernError(std::move(writeConcernError)) {}
+
+std::vector<StatusWith<CursorResponse>> CursorResponse::parseFromBSONMany(
+    const BSONObj& cmdResponse) {
+    std::vector<StatusWith<CursorResponse>> cursors;
+    BSONElement cursorsElt = cmdResponse[kCursorsField];
+
+    // If there is not "cursors" array then treat it as a single cursor response
+    if (cursorsElt.type() != BSONType::Array) {
+        cursors.push_back(parseFromBSON(cmdResponse));
+    } else {
+        BSONObj cursorsObj = cursorsElt.embeddedObject();
+        for (BSONElement elt : cursorsObj) {
+            if (elt.type() != BSONType::Object) {
+                cursors.push_back({ErrorCodes::BadValue,
+                                   str::stream()
+                                       << "Cursors array element contains non-object element: "
+                                       << elt});
+            } else {
+                cursors.push_back(parseFromBSON(elt.Obj()));
+            }
+        }
+    }
+
+    return cursors;
+}
 
 StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdResponse) {
     Status cmdStatus = getStatusFromCommandResult(cmdResponse);
     if (!cmdStatus.isOK()) {
-        if (ErrorCodes::isStaleShardingError(cmdStatus.code())) {
-            auto vWanted = ChunkVersion::fromBSON(cmdResponse, "vWanted");
-            auto vReceived = ChunkVersion::fromBSON(cmdResponse, "vReceived");
-            if (!vWanted.hasEqualEpoch(vReceived)) {
-                return Status(ErrorCodes::StaleEpoch, cmdStatus.reason());
-            }
-        }
         return cmdStatus;
     }
 
@@ -181,6 +226,14 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
         doc.shareOwnershipWith(cmdResponse);
     }
 
+    auto postBatchResumeTokenElem = cursorObj[kPostBatchResumeTokenField];
+    if (postBatchResumeTokenElem && postBatchResumeTokenElem.type() != BSONType::Object) {
+        return {ErrorCodes::BadValue,
+                str::stream() << kPostBatchResumeTokenField
+                              << " format is invalid; expected Object, but found: "
+                              << postBatchResumeTokenElem.type()};
+    }
+
     auto latestOplogTimestampElem = cmdResponse[kInternalLatestOplogTimestampField];
     if (latestOplogTimestampElem && latestOplogTimestampElem.type() != BSONType::bsonTimestamp) {
         return {
@@ -204,6 +257,8 @@ StatusWith<CursorResponse> CursorResponse::parseFromBSON(const BSONObj& cmdRespo
              boost::none,
              latestOplogTimestampElem ? latestOplogTimestampElem.timestamp()
                                       : boost::optional<Timestamp>{},
+             postBatchResumeTokenElem ? postBatchResumeTokenElem.Obj().getOwned()
+                                      : boost::optional<BSONObj>{},
              writeConcernError ? writeConcernError.Obj().getOwned() : boost::optional<BSONObj>{}}};
 }
 
@@ -221,6 +276,11 @@ void CursorResponse::addToBSON(CursorResponse::ResponseType responseType,
         batchBuilder.append(obj);
     }
     batchBuilder.doneFast();
+
+    if (_postBatchResumeToken) {
+        invariant(!_postBatchResumeToken->isEmpty());
+        cursorBuilder.append(kPostBatchResumeTokenField, *_postBatchResumeToken);
+    }
 
     cursorBuilder.doneFast();
 

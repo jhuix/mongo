@@ -23,11 +23,10 @@ load("jstests/replsets/rslib.js");
     let checkedRunCommand = (db, cmd) =>
         ((res, msg) => (assert.commandWorked(res, msg), res))(db.runCommand(cmd), tojson(cmd));
 
-    // Like db.getCollectionNames, but allows a filter and works without system.namespaces.
+    // Like db.getCollectionNames, but allows a filter.
     let getCollectionNames = (db, filter) => checkedRunCommand(db, {listCollections: 1, filter})
                                                  .cursor.firstBatch.map((entry) => entry.name)
-                                                 .sort()
-                                                 .filter((name) => name != "system.indexes");
+                                                 .sort();
 
     // Function that checks that all array elements are equal, and returns the unique element.
     let checkEqual = (array, what) =>
@@ -130,6 +129,10 @@ load("jstests/replsets/rslib.js");
     printjson(checkFinalResults([a1, b1], ["coll", "x"], []));
     printjson(checkFinalResults([a2, b2], ["coll", "system.views"], ["y"]));
     printjson(checkFinalResults([a3, b3], ["coll", "system.views"], ["z"]));
+
+    // Verify data consistency between nodes.
+    replTest.checkReplicatedDataHashes();
+    replTest.checkOplogs();
 
     replTest.stopSet();
 }());

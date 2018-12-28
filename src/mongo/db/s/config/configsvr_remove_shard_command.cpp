@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,7 +41,8 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
@@ -57,13 +60,13 @@ class ConfigSvrRemoveShardCommand : public BasicCommand {
 public:
     ConfigSvrRemoveShardCommand() : BasicCommand("_configsvrRemoveShard") {}
 
-    void help(std::stringstream& help) const override {
-        help << "Internal command, which is exported by the sharding config server. Do not call "
-                "directly. Removes a shard from the cluster.";
+    std::string help() const override {
+        return "Internal command, which is exported by the sharding config server. Do not call "
+               "directly. Removes a shard from the cluster.";
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -76,7 +79,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -92,11 +95,20 @@ public:
                 "_configsvrRemoveShard can only be run on config servers",
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
 
+        // Set the operation context read concern level to local for reads into the config database.
+        repl::ReadConcernArgs::get(opCtx) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+
         uassert(ErrorCodes::TypeMismatch,
                 str::stream() << "Field '" << cmdObj.firstElement().fieldName()
                               << "' must be of type string",
                 cmdObj.firstElement().type() == BSONType::String);
         const std::string target = cmdObj.firstElement().str();
+
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "removeShard must be called with majority writeConcern, got "
+                              << cmdObj,
+                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
         const auto shardStatus =
             Grid::get(opCtx)->shardRegistry()->getShard(opCtx, ShardId(target));
@@ -104,7 +116,7 @@ public:
             std::string msg(str::stream() << "Could not drop shard '" << target
                                           << "' because it does not exist");
             log() << msg;
-            return appendCommandStatus(result, Status(ErrorCodes::ShardNotFound, msg));
+            uasserted(ErrorCodes::ShardNotFound, msg);
         }
         const auto& shard = shardStatus.getValue();
 
@@ -113,9 +125,8 @@ public:
         const auto shardDrainingStatus =
             uassertStatusOK(shardingCatalogManager->removeShard(opCtx, shard->getId()));
 
-        std::vector<std::string> databases;
-        uassertStatusOK(
-            shardingCatalogManager->getDatabasesForShard(opCtx, shard->getId(), &databases));
+        std::vector<std::string> databases =
+            uassertStatusOK(shardingCatalogManager->getDatabasesForShard(opCtx, shard->getId()));
 
         // Get BSONObj containing:
         // 1) note about moving or dropping databases in a shard
@@ -144,19 +155,16 @@ public:
                 result.appendElements(dbInfo);
                 break;
             case ShardDrainingStatus::ONGOING: {
-                std::vector<ChunkType> chunks;
-                Status status = Grid::get(opCtx)->catalogClient()->getChunks(
+                const auto swChunks = Grid::get(opCtx)->catalogClient()->getChunks(
                     opCtx,
                     BSON(ChunkType::shard(shard->getId().toString())),
                     BSONObj(),
                     boost::none,  // return all
-                    &chunks,
                     nullptr,
-                    repl::ReadConcernLevel::kMajorityReadConcern);
-                if (!status.isOK()) {
-                    return appendCommandStatus(result, status);
-                }
+                    repl::ReadConcernArgs::get(opCtx).getLevel());
+                uassertStatusOK(swChunks.getStatus());
 
+                const auto& chunks = swChunks.getValue();
                 result.append("msg", "draining ongoing");
                 result.append("state", "ongoing");
                 result.append("remaining",

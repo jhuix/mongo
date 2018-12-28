@@ -1,9 +1,11 @@
+// @tags: [does_not_support_stepdowns, requires_non_retryable_commands, requires_fastcount]
+
 /**
  * Tests that various database commands respect the 'bypassDocumentValidation' flag:
  *
  * - aggregation with $out
  * - applyOps (when not sharded)
- * - copyDb
+ * - doTxn (when not sharded)
  * - findAndModify
  * - insert
  * - mapReduce
@@ -11,6 +13,11 @@
  */
 (function() {
     'use strict';
+
+    // For isWiredTiger.
+    load("jstests/concurrency/fsm_workload_helpers/server_types.js");
+    // For isReplSet
+    load("jstests/libs/fixture_helpers.js");
 
     function assertFailsValidation(res) {
         if (res instanceof WriteResult || res instanceof BulkWriteResult) {
@@ -30,20 +37,37 @@
      * 'validator', which should enforce the existence of a field "a".
      */
     function runBypassDocumentValidationTest(validator) {
-        coll.drop();
+        // Use majority write concern to clear the drop-pending that can cause lock conflicts with
+        // transactions.
+        coll.drop({writeConcern: {w: "majority"}});
 
         // Insert documents into the collection that would not be valid before setting 'validator'.
         assert.writeOK(coll.insert({_id: 1}));
         assert.writeOK(coll.insert({_id: 2}));
         assert.commandWorked(myDb.runCommand({collMod: collName, validator: validator}));
 
+        const isMongos = db.runCommand({isdbgrid: 1}).isdbgrid;
         // Test applyOps with a simple insert if not on mongos.
-        if (!db.runCommand({isdbgrid: 1}).isdbgrid) {
-            const op = [{h: 1, v: 2, op: 'i', ns: coll.getFullName(), o: {_id: 9}}];
+        if (!isMongos) {
+            const op = [{op: 'i', ns: coll.getFullName(), o: {_id: 9}}];
             assertFailsValidation(myDb.runCommand({applyOps: op, bypassDocumentValidation: false}));
             assert.eq(0, coll.count({_id: 9}));
             assert.commandWorked(myDb.runCommand({applyOps: op, bypassDocumentValidation: true}));
             assert.eq(1, coll.count({_id: 9}));
+        }
+
+        // Test doTxn with a simple insert if a replica set, not on mongos and the storage engine
+        // is WiredTiger.
+        if (FixtureHelpers.isReplSet(db) && !isMongos && isWiredTiger(db)) {
+            const session = db.getMongo().startSession();
+            const sessionDb = session.getDatabase(myDb.getName());
+            const op = [{op: 'i', ns: coll.getFullName(), o: {_id: 10}}];
+            assertFailsValidation(sessionDb.runCommand(
+                {doTxn: op, bypassDocumentValidation: false, txnNumber: NumberLong("0")}));
+            assert.eq(0, coll.count({_id: 10}));
+            assert.commandWorked(sessionDb.runCommand(
+                {doTxn: op, bypassDocumentValidation: true, txnNumber: NumberLong("1")}));
+            assert.eq(1, coll.count({_id: 10}));
         }
 
         // Test the aggregation command with a $out stage.
@@ -59,19 +83,6 @@
         assert.eq(0, outputColl.count({aggregation: 1}));
         coll.aggregate(pipeline, {bypassDocumentValidation: true});
         assert.eq(1, outputColl.count({aggregation: 1}));
-
-        // Test the copyDb command.
-        const copyDbName = dbName + '_copy';
-        const copyDb = myDb.getSiblingDB(copyDbName);
-        assert.commandWorked(copyDb.dropDatabase());
-        let res = db.adminCommand(
-            {copydb: 1, fromdb: dbName, todb: copyDbName, bypassDocumentValidation: false});
-        assertFailsValidation(res);
-        assert.eq(0, copyDb[collName].count());
-        assert.commandWorked(copyDb.dropDatabase());
-        assert.commandWorked(db.adminCommand(
-            {copydb: 1, fromdb: dbName, todb: copyDbName, bypassDocumentValidation: true}));
-        assert.eq(coll.count(), db.getSiblingDB(copyDbName)[collName].count());
 
         // Test the findAndModify command.
         assert.throws(function() {
@@ -89,7 +100,7 @@
         const reduce = function() {
             return 'mapReduce';
         };
-        res = myDb.runCommand({
+        let res = myDb.runCommand({
             mapReduce: collName,
             map: map,
             reduce: reduce,

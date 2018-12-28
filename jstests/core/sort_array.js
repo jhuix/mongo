@@ -1,12 +1,10 @@
+// @tags: [does_not_support_stepdowns, requires_non_retryable_writes]
+
 /**
  * Tests for sorting documents by fields that contain arrays.
  */
 (function() {
     "use strict";
-
-    // The MMAP storage engine does not store path-level multikey metadata, so it cannot participate
-    // in related query planning optimizations.
-    const isMMAPv1 = jsTest.options().storageEngine === "mmapv1";
 
     load("jstests/libs/analyze_plan.js");
 
@@ -21,7 +19,7 @@
         let cursor = coll.find(filter, project).sort(sort);
         assert.eq(cursor.toArray(), expected);
         let explain = coll.find(filter, project).sort(sort).explain();
-        assert(planHasStage(explain.queryPlanner.winningPlan, "SORT"));
+        assert(planHasStage(db, explain.queryPlanner.winningPlan, "SORT"));
 
         let pipeline = [
             {$_internalInhibitOptimization: {}},
@@ -131,25 +129,22 @@
         expected: [{_id: 0}, {_id: 1}]
     });
 
-    if (!isMMAPv1) {
-        // Test that, for storage engines which support path-level multikey tracking, a multikey
-        // index can provide a sort over a non-multikey field.
-        coll.drop();
-        assert.commandWorked(coll.createIndex({a: 1, "b.c": 1}));
-        assert.writeOK(coll.insert({a: [1, 2, 3], b: {c: 9}}));
-        explain = coll.find({a: 2}).sort({"b.c": -1}).explain();
-        assert(planHasStage(explain.queryPlanner.winningPlan, "IXSCAN"));
-        assert(!planHasStage(explain.queryPlanner.winningPlan, "SORT"));
+    // Test that a multikey index can provide a sort over a non-multikey field.
+    coll.drop();
+    assert.commandWorked(coll.createIndex({a: 1, "b.c": 1}));
+    assert.writeOK(coll.insert({a: [1, 2, 3], b: {c: 9}}));
+    explain = coll.find({a: 2}).sort({"b.c": -1}).explain();
+    assert(planHasStage(db, explain.queryPlanner.winningPlan, "IXSCAN"));
+    assert(!planHasStage(db, explain.queryPlanner.winningPlan, "SORT"));
 
-        const pipeline = [
-            {$match: {a: 2}},
-            {$sort: {"b.c": -1}},
-        ];
-        explain = coll.explain().aggregate(pipeline);
-        assert(aggPlanHasStage(explain, "IXSCAN"));
-        assert(!aggPlanHasStage(explain, "SORT"));
-        assert(!aggPlanHasStage(explain, "$sort"));
-    }
+    const pipeline = [
+        {$match: {a: 2}},
+        {$sort: {"b.c": -1}},
+    ];
+    explain = coll.explain().aggregate(pipeline);
+    assert(aggPlanHasStage(explain, "IXSCAN"));
+    assert(!aggPlanHasStage(explain, "SORT"));
+    assert(!aggPlanHasStage(explain, "$sort"));
 
     // Test that we can correctly sort by an array field in agg when there are additional fields not
     // involved in the sort pattern.
@@ -161,4 +156,18 @@
 
     testAggAndFindSort(
         {filter: {}, sort: {"d.e.g": 1}, project: {_id: 1}, expected: [{_id: 1}, {_id: 0}]});
+
+    // Test a sort over the trailing field of a compound index, where the two fields of the index
+    // share a path prefix. This is designed as a regression test for SERVER-31858.
+    coll.drop();
+    assert.writeOK(coll.insert({_id: 2, a: [{b: 1, c: 2}, {b: 2, c: 3}]}));
+    assert.writeOK(coll.insert({_id: 0, a: [{b: 2, c: 0}, {b: 1, c: 4}]}));
+    assert.writeOK(coll.insert({_id: 1, a: [{b: 1, c: 5}, {b: 2, c: 1}]}));
+    assert.commandWorked(coll.createIndex({"a.b": 1, "a.c": 1}));
+    testAggAndFindSort({
+        filter: {"a.b": 1},
+        project: {_id: 1},
+        sort: {"a.c": 1},
+        expected: [{_id: 0}, {_id: 1}, {_id: 2}]
+    });
 }());

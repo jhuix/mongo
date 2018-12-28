@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -239,7 +239,7 @@ __curds_reset(WT_CURSOR *cursor)
 
 	source = ((WT_CURSOR_DATA_SOURCE *)cursor)->source;
 
-	CURSOR_API_CALL(cursor, session, reset, NULL);
+	CURSOR_API_CALL_PREPARE_ALLOWED(cursor, session, reset, NULL);
 
 	WT_STAT_CONN_INCR(session, cursor_reset);
 	WT_STAT_DATA_INCR(session, cursor_reset);
@@ -443,11 +443,11 @@ __curds_close(WT_CURSOR *cursor)
 	WT_SESSION_IMPL *session;
 
 	cds = (WT_CURSOR_DATA_SOURCE *)cursor;
-
-	CURSOR_API_CALL(cursor, session, close, NULL);
+	CURSOR_API_CALL_PREPARE_ALLOWED(cursor, session, close, NULL);
+err:
 
 	if (cds->source != NULL)
-		ret = cds->source->close(cds->source);
+		WT_TRET(cds->source->close(cds->source));
 
 	if (cds->collator_owned) {
 		if (cds->collator->terminate != NULL)
@@ -464,9 +464,9 @@ __curds_close(WT_CURSOR *cursor)
 	__wt_free(session, cursor->key_format);
 	__wt_free(session, cursor->value_format);
 
-	WT_TRET(__wt_cursor_close(cursor));
+	__wt_cursor_close(cursor);
 
-err:	API_END_RET(session, ret);
+	API_END_RET(session, ret);
 }
 
 /*
@@ -496,6 +496,8 @@ __wt_curds_open(
 	    __curds_remove,			/* remove */
 	    __curds_reserve,			/* reserve */
 	    __wt_cursor_reconfigure_notsup,	/* reconfigure */
+	    __wt_cursor_notsup,			/* cache */
+	    __wt_cursor_reopen_notsup,		/* reopen */
 	    __curds_close);			/* close */
 	WT_CONFIG_ITEM cval, metadata;
 	WT_CURSOR *cursor, *source;
@@ -505,13 +507,12 @@ __wt_curds_open(
 
 	WT_STATIC_ASSERT(offsetof(WT_CURSOR_DATA_SOURCE, iface) == 0);
 
-	data_source = NULL;
 	metaconf = NULL;
 
 	WT_RET(__wt_calloc_one(session, &data_source));
-	cursor = &data_source->iface;
+	cursor = (WT_CURSOR *)data_source;
 	*cursor = iface;
-	cursor->session = &session->iface;
+	cursor->session = (WT_SESSION *)session;
 
 	/*
 	 * XXX

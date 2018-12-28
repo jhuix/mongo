@@ -13,8 +13,14 @@ load('./jstests/libs/chunk_manipulation_util.js');
  * 4. Retry writes and confirm that writes are not duplicated.
  */
 (function() {
-
     "use strict";
+
+    load("jstests/libs/retryable_writes_util.js");
+
+    if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {
+        jsTestLog("Retryable writes are not supported, skipping test");
+        return;
+    }
 
     var staticMongod = MongoRunner.runMongod({});  // For startParallelOps.
 
@@ -26,6 +32,8 @@ load('./jstests/libs/chunk_manipulation_util.js');
     pauseMoveChunkAtStep(st.shard0, moveChunkStepNames.reachedSteadyState);
     var joinMoveChunk =
         moveChunkParallel(staticMongod, st.s.host, {x: 0}, null, 'test.user', st.shard1.shardName);
+
+    waitForMoveChunkStep(st.shard0, moveChunkStepNames.reachedSteadyState);
 
     var insertCmd = {
         insert: 'user',
@@ -67,14 +75,7 @@ load('./jstests/libs/chunk_manipulation_util.js');
 
     assert.eq(findAndModifyResult.ok, findAndModifyRetryResult.ok);
     assert.eq(findAndModifyResult.value, findAndModifyRetryResult.value);
-
-    // TODO: SERVER-30532: after adding upserted, just compare the entire lastErrorObject
-    var expectedLE = findAndModifyResult.lastErrorObject;
-    var toCheckLE = findAndModifyRetryResult.lastErrorObject;
-
-    assert.neq(null, toCheckLE);
-    assert.eq(findAndModifyResult.updatedExisting, findAndModifyRetryResult.updatedExisting);
-    assert.eq(findAndModifyResult.n, findAndModifyRetryResult.n);
+    assert.eq(findAndModifyResult.lastErrorObject, findAndModifyRetryResult.lastErrorObject);
 
     assert.eq(1, testDB.user.findOne({x: 30}).y);
 
