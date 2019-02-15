@@ -1,6 +1,3 @@
-// server_parameters.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -47,6 +44,12 @@ using std::vector;
 namespace {
 ServerParameterSet* GLOBAL = NULL;
 }
+
+ServerParameter::ServerParameter(StringData name, ServerParameterType spt)
+    : ServerParameter(ServerParameterSet::getGlobal(),
+                      name,
+                      spt != ServerParameterType::kRuntimeOnly,
+                      spt != ServerParameterType::kStartupOnly) {}
 
 ServerParameter::ServerParameter(ServerParameterSet* sps,
                                  StringData name,

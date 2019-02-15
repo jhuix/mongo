@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -116,7 +115,7 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx, StringData ns, boo
         return db;
 
     // We've inserted a nullptr entry for dbname: make sure to remove it on unsuccessful exit.
-    auto removeDbGuard = MakeGuard([this, &lk, dbname] {
+    auto removeDbGuard = makeGuard([this, &lk, dbname] {
         if (!lk.owns_lock())
             lk.lock();
         _dbs.erase(dbname);
@@ -151,7 +150,7 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx, StringData ns, boo
     newDb->init(opCtx);
 
     // Finally replace our nullptr entry with the new Database pointer.
-    removeDbGuard.Dismiss();
+    removeDbGuard.dismiss();
     lk.lock();
     auto it = _dbs.find(dbname);
     invariant(it != _dbs.end() && it->second == nullptr);
@@ -181,7 +180,7 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
         Top::get(serviceContext).collectionDropped(coll->ns().ns(), true);
     }
 
-    close(opCtx, name, "database dropped");
+    close(opCtx, name);
 
     auto const storageEngine = serviceContext->getStorageEngine();
     writeConflictRetry(opCtx, "dropDatabase", name, [&] {
@@ -198,7 +197,7 @@ void evictDatabaseFromUUIDCatalog(OperationContext* opCtx, Database* db) {
 }
 }  // namespace
 
-void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns, const std::string& reason) {
+void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns) {
     invariant(opCtx->lockState()->isW());
 
     const StringData dbName = _todb(ns);
@@ -214,7 +213,7 @@ void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns, const std
     repl::oplogCheckCloseDatabase(opCtx, db);
     evictDatabaseFromUUIDCatalog(opCtx, db);
 
-    db->close(opCtx, reason);
+    db->close(opCtx);
     delete db;
     db = nullptr;
 
@@ -226,7 +225,7 @@ void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns, const std
         .transitional_ignore();
 }
 
-void DatabaseHolderImpl::closeAll(OperationContext* opCtx, const std::string& reason) {
+void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isW());
 
     stdx::lock_guard<SimpleMutex> lk(_m);
@@ -243,7 +242,7 @@ void DatabaseHolderImpl::closeAll(OperationContext* opCtx, const std::string& re
         Database* db = _dbs[name];
         repl::oplogCheckCloseDatabase(opCtx, db);
         evictDatabaseFromUUIDCatalog(opCtx, db);
-        db->close(opCtx, reason);
+        db->close(opCtx);
         delete db;
 
         _dbs.erase(name);

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -174,7 +173,7 @@ void CollectionInfoCacheImpl::notifyOfQuery(OperationContext* opCtx,
 }
 
 void CollectionInfoCacheImpl::clearQueryCache() {
-    LOG(1) << _collection->ns().ns() << ": clearing plan cache - collection info cache reset";
+    LOG(1) << _collection->ns() << ": clearing plan cache - collection info cache reset";
     if (NULL != _planCache.get()) {
         _planCache->clear();
     }

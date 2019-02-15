@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -61,6 +60,13 @@ std::size_t DocumentSourceMergeCursors::getNumRemotes() const {
         return _armParams->getRemotes().size();
     }
     return _blockingResultsMerger->getNumRemotes();
+}
+
+BSONObj DocumentSourceMergeCursors::getHighWaterMark() {
+    if (!_blockingResultsMerger) {
+        populateMerger();
+    }
+    return _blockingResultsMerger->getHighWaterMark();
 }
 
 bool DocumentSourceMergeCursors::remotesExhausted() const {

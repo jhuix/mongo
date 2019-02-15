@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -27,6 +26,8 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+
+#include <utility>
 
 #include "mongo/platform/basic.h"
 
@@ -712,8 +713,7 @@ TEST(QuerySolutionTest, IndexScanNodeHasFieldExcludesSimpleBoundsStringFieldWhen
     ASSERT_FALSE(node.hasField("b"));
 }
 
-std::unique_ptr<ParsedProjection> createParsedProjection(const BSONObj& query,
-                                                         const BSONObj& projObj) {
+auto createMatchExprAndParsedProjection(const BSONObj& query, const BSONObj& projObj) {
     QueryTestServiceContext serviceCtx;
     auto opCtx = serviceCtx.makeOperationContext();
     const CollatorInterface* collator = nullptr;
@@ -732,7 +732,8 @@ std::unique_ptr<ParsedProjection> createParsedProjection(const BSONObj& query,
                                        << status.toString());
     }
     ASSERT(out);
-    return std::unique_ptr<ParsedProjection>(out);
+    return std::make_pair(std::move(queryMatchExpr.getValue()),
+                          std::unique_ptr<ParsedProjection>(out));
 }
 
 TEST(QuerySolutionTest, InclusionProjectionPreservesSort) {
@@ -742,10 +743,12 @@ TEST(QuerySolutionTest, InclusionProjectionPreservesSort) {
     BSONObj projection = BSON("a" << 1);
     BSONObj match;
 
-    auto parsedProjection = createParsedProjection(match, projection);
+    auto matchExprAndParsedProjection = createMatchExprAndParsedProjection(match, projection);
 
-    ProjectionNode proj{*parsedProjection};
-    proj.children.push_back(node.release());
+    ProjectionNodeDefault proj{std::move(node),
+                               *matchExprAndParsedProjection.first,
+                               projection,
+                               *matchExprAndParsedProjection.second};
     proj.computeProperties();
 
     ASSERT_EQ(proj.getSort().size(), 1U);
@@ -759,10 +762,12 @@ TEST(QuerySolutionTest, ExclusionProjectionDoesNotPreserveSort) {
     BSONObj projection = BSON("a" << 0);
     BSONObj match;
 
-    auto parsedProjection = createParsedProjection(match, projection);
+    auto matchExprAndParsedProjection = createMatchExprAndParsedProjection(match, projection);
 
-    ProjectionNode proj{*parsedProjection};
-    proj.children.push_back(node.release());
+    ProjectionNodeDefault proj{std::move(node),
+                               *matchExprAndParsedProjection.first,
+                               projection,
+                               *matchExprAndParsedProjection.second};
     proj.computeProperties();
 
     ASSERT_EQ(proj.getSort().size(), 0U);
@@ -774,10 +779,12 @@ TEST(QuerySolutionTest, InclusionProjectionTruncatesSort) {
     BSONObj projection = BSON("a" << 1);
     BSONObj match;
 
-    auto parsedProjection = createParsedProjection(match, projection);
+    auto matchExprAndParsedProjection = createMatchExprAndParsedProjection(match, projection);
 
-    ProjectionNode proj{*parsedProjection};
-    proj.children.push_back(node.release());
+    ProjectionNodeDefault proj{std::move(node),
+                               *matchExprAndParsedProjection.first,
+                               projection,
+                               *matchExprAndParsedProjection.second};
     proj.computeProperties();
 
     ASSERT_EQ(proj.getSort().size(), 1U);
@@ -790,10 +797,12 @@ TEST(QuerySolutionTest, ExclusionProjectionTruncatesSort) {
     BSONObj projection = BSON("b" << 0);
     BSONObj match;
 
-    auto parsedProjection = createParsedProjection(match, projection);
+    auto matchExprAndParsedProjection = createMatchExprAndParsedProjection(match, projection);
 
-    ProjectionNode proj{*parsedProjection};
-    proj.children.push_back(node.release());
+    ProjectionNodeDefault proj{std::move(node),
+                               *matchExprAndParsedProjection.first,
+                               projection,
+                               *matchExprAndParsedProjection.second};
     proj.computeProperties();
 
     ASSERT_EQ(proj.getSort().size(), 1U);

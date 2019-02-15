@@ -17,9 +17,6 @@ selector:
   # cluster.
   - jstests/core/txns/transactions_block_ddl.js
 
-  # TODO SERVER-36124: maxTimeMS doesn't work for insert on mongos.
-  - jstests/core/txns/write_conflicts_with_non_txns.js
-
   # TODO SERVER-36120: No doTxn command on mongos.
   - jstests/core/txns/do_txn_atomicity.js
   - jstests/core/txns/do_txn_basic.js
@@ -41,6 +38,9 @@ selector:
 
   # View tests aren't expected to work when collections are implicitly sharded.
   - jstests/core/txns/view_reads_in_transaction.js
+
+  # TODO SERVER-39175: Mongos doesn't correctly report write errors in transactions
+  - jstests/core/txns/multi_statement_transaction_write_error.js
   exclude_with_any_tags:
   - assumes_against_mongod_not_mongos
   # Tests tagged with the following will fail because they assume collections are not sharded.

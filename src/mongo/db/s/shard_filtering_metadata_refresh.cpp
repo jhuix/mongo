@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -249,7 +248,10 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
             return;
         }
 
-        const auto cachedDbVersion = DatabaseShardingState::get(db).getDbVersion(opCtx);
+        auto& dss = DatabaseShardingState::get(db);
+        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+
+        const auto cachedDbVersion = dss.getDbVersion(opCtx, dssLock);
         if (cachedDbVersion && cachedDbVersion->getUuid() == refreshedDbVersion.getUuid() &&
             cachedDbVersion->getLastMod() >= refreshedDbVersion.getLastMod()) {
             LOG(2) << "Skipping setting cached databaseVersion for " << dbName
@@ -269,7 +271,10 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
         return;
     }
 
-    DatabaseShardingState::get(db).setDbVersion(opCtx, std::move(refreshedDbVersion));
+    auto& dss = DatabaseShardingState::get(db);
+    auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, &dss);
+
+    dss.setDbVersion(opCtx, std::move(refreshedDbVersion), dssLock);
 }
 
 }  // namespace mongo

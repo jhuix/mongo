@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -100,7 +99,9 @@ public:
     /**
      * Returns the stored raw pointer to the OperationContext.
      */
-    OperationContext* operationContext() const;
+    OperationContext* operationContext() const {
+        return _opCtx.get();
+    }
 
     /**
      * Blocking methods, which receive one message from the network and respond using the

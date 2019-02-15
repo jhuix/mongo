@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -34,6 +33,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
@@ -50,6 +50,8 @@
 namespace mongo {
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeLinearizableReadConcern);
 
 /**
 *  Synchronize writeRequests
@@ -131,13 +133,16 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
     // one that waits for the notification gets the later clusterTime, so when the request finishes
     // it needs to be repeated with the later time.
     while (clusterTime > lastAppliedOpTime) {
-        auto shardingState = ShardingState::get(opCtx);
         // standalone replica set, so there is no need to advance the OpLog on the primary.
-        if (!shardingState->enabled()) {
+        if (serverGlobalParams.clusterRole == ClusterRole::None) {
             return Status::OK();
         }
 
-        auto myShard = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardingState->shardId());
+        bool isConfig = (serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+        auto myShard = isConfig ? Grid::get(opCtx)->shardRegistry()->getConfigShard()
+                                : Grid::get(opCtx)->shardRegistry()->getShard(
+                                      opCtx, ShardingState::get(opCtx)->shardId());
+
         if (!myShard.isOK()) {
             return myShard.getStatus();
         }
@@ -342,7 +347,13 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
     return Status::OK();
 }
 
-MONGO_REGISTER_SHIM(waitForLinearizableReadConcern)(OperationContext* opCtx)->Status {
+MONGO_REGISTER_SHIM(waitForLinearizableReadConcern)
+(OperationContext* opCtx, const int readConcernTimeout)->Status {
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &hangBeforeLinearizableReadConcern, opCtx, "hangBeforeLinearizableReadConcern", [opCtx]() {
+            log() << "batch update - hangBeforeLinearizableReadConcern fail point enabled. "
+                     "Blocking until fail point is disabled.";
+        });
 
     repl::ReplicationCoordinator* replCoord =
         repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
@@ -366,10 +377,11 @@ MONGO_REGISTER_SHIM(waitForLinearizableReadConcern)(OperationContext* opCtx)->St
         });
     }
     WriteConcernOptions wc = WriteConcernOptions(
-        WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, 0);
+        WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, readConcernTimeout);
 
     repl::OpTime lastOpApplied = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
     auto awaitReplResult = replCoord->awaitReplication(opCtx, lastOpApplied, wc);
+
     if (awaitReplResult.status == ErrorCodes::WriteConcernFailed) {
         return Status(ErrorCodes::LinearizableReadConcernError,
                       "Failed to confirm that read was linearizable.");
@@ -400,10 +412,12 @@ MONGO_REGISTER_SHIM(waitForSpeculativeMajorityReadConcern)
            << " to become committed, current commit point: " << replCoord->getLastCommittedOpTime();
 
     if (!opCtx->hasDeadline()) {
-        // TODO (SERVER-38727): Replace this with a user specified timeout value, to address the
-        // fact that getMore commands do not respect maxTimeMS properly. Currently, this hard-coded
-        // value represents the maximum time we are ever willing to wait for an optime to majority
-        // commit when doing a speculative majority read. We make this value rather conservative.
+        // This hard-coded value represents the maximum time we are willing to wait for an optime to
+        // majority commit when doing a speculative majority read if no maxTimeMS value has been set
+        // for the command. We make this value rather conservative. This exists primarily to address
+        // the fact that getMore commands do not respect maxTimeMS properly. In this case, we still
+        // want speculative majority reads to time out after some period if an optime cannot
+        // majority commit.
         auto timeout = Seconds(15);
         opCtx->setDeadlineAfterNowBy(timeout, ErrorCodes::MaxTimeMSExpired);
     }

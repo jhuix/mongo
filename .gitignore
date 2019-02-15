@@ -83,6 +83,7 @@ scratch
 /mongos
 /mongoshim
 /mongosniff
+/mongotrafficreader
 /wt
 
 *.tgz
@@ -143,6 +144,8 @@ debian/mongodb
 .cproject
 .project
 .pydevproject
+.externalToolBuilders/
+.settings/
 
 # Idea CLion project artifacts
 .idea

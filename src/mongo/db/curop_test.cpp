@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -57,8 +56,6 @@ TEST(CurOpTest, AddingAdditiveMetricsObjectsTogetherShouldAddFieldsTogether) {
     additiveMetricsToAdd.ninserted = 0;
     currentAdditiveMetrics.ndeleted = 3;
     additiveMetricsToAdd.ndeleted = 2;
-    currentAdditiveMetrics.nmoved = 0;
-    additiveMetricsToAdd.nmoved = 4;
     currentAdditiveMetrics.keysInserted = 6;
     additiveMetricsToAdd.keysInserted = 5;
     currentAdditiveMetrics.keysDeleted = 4;
@@ -85,8 +82,6 @@ TEST(CurOpTest, AddingAdditiveMetricsObjectsTogetherShouldAddFieldsTogether) {
               *additiveMetricsBeforeAdd.ninserted + *additiveMetricsToAdd.ninserted);
     ASSERT_EQ(*currentAdditiveMetrics.ndeleted,
               *additiveMetricsBeforeAdd.ndeleted + *additiveMetricsToAdd.ndeleted);
-    ASSERT_EQ(*currentAdditiveMetrics.nmoved,
-              *additiveMetricsBeforeAdd.nmoved + *additiveMetricsToAdd.nmoved);
     ASSERT_EQ(*currentAdditiveMetrics.keysInserted,
               *additiveMetricsBeforeAdd.keysInserted + *additiveMetricsToAdd.keysInserted);
     ASSERT_EQ(*currentAdditiveMetrics.keysDeleted,
@@ -107,8 +102,6 @@ TEST(CurOpTest, AddingUninitializedAdditiveMetricsFieldsShouldBeTreatedAsZero) {
     currentAdditiveMetrics.docsExamined = 4;
     currentAdditiveMetrics.nModified = 3;
     additiveMetricsToAdd.ninserted = 0;
-    currentAdditiveMetrics.nmoved = 0;
-    additiveMetricsToAdd.nmoved = 4;
     currentAdditiveMetrics.keysInserted = 6;
     additiveMetricsToAdd.keysInserted = 5;
     currentAdditiveMetrics.keysDeleted = 4;
@@ -135,8 +128,6 @@ TEST(CurOpTest, AddingUninitializedAdditiveMetricsFieldsShouldBeTreatedAsZero) {
     ASSERT_EQ(currentAdditiveMetrics.nMatched, boost::none);
 
     // The following field values should have changed after adding.
-    ASSERT_EQ(*currentAdditiveMetrics.nmoved,
-              *additiveMetricsBeforeAdd.nmoved + *additiveMetricsToAdd.nmoved);
     ASSERT_EQ(*currentAdditiveMetrics.keysInserted,
               *additiveMetricsBeforeAdd.keysInserted + *additiveMetricsToAdd.keysInserted);
     ASSERT_EQ(*currentAdditiveMetrics.keysDeleted,
@@ -160,14 +151,12 @@ TEST(CurOpTest, AdditiveMetricsFieldsShouldIncrementByN) {
     additiveMetrics.incrementWriteConflicts(1);
     additiveMetrics.incrementKeysInserted(5);
     additiveMetrics.incrementKeysDeleted(0);
-    additiveMetrics.incrementNmoved(1);
     additiveMetrics.incrementNinserted(3);
     additiveMetrics.incrementPrepareReadConflicts(2);
 
     ASSERT_EQ(*additiveMetrics.writeConflicts, 2);
     ASSERT_EQ(*additiveMetrics.keysInserted, 7);
     ASSERT_EQ(*additiveMetrics.keysDeleted, 0);
-    ASSERT_EQ(*additiveMetrics.nmoved, 1);
     ASSERT_EQ(*additiveMetrics.ninserted, 3);
     ASSERT_EQ(*additiveMetrics.prepareReadConflicts, 8);
 }

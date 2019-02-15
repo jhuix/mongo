@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -87,9 +86,11 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
 
 class OpObserverMock : public OpObserverNoop {
 public:
-    void onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) override {
+    void onTransactionPrepare(OperationContext* opCtx,
+                              const OplogSlot& prepareOpTime,
+                              std::vector<repl::ReplOperation>& statements) override {
         ASSERT_TRUE(opCtx->lockState()->inAWriteUnitOfWork());
-        OpObserverNoop::onTransactionPrepare(opCtx, prepareOpTime);
+        OpObserverNoop::onTransactionPrepare(opCtx, prepareOpTime, statements);
 
         uassert(ErrorCodes::OperationFailed,
                 "onTransactionPrepare() failed",
@@ -104,9 +105,11 @@ public:
 
     void onTransactionCommit(OperationContext* opCtx,
                              boost::optional<OplogSlot> commitOplogEntryOpTime,
-                             boost::optional<Timestamp> commitTimestamp) override {
+                             boost::optional<Timestamp> commitTimestamp,
+                             std::vector<repl::ReplOperation>& statements) override {
         ASSERT_TRUE(opCtx->lockState()->inAWriteUnitOfWork());
-        OpObserverNoop::onTransactionCommit(opCtx, commitOplogEntryOpTime, commitTimestamp);
+        OpObserverNoop::onTransactionCommit(
+            opCtx, commitOplogEntryOpTime, commitTimestamp, statements);
 
         uassert(ErrorCodes::OperationFailed,
                 "onTransactionCommit() failed",
@@ -125,6 +128,7 @@ public:
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
+                                  std::uint64_t numRecords,
                                   const CollectionDropType dropType) override {
         // If the oplog is not disabled for this namespace, then we need to reserve an op time for
         // the drop.

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -116,6 +115,7 @@ public:
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
+                                  std::uint64_t numRecords,
                                   const CollectionDropType dropType) override {
         // If the oplog is not disabled for this namespace, then we need to reserve an op time for
         // the drop.
@@ -225,7 +225,7 @@ repl::OplogEntry _makeOplogEntry(repl::OpTime opTime,
                                  OperationSessionInfo sessionInfo = {},
                                  boost::optional<Date_t> wallTime = boost::none) {
     return repl::OplogEntry(opTime,                           // optime
-                            1LL,                              // hash
+                            boost::none,                      // hash
                             opType,                           // opType
                             testNs,                           // namespace
                             boost::none,                      // uuid
@@ -257,7 +257,6 @@ repl::OplogEntry _makeTransactionOplogEntry(repl::OpTime opTime,
     sessionInfo.serialize(&builder);
     builder.append("ts", opTime.getTimestamp());
     builder.append("t", opTime.getTerm());
-    builder.append("h", 1LL);
     builder.append("v", repl::OplogEntry::kOplogVersion);
     builder.append("op", "c");
     builder.append("ns", testNs.toString());

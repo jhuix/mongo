@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -82,7 +81,7 @@ private:
     void _releaseResources();
 
     template <typename F>
-    Status _runTaskReleaseResourcesOnFailure(F task) noexcept;
+    Status _runTaskReleaseResourcesOnFailure(const F& task) noexcept;
 
     /**
      * Adds document and associated RecordId to index blocks after inserting into RecordStore.

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -153,7 +152,6 @@ int _createIndexOnEmptyCollection(OperationContext* opCtx, NamespaceString nss, 
  */
 TimestampedBSONObj makeOplogEntry(OpTime opTime) {
     BSONObjBuilder bob(opTime.toBSON());
-    bob.append("h", 1LL);
     bob.append("op", "c");
     bob.append("ns", "test.t");
     return {bob.obj(), opTime.getTimestamp()};

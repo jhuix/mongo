@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,6 +39,7 @@
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/is_master_response.h"
@@ -54,7 +54,6 @@
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
-#include "mongo/db/repl/replication_state_transition_lock_guard.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/update_position_args.h"
@@ -110,7 +109,7 @@ struct OpTimeWithTermOne {
  */
 void killOperation(OperationContext* opCtx) {
     stdx::lock_guard<Client> lkClient(*opCtx->getClient());
-    opCtx->getServiceContext()->killOperation(opCtx);
+    opCtx->getServiceContext()->killOperation(lkClient, opCtx);
 }
 
 TEST_F(ReplCoordTest, IsMasterIsFalseDuringStepdown) {
@@ -3855,7 +3854,8 @@ TEST_F(StableOpTimeTest, CalculateStableOpTime) {
     stableOpTimeCandidates = {
         OpTime({0, 0}, term), OpTime({0, 1}, term), OpTime({0, 2}, term), OpTime({0, 4}, term)};
     expectedStableOpTime = OpTime({0, 2}, term);
-    stableOpTime = repl->calculateStableOpTime_forTest(stableOpTimeCandidates, commitPoint);
+    stableOpTime =
+        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
     ASSERT_EQ(expectedStableOpTime, stableOpTime);
 
     // There is a valid stable optime equal to the commit point.
@@ -3863,49 +3863,56 @@ TEST_F(StableOpTimeTest, CalculateStableOpTime) {
     stableOpTimeCandidates = {
         OpTime({0, 0}, term), OpTime({0, 1}, term), OpTime({0, 2}, term), OpTime({0, 3}, term)};
     expectedStableOpTime = OpTime({0, 2}, term);
-    stableOpTime = repl->calculateStableOpTime_forTest(stableOpTimeCandidates, commitPoint);
+    stableOpTime =
+        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
     ASSERT_EQ(expectedStableOpTime, stableOpTime);
 
     // There is a valid stable optime, all candidates are smaller than the commit point.
     commitPoint = OpTime({0, 4}, term);
     stableOpTimeCandidates = {OpTime({0, 1}, term), OpTime({0, 2}, term), OpTime({0, 3}, term)};
     expectedStableOpTime = OpTime({0, 3}, term);
-    stableOpTime = repl->calculateStableOpTime_forTest(stableOpTimeCandidates, commitPoint);
+    stableOpTime =
+        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
     ASSERT_EQ(expectedStableOpTime, stableOpTime);
 
     // There is no valid stable optime, all candidates are greater than the commit point.
     commitPoint = OpTime({0, 0}, term);
     stableOpTimeCandidates = {OpTime({0, 1}, term), OpTime({0, 2}, term), OpTime({0, 3}, term)};
     expectedStableOpTime = boost::none;
-    stableOpTime = repl->calculateStableOpTime_forTest(stableOpTimeCandidates, commitPoint);
+    stableOpTime =
+        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
     ASSERT_EQ(expectedStableOpTime, stableOpTime);
 
     // There are no timestamp candidates.
     commitPoint = OpTime({0, 0}, term);
     stableOpTimeCandidates = {};
     expectedStableOpTime = boost::none;
-    stableOpTime = repl->calculateStableOpTime_forTest(stableOpTimeCandidates, commitPoint);
+    stableOpTime =
+        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
     ASSERT_EQ(expectedStableOpTime, stableOpTime);
 
     // There is a single timestamp candidate which is equal to the commit point.
     commitPoint = OpTime({0, 1}, term);
     stableOpTimeCandidates = {OpTime({0, 1}, term)};
     expectedStableOpTime = OpTime({0, 1}, term);
-    stableOpTime = repl->calculateStableOpTime_forTest(stableOpTimeCandidates, commitPoint);
+    stableOpTime =
+        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
     ASSERT_EQ(expectedStableOpTime, stableOpTime);
 
     // There is a single timestamp candidate which is greater than the commit point.
     commitPoint = OpTime({0, 0}, term);
     stableOpTimeCandidates = {OpTime({0, 1}, term)};
     expectedStableOpTime = boost::none;
-    stableOpTime = repl->calculateStableOpTime_forTest(stableOpTimeCandidates, commitPoint);
+    stableOpTime =
+        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
     ASSERT_EQ(expectedStableOpTime, stableOpTime);
 
     // There is a single timestamp candidate which is less than the commit point.
     commitPoint = OpTime({0, 2}, term);
     stableOpTimeCandidates = {OpTime({0, 1}, term)};
     expectedStableOpTime = OpTime({0, 1}, term);
-    stableOpTime = repl->calculateStableOpTime_forTest(stableOpTimeCandidates, commitPoint);
+    stableOpTime =
+        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
     ASSERT_EQ(expectedStableOpTime, stableOpTime);
 
     // Set the oldest oplog entry OpTime for non-majority committed aborts/commits associated
@@ -3921,7 +3928,8 @@ TEST_F(StableOpTimeTest, CalculateStableOpTime) {
     txnMetrics->addActiveOpTime(oldestNonMajCommittedOpTime);
     // Update the finishOpTime.
     txnMetrics->removeActiveOpTime(oldestNonMajCommittedOpTime, finishOpTime);
-    stableOpTime = repl->calculateStableOpTime_forTest(stableOpTimeCandidates, commitPoint);
+    stableOpTime =
+        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
     ASSERT_EQ(oldestNonMajCommittedOpTime, stableOpTime);
 }
 
@@ -4206,7 +4214,8 @@ TEST_F(StableOpTimeTest, ClearOpTimeCandidatesPastCommonPointAfterRollback) {
     // Make sure the stable optime candidate set has been cleared of all entries past the common
     // point.
     opTimeCandidates = repl->getStableOpTimeCandidates_forTest();
-    auto stableOpTime = repl->getStableOpTime_forTest();
+    auto stableOpTime =
+        repl->chooseStableOpTimeFromCandidates_forTest(opTimeCandidates, commitPoint);
     ASSERT(stableOpTime);
     expectedOpTimeCandidates = {*stableOpTime};
     ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);

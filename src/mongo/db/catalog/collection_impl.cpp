@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -50,6 +49,7 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog_impl.h"
 #include "mongo/db/catalog/index_consistency.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/namespace_uuid_cache.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/clientcursor.h"
@@ -57,12 +57,14 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -216,7 +218,6 @@ CollectionImpl::CollectionImpl(OperationContext* opCtx,
           _parseValidationAction(_details->getCollectionOptions(opCtx).validationAction))),
       _validationLevel(uassertStatusOK(
           _parseValidationLevel(_details->getCollectionOptions(opCtx).validationLevel))),
-      _cursorManager(std::make_unique<CursorManager>(_ns)),
       _cappedNotifier(_recordStore->isCapped() ? stdx::make_unique<CappedInsertNotifier>()
                                                : nullptr) {
 
@@ -317,8 +318,7 @@ StatusWithMatchExpression CollectionImpl::parseValidator(
 
     if (ns().isSystem() && !ns().isDropPendingNamespace()) {
         return {ErrorCodes::InvalidOptions,
-                str::stream() << "Document validators not allowed on system collection "
-                              << ns().ns()
+                str::stream() << "Document validators not allowed on system collection " << ns()
                               << (_uuid ? " with UUID " + _uuid->toString() : "")};
     }
 
@@ -390,7 +390,7 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
             return Status(ErrorCodes::InternalError,
                           str::stream()
                               << "Collection::insertDocument got document without _id for ns:"
-                              << _ns.ns());
+                              << _ns);
         }
 
         auto status = checkValidation(opCtx, it->doc);
@@ -797,7 +797,6 @@ Status CollectionImpl::truncate(OperationContext* opCtx) {
 
     // 2) drop indexes
     _indexCatalog->dropAllIndexes(opCtx, true);
-    _cursorManager->invalidateAll(opCtx, false, "collection truncated");
 
     // 3) truncate record store
     auto status = _recordStore->truncate(opCtx);
@@ -820,7 +819,6 @@ void CollectionImpl::cappedTruncateAfter(OperationContext* opCtx, RecordId end, 
     BackgroundOperation::assertNoBgOpInProgForNs(ns());
     invariant(_indexCatalog->numIndexesInProgress(opCtx) == 0);
 
-    _cursorManager->invalidateAll(opCtx, false, "capped collection truncated");
     _recordStore->cappedTruncateAfter(opCtx, end, inclusive);
 }
 
@@ -957,6 +955,53 @@ Status CollectionImpl::updateValidator(OperationContext* opCtx,
 
 const CollatorInterface* CollectionImpl::getDefaultCollator() const {
     return _collator.get();
+}
+
+StatusWith<std::vector<BSONObj>> CollectionImpl::addCollationDefaultsToIndexSpecsForCreate(
+    OperationContext* opCtx, const std::vector<BSONObj>& originalIndexSpecs) const {
+    std::vector<BSONObj> newIndexSpecs;
+
+    auto collator = getDefaultCollator();  // could be null.
+    auto collatorFactory = CollatorFactoryInterface::get(opCtx->getServiceContext());
+
+    for (const auto& originalIndexSpec : originalIndexSpecs) {
+        auto validateResult =
+            index_key_validate::validateIndexSpecCollation(opCtx, originalIndexSpec, collator);
+        if (!validateResult.isOK()) {
+            return validateResult.getStatus().withContext(
+                str::stream()
+                << "failed to add collation information to index spec for index creation: "
+                << originalIndexSpec);
+        }
+        const auto& newIndexSpec = validateResult.getValue();
+
+        auto keyPattern = newIndexSpec[IndexDescriptor::kKeyPatternFieldName].Obj();
+        if (IndexDescriptor::isIdIndexPattern(keyPattern)) {
+            std::unique_ptr<CollatorInterface> indexCollator;
+            if (auto collationElem = newIndexSpec[IndexDescriptor::kCollationFieldName]) {
+                auto indexCollatorResult = collatorFactory->makeFromBSON(collationElem.Obj());
+                // validateIndexSpecCollation() should have checked that the index collation spec is
+                // valid.
+                invariant(indexCollatorResult.getStatus(),
+                          str::stream() << "invalid collation in index spec: " << newIndexSpec);
+                indexCollator = std::move(indexCollatorResult.getValue());
+            }
+            if (!CollatorInterface::collatorsMatch(collator, indexCollator.get())) {
+                return {ErrorCodes::BadValue,
+                        str::stream() << "The _id index must have the same collation as the "
+                                         "collection. Index collation: "
+                                      << (indexCollator.get() ? indexCollator->getSpec().toBSON()
+                                                              : CollationSpec::kSimpleSpec)
+                                      << ", collection collation: "
+                                      << (collator ? collator->getSpec().toBSON()
+                                                   : CollationSpec::kSimpleSpec)};
+            }
+        }
+
+        newIndexSpecs.push_back(newIndexSpec);
+    }
+
+    return newIndexSpecs;
 }
 
 namespace {
@@ -1218,11 +1263,10 @@ Status CollectionImpl::validate(OperationContext* opCtx,
             opCtx, _indexCatalog.get(), &indexNsResultsMap, &keysPerIndex, level, results, output);
 
         if (!results->valid) {
-            log(LogComponent::kIndex) << "validating collection " << ns().toString() << " failed"
-                                      << uuidString << endl;
+            log(LogComponent::kIndex) << "validating collection " << ns() << " failed"
+                                      << uuidString;
         } else {
-            log(LogComponent::kIndex) << "validated collection " << ns().toString() << uuidString
-                                      << endl;
+            log(LogComponent::kIndex) << "validated collection " << ns() << uuidString;
         }
     } catch (DBException& e) {
         if (ErrorCodes::isInterruption(e.code())) {
@@ -1280,14 +1324,6 @@ void CollectionImpl::setNs(NamespaceString nss) {
     _indexCatalog->setNs(_ns);
     _infoCache->setNs(_ns);
     _recordStore->setNs(_ns);
-
-    // Until the query layer is prepared for cursors to survive renames, all cursors are killed when
-    // the name of a collection changes. Therefore, the CursorManager should be empty. This means it
-    // is safe to re-establish it with a new namespace by tearing down the old one and allocating a
-    // new manager associated with the new name. This is done in order to ensure that the
-    // 'globalCursorIdCache' maintains the correct mapping from cursor id "prefix" (the high order
-    // bits) to namespace.
-    _cursorManager = std::make_unique<CursorManager>(_ns);
 }
 
 void CollectionImpl::indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) {

@@ -34,8 +34,8 @@
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
-AtomicInt32 test::gStdIntPreallocated;
-AtomicInt32 test::gStdIntPreallocatedUpdateCount;
+AtomicWord<int> test::gStdIntPreallocated;
+AtomicWord<int> test::gStdIntPreallocatedUpdateCount;
 
 namespace {
 
@@ -151,8 +151,8 @@ TEST(ServerParameterWithStorage, StorageTest) {
     doStorageTestByType<double>("DoubleD", doubleVals, stringVals);
     doStorageTestByType<std::string>("String", stringVals, {});
 
-    doStorageTestByAtomic<AtomicBool>("AtomicBool", boolVals, stringVals);
-    doStorageTestByAtomic<AtomicInt32>("AtomicInt32", numberVals, stringVals);
+    doStorageTestByAtomic<AtomicWord<bool>>("AtomicWord<bool>", boolVals, stringVals);
+    doStorageTestByAtomic<AtomicWord<int>>("AtomicWord<int>", numberVals, stringVals);
     doStorageTestByAtomic<AtomicDouble>("AtomicDoubleI", numberVals, stringVals);
     doStorageTestByAtomic<AtomicDouble>("AtomicDoubleD", doubleVals, stringVals);
 }
@@ -256,6 +256,13 @@ TEST(IDLServerParameterWithStorage, startupIntWithExpressions) {
     ASSERT_NOT_OK(sp->setValue(test::kStartupIntWithExpressionsMaximum + 1));
     ASSERT_OK(sp->setValue(test::kStartupIntWithExpressionsMaximum));
     ASSERT_EQ(test::gStartupIntWithExpressions, test::kStartupIntWithExpressionsMaximum);
+}
+
+TEST(IDLServerParameterWithStorage, exportedDefaults) {
+    ASSERT_EQ(test::kStdIntPreallocatedDefault, 11);
+    ASSERT_EQ(test::kStdIntDeclaredDefault, 42);
+    ASSERT_EQ(test::kStartupIntWithExpressionsDefault, 100);
+    ASSERT_EQ(test::kUgly_complicated_name_spDefault, true);
 }
 
 }  // namespace

@@ -53,6 +53,7 @@
 #include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_sessions_local.h"
+#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/op_observer.h"
@@ -75,13 +76,13 @@
 #include "mongo/db/s/periodic_balancer_config_refresher.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
+#include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/system_index.h"
-#include "mongo/db/transaction_coordinator_service.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -507,7 +508,14 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     const auto opTimeToReturn = fassert(28665, loadLastOpTime(opCtx));
 
     _shardingOnTransitionToPrimaryHook(opCtx);
+
+    // This has to go before reaquiring locks for prepared transactions, otherwise this can be
+    // blocked by prepared transactions.
     _dropAllTempCollections(opCtx);
+
+    MongoDSessionCatalog::onStepUp(opCtx);
+
+    notifyFreeMonitoringOnTransitionToPrimary();
 
     // It is only necessary to check the system indexes on the first transition to master.
     // On subsequent transitions to master the indexes will have already been created.
@@ -629,6 +637,10 @@ void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(ServiceContext*
     setNewTimestamp(ctx, newTime);
 }
 
+Timestamp ReplicationCoordinatorExternalStateImpl::getGlobalTimestamp(ServiceContext* service) {
+    return LogicalClock::get(service)->getClusterTime().asTimestamp();
+}
+
 bool ReplicationCoordinatorExternalStateImpl::oplogExists(OperationContext* opCtx) {
     AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
     return oplog.getCollection() != nullptr;
@@ -693,10 +705,12 @@ void ReplicationCoordinatorExternalStateImpl::closeConnections() {
 void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         Balancer::get(_service)->interruptBalancer();
+        TransactionCoordinatorService::get(_service)->onStepDown();
     } else if (ShardingState::get(_service)->enabled()) {
         ChunkSplitter::get(_service).onStepDown();
         CatalogCacheLoader::get(_service).onStepDown();
         PeriodicBalancerConfigRefresher::get(_service).onStepDown();
+        TransactionCoordinatorService::get(_service)->onStepDown();
     }
 
     if (auto validator = LogicalTimeValidator::get(_service)) {
@@ -789,10 +803,6 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
             validator->enableKeyGenerator(opCtx, true);
         }
     }
-
-    MongoDSessionCatalog::onStepUp(opCtx);
-
-    notifyFreeMonitoringOnTransitionToPrimary();
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {

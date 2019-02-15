@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -122,7 +121,7 @@ private:
         return std::tie(_password, _salt, _iterationCount);
     }
 
-    static constexpr auto saltLength() {
+    static constexpr auto saltLength() -> decltype(HashBlock::kHashLength) {
         return HashBlock::kHashLength - 4;
     }
 

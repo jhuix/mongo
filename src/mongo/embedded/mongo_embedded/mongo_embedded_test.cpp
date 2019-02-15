@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -576,7 +575,6 @@ TEST_F(MongodbCAPITest, RunListCommands) {
         "getLastError",
         "getMore",
         "getParameter",
-        "getPrevError",
         "insert",
         "isMaster",
         "killCursors",

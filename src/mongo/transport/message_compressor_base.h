@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -146,10 +145,10 @@ private:
     const MessageCompressorId _id;
     const std::string _name;
 
-    AtomicInt64 _compressBytesIn;
-    AtomicInt64 _compressBytesOut;
+    AtomicWord<long long> _compressBytesIn;
+    AtomicWord<long long> _compressBytesOut;
 
-    AtomicInt64 _decompressBytesIn;
-    AtomicInt64 _decompressBytesOut;
+    AtomicWord<long long> _decompressBytesIn;
+    AtomicWord<long long> _decompressBytesOut;
 };
 }  // namespace mongo

@@ -1,5 +1,3 @@
-// mongo/shell/shell_utils_launcher.cpp
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -61,6 +59,7 @@
 #endif
 
 #include "mongo/client/dbclient_connection.h"
+#include "mongo/db/traffic_reader.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils.h"
@@ -338,12 +337,10 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env, bool isMon
 // we explicitly override them.
 #ifdef _WIN32
     wchar_t* processEnv = GetEnvironmentStringsW();
-    ON_BLOCK_EXIT(
-        [](wchar_t* toFree) {
-            if (toFree)
-                FreeEnvironmentStringsW(toFree);
-        },
-        processEnv);
+    ON_BLOCK_EXIT([processEnv] {
+        if (processEnv)
+            FreeEnvironmentStringsW(processEnv);
+    });
 
     // Windows' GetEnvironmentStringsW returns a NULL terminated array of NULL separated
     // <key>=<value> pairs.
@@ -959,7 +956,7 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
         return;
     }
 
-    ON_BLOCK_EXIT(CloseHandle, event);
+    ON_BLOCK_EXIT([&] { CloseHandle(event); });
 
     bool result = SetEvent(event);
     if (!result) {
@@ -1064,6 +1061,14 @@ BSONObj StopMongoProgramByPid(const BSONObj& a, void* data) {
     return BSON("" << (double)code);
 }
 
+BSONObj ConvertTrafficRecordingToBSON(const BSONObj& a, void* data) {
+    int nFields = a.nFields();
+    uassert(ErrorCodes::FailedToParse, "wrong number of arguments", nFields == 1);
+
+    auto arr = trafficRecordingFileToBSONArr(a.firstElement().String());
+    return BSON("" << arr);
+}
+
 int KillMongoProgramInstances() {
     vector<ProcessId> pids;
     registry.getRegisteredPids(pids);
@@ -1115,6 +1120,7 @@ void installShellUtilsLauncher(Scope& scope) {
     scope.injectNative("resetDbpath", ResetDbpath);
     scope.injectNative("pathExists", PathExists);
     scope.injectNative("copyDbpath", CopyDbpath);
+    scope.injectNative("convertTrafficRecordingToBSON", ConvertTrafficRecordingToBSON);
 }
 }  // namespace shell_utils
 }  // namespace mongo

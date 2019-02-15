@@ -1,5 +1,7 @@
 /**
  * Test change stream behavior with speculative majority reads in the face of replication rollback.
+ *
+ * @tags: [uses_speculative_majority]
  */
 (function() {
     'use strict';
@@ -18,15 +20,9 @@
     const replTest = new ReplSetTest(
         {name, nodes: 3, useBridge: true, nodeOptions: {enableMajorityReadConcern: "false"}});
     replTest.startSet();
-    const nodes = replTest.nodeList();
-    replTest.initiate({
-        _id: name,
-        members: [
-            {_id: 0, host: nodes[0]},
-            {_id: 1, host: nodes[1]},
-            {_id: 2, host: nodes[2], arbiterOnly: true}
-        ]
-    });
+    let config = replTest.getReplSetConfig();
+    config.members[2].priority = 0;
+    replTest.initiate(config);
 
     const rollbackTest = new RollbackTest(name, replTest);
     const primary = rollbackTest.getPrimary();

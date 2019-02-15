@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -70,7 +69,7 @@ public:
     }
 
     const std::string& getIdent() const override {
-        MONGO_UNREACHABLE;
+        return _ident;
     }
 
     virtual void setCappedCallback(CappedCallback*) {}
@@ -182,6 +181,7 @@ private:
     CollectionOptions _options;
     long long _numInserts;
     BSONObj _dummy;
+    std::string _ident;
 };
 
 class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -604,7 +603,7 @@ TEST_F(ReporterTestNoTriggerAtSetUp, FailingToScheduleRemoteCommandTaskShouldMak
         virtual StatusWith<executor::TaskExecutor::CallbackHandle> scheduleRemoteCommand(
             const executor::RemoteCommandRequest& request,
             const RemoteCommandCallbackFn& cb,
-            const transport::BatonHandle& baton = nullptr) override {
+            const BatonHandle& baton = nullptr) override {
             // Any error status other than ShutdownInProgress will cause the reporter to fassert.
             return Status(ErrorCodes::ShutdownInProgress,
                           "failed to send remote command - shutdown in progress");

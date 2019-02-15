@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,7 +39,7 @@
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_test_lib.h"
 #include "mongo/util/log.h"

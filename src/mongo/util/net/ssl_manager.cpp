@@ -50,9 +50,14 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_parameters_gen.h"
+#include "mongo/util/synchronized_value.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
+
+SSLManagerInterface* theSSLManager = nullptr;
+
 namespace {
 
 // Some of these duplicate the std::isalpha/std::isxdigit because we don't want them to be
@@ -288,7 +293,94 @@ constexpr int kASN1TeletexString = 20;
 constexpr int kASN1UniversalString = 28;
 constexpr int kASN1BMPString = 30;
 constexpr int kASN1OctetString = 4;
+
+void canonicalizeClusterDN(std::vector<std::string>* dn) {
+    // remove all RDNs we don't care about
+    for (size_t i = 0; i < dn->size(); i++) {
+        std::string& comp = dn->at(i);
+        boost::algorithm::trim(comp);
+        if (!mongoutils::str::startsWith(comp.c_str(), "DC=") &&
+            !mongoutils::str::startsWith(comp.c_str(), "O=") &&
+            !mongoutils::str::startsWith(comp.c_str(), "OU=")) {
+            dn->erase(dn->begin() + i);
+            i--;
+        }
+    }
+    std::stable_sort(dn->begin(), dn->end());
+}
+
+constexpr StringData kOID_DC = "0.9.2342.19200300.100.1.25"_sd;
+constexpr StringData kOID_O = "2.5.4.10"_sd;
+constexpr StringData kOID_OU = "2.5.4.11"_sd;
+
+std::vector<SSLX509Name::Entry> canonicalizeClusterDN(
+    const std::vector<std::vector<SSLX509Name::Entry>>& entries) {
+    std::vector<SSLX509Name::Entry> ret;
+
+    for (const auto& rdn : entries) {
+        for (const auto& entry : rdn) {
+            if ((entry.oid != kOID_DC) && (entry.oid != kOID_O) && (entry.oid != kOID_OU)) {
+                continue;
+            }
+            ret.push_back(entry);
+        }
+    }
+    std::stable_sort(ret.begin(), ret.end());
+    return ret;
+}
+
+struct DNValue {
+    explicit DNValue(SSLX509Name dn)
+        : fullDN(std::move(dn)), canonicalized(canonicalizeClusterDN(fullDN.entries())) {}
+
+    SSLX509Name fullDN;
+    std::vector<SSLX509Name::Entry> canonicalized;
+};
+synchronized_value<boost::optional<DNValue>> clusterMemberOverride;
+boost::optional<std::vector<SSLX509Name::Entry>> getClusterMemberDNOverrideParameter() {
+    auto guarded_value = clusterMemberOverride.synchronize();
+    auto& value = *guarded_value;
+    if (!value) {
+        return boost::none;
+    }
+    return value->canonicalized;
+}
 }  // namespace
+
+void ClusterMemberDNOverride::append(OperationContext* opCtx,
+                                     BSONObjBuilder& b,
+                                     const std::string& name) {
+    auto value = clusterMemberOverride.get();
+    if (value) {
+        b.append(name, value->fullDN.toString());
+    }
+}
+
+Status ClusterMemberDNOverride::setFromString(const std::string& str) {
+    if (str.empty()) {
+        *clusterMemberOverride = boost::none;
+        return Status::OK();
+    }
+
+    auto swDN = parseDN(str);
+    if (!swDN.isOK()) {
+        return swDN.getStatus();
+    }
+    auto dn = std::move(swDN.getValue());
+    auto status = dn.normalizeStrings();
+    if (!status.isOK()) {
+        return status;
+    }
+
+    DNValue val(std::move(dn));
+    if (val.canonicalized.empty()) {
+        return {ErrorCodes::BadValue,
+                "Cluster member DN's must contain at least one O, OU, or DC component"};
+    }
+
+    *clusterMemberOverride = {std::move(val)};
+    return Status::OK();
+}
 
 StatusWith<SSLX509Name> parseDN(StringData sd) try {
     uassert(ErrorCodes::BadValue, "DN strings must be valid UTF-8 strings", isValidUTF8(sd));
@@ -335,9 +427,12 @@ std::string x509OidToShortName(StringData name) {
     return sn;
 }
 
+using UniqueASN1Object =
+    std::unique_ptr<ASN1_OBJECT, OpenSSLDeleter<decltype(ASN1_OBJECT_free), ASN1_OBJECT_free>>;
+
 boost::optional<std::string> x509ShortNameToOid(StringData name) {
     // Converts the OID to an ASN1_OBJECT
-    const auto obj = OBJ_txt2obj(name.rawData(), 0);
+    UniqueASN1Object obj(OBJ_txt2obj(name.rawData(), 0));
     if (!obj) {
         return boost::none;
     }
@@ -346,7 +441,7 @@ boost::optional<std::string> x509ShortNameToOid(StringData name) {
     // big the buffer should be, but the man page gives 80 as a good guess for buffer size.
     constexpr auto kDefaultBufferSize = 80;
     std::vector<char> buffer(kDefaultBufferSize);
-    size_t realSize = OBJ_obj2txt(buffer.data(), buffer.size(), obj, 1);
+    size_t realSize = OBJ_obj2txt(buffer.data(), buffer.size(), obj.get(), 1);
 
     // Resize the buffer down or up to the real size.
     buffer.resize(realSize);
@@ -354,7 +449,7 @@ boost::optional<std::string> x509ShortNameToOid(StringData name) {
     // If the real size is greater than the default buffer size we picked, then just call
     // OBJ_obj2txt again now that the buffer is correctly sized.
     if (realSize > kDefaultBufferSize) {
-        OBJ_obj2txt(buffer.data(), buffer.size(), obj, 1);
+        OBJ_obj2txt(buffer.data(), buffer.size(), obj.get(), 1);
     }
 
     return std::string(buffer.data(), buffer.size());
@@ -467,7 +562,7 @@ TLSVersionCounts& TLSVersionCounts::get(ServiceContext* serviceContext) {
 MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager", "GlobalLogManager"))
 (InitializerContext*) {
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
-        const auto& config = getSSLManager()->getSSLConfiguration();
+        const auto& config = theSSLManager->getSSLConfiguration();
         if (!config.clientSubjectName.empty()) {
             LOG(1) << "Client Certificate Name: " << config.clientSubjectName;
         }
@@ -491,6 +586,15 @@ Status SSLX509Name::normalizeStrings() {
                 case kASN1UniversalString:
                 case kASN1BMPString:
                 case kASN1OctetString: {
+                    // Technically https://tools.ietf.org/html/rfc5280#section-4.1.2.4 requires
+                    // that DN component values must be at least 1 code point long, but we've
+                    // supported empty components before (see SERVER-39107) so we special-case
+                    // normalizing empty values to an empty UTF-8 string
+                    if (entry.value.empty()) {
+                        entry.type = kASN1UTF8String;
+                        break;
+                    }
+
                     auto res = icuX509DNPrep(entry.value);
                     if (!res.isOK()) {
                         return res.getStatus();
@@ -537,43 +641,6 @@ std::string SSLX509Name::toString() const {
     return os.str();
 }
 
-namespace {
-void canonicalizeClusterDN(std::vector<std::string>* dn) {
-    // remove all RDNs we don't care about
-    for (size_t i = 0; i < dn->size(); i++) {
-        std::string& comp = dn->at(i);
-        boost::algorithm::trim(comp);
-        if (!mongoutils::str::startsWith(comp.c_str(), "DC=") &&
-            !mongoutils::str::startsWith(comp.c_str(), "O=") &&
-            !mongoutils::str::startsWith(comp.c_str(), "OU=")) {
-            dn->erase(dn->begin() + i);
-            i--;
-        }
-    }
-    std::stable_sort(dn->begin(), dn->end());
-}
-
-constexpr StringData kOID_DC = "0.9.2342.19200300.100.1.25"_sd;
-constexpr StringData kOID_O = "2.5.4.10"_sd;
-constexpr StringData kOID_OU = "2.5.4.11"_sd;
-
-std::vector<SSLX509Name::Entry> canonicalizeClusterDN(
-    const std::vector<std::vector<SSLX509Name::Entry>>& entries) {
-    std::vector<SSLX509Name::Entry> ret;
-
-    for (const auto& rdn : entries) {
-        for (const auto& entry : rdn) {
-            if ((entry.oid != kOID_DC) && (entry.oid != kOID_O) && (entry.oid != kOID_OU)) {
-                continue;
-            }
-            ret.push_back(entry);
-        }
-    }
-    std::stable_sort(ret.begin(), ret.end());
-    return ret;
-}
-}  // namespace
-
 Status SSLConfiguration::setServerSubjectName(SSLX509Name name) {
     auto status = name.normalizeStrings();
     if (!status.isOK()) {
@@ -601,8 +668,16 @@ bool SSLConfiguration::isClusterMember(SSLX509Name subject) const {
     }
 
     auto client = canonicalizeClusterDN(subject.entries());
+    if (client.empty()) {
+        return false;
+    }
 
-    return !client.empty() && (client == _canonicalServerSubjectName);
+    if (client == _canonicalServerSubjectName) {
+        return true;
+    }
+
+    auto altClusterDN = getClusterMemberDNOverrideParameter();
+    return (altClusterDN && (client == *altClusterDN));
 }
 
 bool SSLConfiguration::isClusterMember(StringData subjectName) const {
@@ -1078,6 +1153,10 @@ void recordTLSVersion(TLSVersion version, const HostAndPort& hostForLogging) {
         log() << "Accepted connection with TLS Version " << versionString << " from connection "
               << hostForLogging;
     }
+}
+
+SSLManagerInterface* getSSLManager() {
+    return theSSLManager;
 }
 
 }  // namespace mongo

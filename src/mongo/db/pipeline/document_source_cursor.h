@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -68,6 +67,10 @@ public:
 
         constraints.requiresInputDocSource = false;
         return constraints;
+    }
+
+    boost::optional<MergingLogic> mergingLogic() final {
+        return boost::none;
     }
 
     void detachFromOperationContext() final;
@@ -187,11 +190,6 @@ private:
      * non-null.
      */
     void cleanupExecutor();
-
-    /**
-     * Destroys and de-registers '_exec'. '_exec' must be non-null.
-     */
-    void cleanupExecutor(const AutoGetCollectionForRead& readLock);
 
     /**
      * Reads a batch of data from '_exec'. Subclasses can specify custom behavior to be performed on

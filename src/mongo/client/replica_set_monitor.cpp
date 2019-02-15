@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -45,7 +44,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/server_options.h"
-#include "mongo/s/grid.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
@@ -94,7 +92,7 @@ const int64_t unknownLatency = numeric_limits<int64_t>::max();
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference(ReadPreference::PrimaryOnly, TagSet());
 const Milliseconds kExpeditedRefreshPeriod(500);
-AtomicBool areRefreshRetriesDisabledForTest{false};  // Only true in tests.
+AtomicWord<bool> areRefreshRetriesDisabledForTest{false};  // Only true in tests.
 
 // TODO: Move to ReplicaSetMonitorManager
 ReplicaSetMonitor::ConfigChangeHook asyncConfigChangeHook;

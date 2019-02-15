@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -138,7 +137,7 @@ StatusWith<std::string> WiredTigerUtil::getMetadata(OperationContext* opCtx, Str
         session->getCursor("metadata:create", WiredTigerSession::kMetadataTableId, false);
     invariant(cursor);
     auto releaser =
-        MakeGuard([&] { session->releaseCursor(WiredTigerSession::kMetadataTableId, cursor); });
+        makeGuard([&] { session->releaseCursor(WiredTigerSession::kMetadataTableId, cursor); });
 
     std::string strUri = uri.toString();
     cursor->set_key(cursor, strUri.c_str());
@@ -326,7 +325,7 @@ StatusWith<uint64_t> WiredTigerUtil::getStatisticsValue(WT_SESSION* session,
                                                   << wiredtiger_strerror(ret));
     }
     invariant(cursor);
-    ON_BLOCK_EXIT(cursor->close, cursor);
+    ON_BLOCK_EXIT([&] { cursor->close(cursor); });
 
     cursor->set_key(cursor, statisticsKey);
     ret = cursor->search(cursor);
@@ -519,7 +518,7 @@ int WiredTigerUtil::verifyTable(OperationContext* opCtx,
     WT_CONNECTION* conn = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn();
     WT_SESSION* session;
     invariantWTOK(conn->open_session(conn, &eventHandler, NULL, &session));
-    ON_BLOCK_EXIT(session->close, session, "");
+    ON_BLOCK_EXIT([&] { session->close(session, ""); });
 
     // Do the verify. Weird parens prevent treating "verify" as a macro.
     return (session->verify)(session, uri.c_str(), NULL);
@@ -616,7 +615,7 @@ Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
     }
     bob->append("uri", uri);
     invariant(c);
-    ON_BLOCK_EXIT(c->close, c);
+    ON_BLOCK_EXIT([&] { c->close(c); });
 
     std::map<string, BSONObjBuilder*> subs;
     const char* desc;
@@ -643,7 +642,7 @@ Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
             suffix = "num";
         }
 
-        long long v = _castStatisticsValue<long long>(value);
+        long long v = castStatisticsValue<long long>(value);
 
         if (prefix.size() == 0) {
             bob->appendNumber(desc, v);
@@ -661,86 +660,6 @@ Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
         bob->append(s, it->second->obj());
         delete it->second;
     }
-    return Status::OK();
-}
-
-Status WiredTigerUtil::exportOperationStatsInfoToBSON(WT_SESSION* session,
-                                                      const std::string& uri,
-                                                      const std::string& config,
-                                                      BSONObjBuilder* bob) {
-    invariant(session);
-    invariant(bob);
-
-    // Map the statistics to a name and type desired for user consumption. There are two types of
-    // operation statistics - data and wait.
-    enum class Section { DATA, WAIT };
-    static std::map<int, std::pair<StringData, Section>> statNameMap = {
-        {WT_STAT_SESSION_BYTES_READ, std::make_pair("bytesRead", Section::DATA)},
-        {WT_STAT_SESSION_BYTES_WRITE, std::make_pair("bytesWritten", Section::DATA)},
-        {WT_STAT_SESSION_LOCK_DHANDLE_WAIT, std::make_pair("handleLock", Section::WAIT)},
-        {WT_STAT_SESSION_READ_TIME, std::make_pair("timeReadingMicros", Section::DATA)},
-        {WT_STAT_SESSION_WRITE_TIME, std::make_pair("timeWritingMicros", Section::DATA)},
-        {WT_STAT_SESSION_LOCK_SCHEMA_WAIT, std::make_pair("schemaLock", Section::WAIT)},
-        {WT_STAT_SESSION_CACHE_TIME, std::make_pair("cache", Section::WAIT)}};
-
-    WT_CURSOR* c = nullptr;
-    const char* cursorConfig = config.empty() ? nullptr : config.c_str();
-    int ret = session->open_cursor(session, uri.c_str(), nullptr, cursorConfig, &c);
-    if (ret != 0) {
-        return Status(ErrorCodes::CursorNotFound,
-                      str::stream() << "unable to open cursor at URI " << uri << ". reason: "
-                                    << wiredtiger_strerror(ret));
-    }
-    invariant(c);
-    ON_BLOCK_EXIT(c->close, c);
-
-    BSONObjBuilder* dataSection = nullptr;
-    BSONObjBuilder* waitSection = nullptr;
-    const char* desc;
-    uint64_t value;
-    uint64_t key;
-    while (c->next(c) == 0 && c->get_key(c, &key) == 0) {
-        fassert(51035, c->get_value(c, &desc, nullptr, &value) == 0);
-
-        StringData statName;
-        // Find the user consumable name for this statistic.
-        auto statIt = statNameMap.find(key);
-        invariant(statIt != statNameMap.end());
-        statName = statIt->second.first;
-
-        Section subs = statIt->second.second;
-        long long casted_val = _castStatisticsValue<long long>(value);
-
-        // Add this statistic only if higher than zero.
-        if (casted_val > 0) {
-            // Gather the statistic into its own subsection in the BSONObj.
-            switch (subs) {
-                case Section::DATA:
-                    if (!dataSection)
-                        dataSection = new BSONObjBuilder();
-
-                    dataSection->append(statName, casted_val);
-                    break;
-                case Section::WAIT:
-                    if (!waitSection)
-                        waitSection = new BSONObjBuilder();
-
-                    waitSection->append(statName, casted_val);
-                    break;
-                default:
-                    return Status(ErrorCodes::BadValue,
-                                  str::stream() << "Unexpected storage statistics type.");
-            }
-        }
-    }
-
-    if (dataSection)
-        bob->append("data", dataSection->obj());
-    if (waitSection)
-        bob->append("timeWaitingMicros", waitSection->obj());
-
-    // Reset the statistics so that the next fetch gives the recent values.
-    c->reset(c);
     return Status::OK();
 }
 

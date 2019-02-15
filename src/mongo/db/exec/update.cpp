@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -221,6 +220,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
 
     Status status = Status::OK();
     const bool validateForStorage = getOpCtx()->writesAreReplicated() && _enforceOkForStorage;
+    const bool isInsert = false;
     FieldRefSet immutablePaths;
     if (getOpCtx()->writesAreReplicated() && !request->isFromMigration()) {
         auto immutablePathsVector = getImmutableFields(getOpCtx(), request->getNamespaceString());
@@ -232,8 +232,13 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
     }
     if (!driver->needMatchDetails()) {
         // If we don't need match details, avoid doing the rematch
-        status = driver->update(
-            StringData(), &_doc, validateForStorage, immutablePaths, &logObj, &docWasModified);
+        status = driver->update(StringData(),
+                                &_doc,
+                                validateForStorage,
+                                immutablePaths,
+                                isInsert,
+                                &logObj,
+                                &docWasModified);
     } else {
         // If there was a matched field, obtain it.
         MatchDetails matchDetails;
@@ -246,8 +251,13 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
         if (matchDetails.hasElemMatchKey())
             matchedField = matchDetails.elemMatchKey();
 
-        status = driver->update(
-            matchedField, &_doc, validateForStorage, immutablePaths, &logObj, &docWasModified);
+        status = driver->update(matchedField,
+                                &_doc,
+                                validateForStorage,
+                                immutablePaths,
+                                isInsert,
+                                &logObj,
+                                &docWasModified);
     }
 
     if (!status.isOK()) {
@@ -379,7 +389,6 @@ BSONObj UpdateStage::applyUpdateOpsForInsert(OperationContext* opCtx,
     // oplog record, then. We also set the context of the update driver to the INSERT_CONTEXT.
     // Some mods may only work in that context (e.g. $setOnInsert).
     driver->setLogOp(false);
-    driver->setInsert(true);
 
     FieldRefSet immutablePaths;
     if (!isInternalRequest) {
@@ -404,10 +413,12 @@ BSONObj UpdateStage::applyUpdateOpsForInsert(OperationContext* opCtx,
     // Apply the update modifications here. Do not validate for storage, since we will validate the
     // entire document after the update. However, we ensure that no immutable fields are updated.
     const bool validateForStorage = false;
+    const bool isInsert = true;
     if (isInternalRequest) {
         immutablePaths.clear();
     }
-    Status updateStatus = driver->update(StringData(), doc, validateForStorage, immutablePaths);
+    Status updateStatus =
+        driver->update(StringData(), doc, validateForStorage, immutablePaths, isInsert);
     if (!updateStatus.isOK()) {
         uasserted(16836, updateStatus.reason());
     }
@@ -643,7 +654,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
 
         // We want to free this member when we return, unless we need to retry updating or returning
         // it.
-        ScopeGuard memberFreer = MakeGuard(&WorkingSet::free, _ws, id);
+        auto memberFreer = makeGuard([&] { _ws->free(id); });
 
         invariant(member->hasRecordId());
         recordId = member->recordId;
@@ -666,7 +677,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
                 collection(), getOpCtx(), _ws, id, _params.canonicalQuery);
         } catch (const WriteConflictException&) {
             // There was a problem trying to detect if the document still exists, so retry.
-            memberFreer.Dismiss();
+            memberFreer.dismiss();
             return prepareToRetryWSM(id, out);
         }
 
@@ -702,7 +713,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
             // Do the update, get us the new version of the doc.
             newObj = transformAndUpdate(member->obj, recordId);
         } catch (const WriteConflictException&) {
-            memberFreer.Dismiss();  // Keep this member around so we can retry updating it.
+            memberFreer.dismiss();  // Keep this member around so we can retry updating it.
             return prepareToRetryWSM(id, out);
         }
 
@@ -738,7 +749,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
 
                 _idReturning = id;
                 // Keep this member around so that we can return it on the next work() call.
-                memberFreer.Dismiss();
+                memberFreer.dismiss();
             }
             *out = WorkingSet::INVALID_ID;
             return NEED_YIELD;
@@ -748,7 +759,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
             // member->obj should refer to the document we want to return.
             invariant(member->getState() == WorkingSetMember::OWNED_OBJ);
 
-            memberFreer.Dismiss();  // Keep this member around so we can return it.
+            memberFreer.dismiss();  // Keep this member around so we can return it.
             *out = id;
             return PlanStage::ADVANCED;
         }
@@ -819,14 +830,18 @@ const UpdateStats* UpdateStage::getUpdateStats(const PlanExecutor* exec) {
 
     // If the collection exists, then we expect the root of the plan tree to either be an update
     // stage, or (for findAndModify) a projection stage wrapping an update stage.
-    if (StageType::STAGE_PROJECTION == exec->getRootStage()->stageType()) {
-        invariant(exec->getRootStage()->getChildren().size() == 1U);
-        invariant(StageType::STAGE_UPDATE == exec->getRootStage()->child()->stageType());
-        const SpecificStats* stats = exec->getRootStage()->child()->getSpecificStats();
-        return static_cast<const UpdateStats*>(stats);
-    } else {
-        invariant(StageType::STAGE_UPDATE == exec->getRootStage()->stageType());
-        return static_cast<const UpdateStats*>(exec->getRootStage()->getSpecificStats());
+    switch (exec->getRootStage()->stageType()) {
+        case StageType::STAGE_PROJECTION_DEFAULT:
+        case StageType::STAGE_PROJECTION_COVERED:
+        case StageType::STAGE_PROJECTION_SIMPLE: {
+            invariant(exec->getRootStage()->getChildren().size() == 1U);
+            invariant(StageType::STAGE_UPDATE == exec->getRootStage()->child()->stageType());
+            const SpecificStats* stats = exec->getRootStage()->child()->getSpecificStats();
+            return static_cast<const UpdateStats*>(stats);
+        }
+        default:
+            invariant(StageType::STAGE_UPDATE == exec->getRootStage()->stageType());
+            return static_cast<const UpdateStats*>(exec->getRootStage()->getSpecificStats());
     }
 }
 

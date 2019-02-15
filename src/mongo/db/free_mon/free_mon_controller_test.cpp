@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -364,8 +363,8 @@ public:
 
 
 private:
-    AtomicInt32 _registers;
-    AtomicInt32 _metrics;
+    AtomicWord<int> _registers;
+    AtomicWord<int> _metrics;
 
     executor::ThreadPoolTaskExecutor* _threadPool;
 

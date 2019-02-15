@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -69,6 +68,10 @@ public:
 
     std::size_t getNumRemotes() const {
         return _arm.getNumRemotes();
+    }
+
+    BSONObj getHighWaterMark() {
+        return _arm.getHighWaterMark();
     }
 
     void addNewShardCursors(std::vector<RemoteCursor>&& newCursors) {

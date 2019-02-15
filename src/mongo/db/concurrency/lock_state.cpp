@@ -112,7 +112,7 @@ const ResourceId resourceIdGlobal = ResourceId(RESOURCE_GLOBAL, ResourceId::SING
 const Milliseconds MaxWaitTime = Milliseconds(500);
 
 // Dispenses unique LockerId identifiers
-AtomicUInt64 idCounter(0);
+AtomicWord<unsigned long long> idCounter(0);
 
 // Partitioned global lock statistics, so we don't hit the same bucket
 PartitionedInstanceWideLockStats globalStats;
@@ -313,15 +313,14 @@ void LockerImpl::reacquireTicket(OperationContext* opCtx) {
     if (clientState != kInactive)
         return;
 
-    auto acquireTicketResult = _acquireTicket(opCtx, _modeForTicket, Date_t::max());
+    auto deadline = _maxLockTimeout ? Date_t::now() + *_maxLockTimeout : Date_t::max();
+    auto acquireTicketResult = _acquireTicket(opCtx, _modeForTicket, deadline);
     uassert(ErrorCodes::LockTimeout,
             str::stream() << "Unable to acquire ticket with mode '" << _modeForTicket
                           << "' within a max lock request timeout of '"
-                          << _maxLockTimeout.get()
+                          << *_maxLockTimeout
                           << "' milliseconds.",
-            acquireTicketResult == LOCK_OK || !_maxLockTimeout);
-    // If no deadline is specified we should always get a ticket.
-    invariant(acquireTicketResult == LOCK_OK);
+            acquireTicketResult == LOCK_OK || _uninterruptibleLocksRequested);
 }
 
 LockResult LockerImpl::_acquireTicket(OperationContext* opCtx, LockMode mode, Date_t deadline) {
@@ -330,12 +329,8 @@ LockResult LockerImpl::_acquireTicket(OperationContext* opCtx, LockMode mode, Da
     if (holder) {
         _clientState.store(reader ? kQueuedReader : kQueuedWriter);
 
-        if (_maxLockTimeout && !_uninterruptibleLocksRequested) {
-            deadline = std::min(deadline, Date_t::now() + _maxLockTimeout.get());
-        }
-
         // If the ticket wait is interrupted, restore the state of the client.
-        auto restoreStateOnErrorGuard = MakeGuard([&] { _clientState.store(kInactive); });
+        auto restoreStateOnErrorGuard = makeGuard([&] { _clientState.store(kInactive); });
 
         OperationContext* interruptible = _uninterruptibleLocksRequested ? nullptr : opCtx;
         if (deadline == Date_t::max()) {
@@ -343,7 +338,7 @@ LockResult LockerImpl::_acquireTicket(OperationContext* opCtx, LockMode mode, Da
         } else if (!holder->waitForTicketUntil(interruptible, deadline)) {
             return LOCK_TIMEOUT;
         }
-        restoreStateOnErrorGuard.Dismiss();
+        restoreStateOnErrorGuard.dismiss();
     }
     _clientState.store(reader ? kActiveReader : kActiveWriter);
     return LOCK_OK;
@@ -352,7 +347,19 @@ LockResult LockerImpl::_acquireTicket(OperationContext* opCtx, LockMode mode, Da
 LockResult LockerImpl::_lockGlobalBegin(OperationContext* opCtx, LockMode mode, Date_t deadline) {
     dassert(isLocked() == (_modeForTicket != MODE_NONE));
     if (_modeForTicket == MODE_NONE) {
-        auto acquireTicketResult = _acquireTicket(opCtx, mode, deadline);
+        auto lockTimeoutDate =
+            _maxLockTimeout ? Date_t::now() + _maxLockTimeout.get() : Date_t::max();
+        auto useLockTimeout = lockTimeoutDate < deadline;
+        auto acquireTicketResult =
+            _acquireTicket(opCtx, mode, useLockTimeout ? lockTimeoutDate : deadline);
+        if (useLockTimeout) {
+            uassert(ErrorCodes::LockTimeout,
+                    str::stream() << "Unable to acquire ticket with mode '" << _modeForTicket
+                                  << "' within a max lock request timeout of '"
+                                  << *_maxLockTimeout
+                                  << "' milliseconds.",
+                    acquireTicketResult == LOCK_OK || _uninterruptibleLocksRequested);
+        }
         if (acquireTicketResult != LOCK_OK) {
             return acquireTicketResult;
         }
@@ -486,6 +493,11 @@ void LockerImpl::downgrade(ResourceId resId, LockMode newMode) {
 
 bool LockerImpl::unlock(ResourceId resId) {
     LockRequestsMap::Iterator it = _requests.find(resId);
+
+    // Don't attempt to unlock twice. This can happen when an interrupted global lock is destructed.
+    if (it.finished())
+        return false;
+
     if (inAWriteUnitOfWork() && _shouldDelayUnlock(it.key(), (it->mode))) {
         if (!it->unlockPending) {
             _numResourcesToUnlockAtEndUnitOfWork++;
@@ -498,10 +510,27 @@ bool LockerImpl::unlock(ResourceId resId) {
         return false;
     }
 
-    // Don't attempt to unlock twice. This can happen when an interrupted global lock is destructed.
-    if (it.finished())
-        return false;
     return _unlockImpl(&it);
+}
+
+bool LockerImpl::unlockRSTLforPrepare() {
+    auto rstlRequest = _requests.find(resourceIdReplicationStateTransitionLock);
+
+    // Don't attempt to unlock twice. This can happen when an interrupted global lock is destructed.
+    if (!rstlRequest)
+        return false;
+
+    // If the RSTL is 'unlockPending' and we are fully unlocking it, then we do not want to
+    // attempt to unlock the RSTL when the WUOW ends, since it will already be unlocked.
+    if (rstlRequest->unlockPending) {
+        _numResourcesToUnlockAtEndUnitOfWork--;
+    }
+
+    // Reset the recursiveCount to 1 so that we fully unlock the RSTL. Since it will be fully
+    // unlocked, any future unlocks will be noops anyways.
+    rstlRequest->recursiveCount = 1;
+
+    return _unlockImpl(&rstlRequest);
 }
 
 LockMode LockerImpl::getLockMode(ResourceId resId) const {
@@ -813,7 +842,7 @@ LockResult LockerImpl::lockComplete(OperationContext* opCtx,
     uint64_t startOfCurrentWaitTime = startOfTotalWaitTime;
 
     // Clean up the state on any failed lock attempts.
-    auto unlockOnErrorGuard = MakeGuard([&] {
+    auto unlockOnErrorGuard = makeGuard([&] {
         LockRequestsMap::Iterator it = _requests.find(resId);
         _unlockImpl(&it);
     });
@@ -870,7 +899,7 @@ LockResult LockerImpl::lockComplete(OperationContext* opCtx,
     // lock was still granted after all, but we don't try to take advantage of that and will return
     // a timeout.
     if (result == LOCK_OK) {
-        unlockOnErrorGuard.Dismiss();
+        unlockOnErrorGuard.dismiss();
     }
     return result;
 }

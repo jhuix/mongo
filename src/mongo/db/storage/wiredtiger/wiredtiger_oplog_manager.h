@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -85,7 +84,7 @@ public:
 
 private:
     void _oplogJournalThreadLoop(WiredTigerSessionCache* sessionCache,
-                                 WiredTigerRecordStore* oplogRecordStore) noexcept;
+                                 WiredTigerRecordStore* oplogRecordStore);
 
     void _setOplogReadTimestamp(WithLock, uint64_t newTimestamp);
 
@@ -104,6 +103,6 @@ private:
     // journal flushing should not be delayed.
     std::int64_t _opsWaitingForVisibility = 0;  // Guarded by oplogVisibilityStateMutex.
 
-    AtomicUInt64 _oplogReadTimestamp;
+    AtomicWord<unsigned long long> _oplogReadTimestamp;
 };
 }  // namespace mongo

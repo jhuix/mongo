@@ -477,6 +477,7 @@ class Expression(common.SourceLocation):
     """Description of a valid C++ expression."""
 
     def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
         """Construct an Expression."""
 
         self.literal = None  # type: unicode
@@ -484,6 +485,21 @@ class Expression(common.SourceLocation):
         self.is_constexpr = True  # type: bool
 
         super(Expression, self).__init__(file_name, line, column)
+
+
+class ServerParameterClass(common.SourceLocation):
+    """ServerParameter as C++ class specialization."""
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct a ServerParameterClass."""
+
+        self.name = None  # type: unicode
+        self.data = None  # type: unicode
+        self.override_ctor = False  # type: bool
+        self.override_set = False  # type: bool
+
+        super(ServerParameterClass, self).__init__(file_name, line, column)
 
 
 class ServerParameter(common.SourceLocation):
@@ -499,22 +515,32 @@ class ServerParameter(common.SourceLocation):
         self.description = None  # type: unicode
         self.cpp_vartype = None  # type: unicode
         self.cpp_varname = None  # type: unicode
+        self.cpp_class = None  # type: ServerParameterClass
         self.condition = None  # type: Condition
         self.deprecated_name = []  # type: List[unicode]
         self.redact = False  # type: bool
         self.test_only = False  # type: bool
-
-        # Only valid if cppStorage is specified.
-        self.validator = None  # type: Validator
-        self.on_update = None  # type: unicode
         self.default = None  # type: Expression
 
-        # Required if cppStorage is not specified.
-        self.from_bson = None  # type: unicode
-        self.append_bson = None  # type: unicode
-        self.from_string = None  # type: unicode
+        # Only valid if cpp_varname is specified.
+        self.validator = None  # type: Validator
+        self.on_update = None  # type: unicode
 
         super(ServerParameter, self).__init__(file_name, line, column)
+
+
+class GlobalInitializer(common.SourceLocation):
+    """Initializer details for custom registration/storage."""
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct a GlobalInitializer."""
+
+        self.name = None  # type: unicode
+        self.register = None  # type: unicode
+        self.store = None  # type: unicode
+
+        super(GlobalInitializer, self).__init__(file_name, line, column)
 
 
 class ConfigGlobal(common.SourceLocation):
@@ -525,7 +551,7 @@ class ConfigGlobal(common.SourceLocation):
         """Construct a ConfigGlobal."""
         self.section = None  # type: unicode
         self.source = []  # type: List[unicode]
-        self.initializer_name = None  # type: unicode
+        self.initializer = None  # type: GlobalInitializer
 
         super(ConfigGlobal, self).__init__(file_name, line, column)
 

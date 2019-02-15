@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -96,6 +95,8 @@ public:
      * constraints. Ensures that no paths in 'immutablePaths' are modified (though they may be
      * created, if they do not yet exist).
      *
+     * The value of 'isInsert' controls whether $setOnInsert modifiers get applied.
+     *
      * If 'modifiedPaths' is not null, this method will populate it with the set of paths that were
      * either modified at runtime or present statically in the update modifiers. For arrays, the
      * set will include only the path to the array if the length has changed. All paths encode array
@@ -108,6 +109,7 @@ public:
                   mutablebson::Document* doc,
                   bool validateForStorage,
                   const FieldRefSet& immutablePaths,
+                  bool isInsert,
                   BSONObj* logOpRec = nullptr,
                   bool* docWasModified = nullptr,
                   FieldRefSetWithStorage* modifiedPaths = nullptr);
@@ -127,10 +129,6 @@ public:
 
     bool fromOplogApplication() const;
     void setFromOplogApplication(bool fromOplogApplication);
-
-    void setInsert(bool insert) {
-        _insert = insert;
-    }
 
     mutablebson::Document& getDocument() {
         return _objDoc;
@@ -190,9 +188,6 @@ private:
 
     // Do any of the mods require positional match details when calling 'prepare'?
     bool _positional = false;
-
-    // Is this update going to be an upsert?
-    bool _insert = false;
 
     // The document used to represent or store the object being updated.
     mutablebson::Document _objDoc;

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -148,8 +147,8 @@ std::pair<StringData, StringData> partitionBackward(StringData str, const char c
  * on multiple parsed option sources.  STL setwise operations require sorted lists.  A map is used
  * instead of a vector of pairs to permit insertion-is-not-overwrite behavior.
  */
-std::map<std::string, std::string> parseOptions(StringData options, StringData url) {
-    std::map<std::string, std::string> ret;
+MongoURI::OptionsMap parseOptions(StringData options, StringData url) {
+    MongoURI::OptionsMap ret;
     if (options.empty()) {
         return ret;
     }
@@ -206,7 +205,7 @@ std::map<std::string, std::string> parseOptions(StringData options, StringData u
     return ret;
 }
 
-MongoURI::OptionsMap addTXTOptions(std::map<std::string, std::string> options,
+MongoURI::OptionsMap addTXTOptions(MongoURI::OptionsMap options,
                                    const std::string& host,
                                    const StringData url,
                                    const bool isSeedlist) {
@@ -430,7 +429,7 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
                               str::stream() << "Hostname " << target << " is not within the domain "
                                             << domain);
                 }
-                return HostAndPort(srv.host, srv.port);
+                return HostAndPort(target.noncanonicalName(), srv.port);
             });
     }
 
@@ -487,7 +486,10 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
     }
 
     transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode;
-    auto sslModeIter = options.find("ssl");
+    auto sslModeIter = std::find_if(options.begin(), options.end(), [](auto pred) {
+        return pred.first == CaseInsensitiveString("ssl") ||
+            pred.first == CaseInsensitiveString("tls");
+    });
     if (sslModeIter != options.end()) {
         const auto& val = sslModeIter->second;
         if (val == "true") {
@@ -495,7 +497,7 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
         } else if (val == "false") {
             sslMode = transport::kDisableSSL;
         } else {
-            uasserted(51041, str::stream() << "ssl must be either 'true' or 'false', not" << val);
+            uasserted(51041, str::stream() << "tls must be either 'true' or 'false', not" << val);
         }
     }
 
@@ -563,7 +565,7 @@ std::string MongoURI::canonicalizeURIAsString() const {
         auto delimeter = "";
         uri << "?";
         for (const auto& pair : _options) {
-            uri << delimeter << uriEncode(pair.first) << "=" << uriEncode(pair.second);
+            uri << delimeter << uriEncode(pair.first.original()) << "=" << uriEncode(pair.second);
             delimeter = "&";
         }
     }

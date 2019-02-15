@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -380,6 +379,17 @@ Status ReplicationCoordinatorMock::checkIfWriteConcernCanBeSatisfied(
     return Status::OK();
 }
 
+Status ReplicationCoordinatorMock::checkIfCommitQuorumCanBeSatisfied(
+    const CommitQuorumOptions& commitQuorum) const {
+    return Status::OK();
+}
+
+StatusWith<bool> ReplicationCoordinatorMock::checkIfCommitQuorumIsSatisfied(
+    const CommitQuorumOptions& commitQuorum,
+    const std::vector<HostAndPort>& commitReadyMembers) const {
+    return true;
+}
+
 WriteConcernOptions ReplicationCoordinatorMock::getGetLastErrorDefault() {
     return WriteConcernOptions();
 }
@@ -492,6 +502,10 @@ boost::optional<Timestamp> ReplicationCoordinatorMock::getRecoveryTimestamp() {
 
 bool ReplicationCoordinatorMock::setContainsArbiter() const {
     return false;
+}
+
+void ReplicationCoordinatorMock::attemptToAdvanceStableTimestamp() {
+    return;
 }
 
 }  // namespace repl

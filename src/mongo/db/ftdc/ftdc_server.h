@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -105,13 +104,13 @@ private:
  * Used to provide default values from FTDCConfig to the FTDC set parameters.
  */
 struct FTDCStartupParams {
-    AtomicBool enabled;
-    AtomicInt32 periodMillis;
+    AtomicWord<bool> enabled;
+    AtomicWord<int> periodMillis;
 
-    AtomicInt32 maxDirectorySizeMB;
-    AtomicInt32 maxFileSizeMB;
-    AtomicInt32 maxSamplesPerArchiveMetricChunk;
-    AtomicInt32 maxSamplesPerInterimMetricChunk;
+    AtomicWord<int> maxDirectorySizeMB;
+    AtomicWord<int> maxFileSizeMB;
+    AtomicWord<int> maxSamplesPerArchiveMetricChunk;
+    AtomicWord<int> maxSamplesPerInterimMetricChunk;
 
     FTDCStartupParams()
         : enabled(FTDCConfig::kEnabledDefault),
@@ -134,5 +133,10 @@ Status onUpdateFTDCDirectorySize(const std::int32_t value);
 Status onUpdateFTDCFileSize(const std::int32_t value);
 Status onUpdateFTDCSamplesPerChunk(const std::int32_t value);
 Status onUpdateFTDCPerInterimUpdate(const std::int32_t value);
+
+/**
+ * Server Parameter accessors
+ */
+boost::filesystem::path getFTDCDirectoryPathParameter();
 
 }  // namespace mongo

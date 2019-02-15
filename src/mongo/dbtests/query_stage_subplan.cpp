@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -502,7 +501,6 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanRootedOrNE) {
     while (stageState != PlanStage::IS_EOF) {
         WorkingSetID id = WorkingSet::INVALID_ID;
         stageState = subplan->work(&id);
-        ASSERT_NE(stageState, PlanStage::DEAD);
         ASSERT_NE(stageState, PlanStage::FAILURE);
         if (stageState == PlanStage::ADVANCED) {
             ++numResults;

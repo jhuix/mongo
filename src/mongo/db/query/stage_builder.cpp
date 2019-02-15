@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -138,31 +137,38 @@ PlanStage* buildStages(OperationContext* opCtx,
             return new SortKeyGeneratorStage(
                 opCtx, childStage, ws, keyGenNode->sortSpec, cq.getCollator());
         }
-        case STAGE_PROJECTION: {
-            const ProjectionNode* pn = static_cast<const ProjectionNode*>(root);
-            PlanStage* childStage = buildStages(opCtx, collection, cq, qsol, pn->children[0], ws);
+        case STAGE_PROJECTION_DEFAULT: {
+            auto pn = static_cast<const ProjectionNodeDefault*>(root);
+            unique_ptr<PlanStage> childStage{
+                buildStages(opCtx, collection, cq, qsol, pn->children[0], ws)};
             if (nullptr == childStage) {
                 return nullptr;
             }
-
-            ProjectionStageParams params;
-            params.projObj = pn->projection;
-            params.collator = cq.getCollator();
-
-            // Stuff the right data into the params depending on what proj impl we use.
-            if (ProjectionNode::DEFAULT == pn->projType) {
-                params.fullExpression = pn->fullExpression;
-                params.projImpl = ProjectionStageParams::NO_FAST_PATH;
-            } else if (ProjectionNode::COVERED_ONE_INDEX == pn->projType) {
-                params.projImpl = ProjectionStageParams::COVERED_ONE_INDEX;
-                params.coveredKeyObj = pn->coveredKeyObj;
-                invariant(!pn->coveredKeyObj.isEmpty());
-            } else {
-                invariant(ProjectionNode::SIMPLE_DOC == pn->projType);
-                params.projImpl = ProjectionStageParams::SIMPLE_DOC;
+            return new ProjectionStageDefault(opCtx,
+                                              pn->projection,
+                                              ws,
+                                              std::move(childStage),
+                                              pn->fullExpression,
+                                              cq.getCollator());
+        }
+        case STAGE_PROJECTION_COVERED: {
+            auto pn = static_cast<const ProjectionNodeCovered*>(root);
+            unique_ptr<PlanStage> childStage{
+                buildStages(opCtx, collection, cq, qsol, pn->children[0], ws)};
+            if (nullptr == childStage) {
+                return nullptr;
             }
-
-            return new ProjectionStage(opCtx, params, ws, childStage);
+            return new ProjectionStageCovered(
+                opCtx, pn->projection, ws, std::move(childStage), pn->coveredKeyObj);
+        }
+        case STAGE_PROJECTION_SIMPLE: {
+            auto pn = static_cast<const ProjectionNodeSimple*>(root);
+            unique_ptr<PlanStage> childStage{
+                buildStages(opCtx, collection, cq, qsol, pn->children[0], ws)};
+            if (nullptr == childStage) {
+                return nullptr;
+            }
+            return new ProjectionStageSimple(opCtx, pn->projection, ws, std::move(childStage));
         }
         case STAGE_LIMIT: {
             const LimitNode* ln = static_cast<const LimitNode*>(root);

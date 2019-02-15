@@ -14,6 +14,10 @@ env.Library(
             '$BUILD_DIR/mongo/db/catalog/collection',
             '$BUILD_DIR/mongo/db/catalog/index_catalog',
         ],
+        LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/db/index_names',
+            '$BUILD_DIR/mongo/db/namespace_string',
+        ],
 )
 
 env.Library(
@@ -26,6 +30,7 @@ env.Library(
         ],
         LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/base',
+            '$BUILD_DIR/mongo/db/curop',
             '$BUILD_DIR/mongo/db/storage/index_entry_comparison',
         ],
 )
@@ -89,7 +94,7 @@ env.CppUnitTest(
 )
 
 serveronlyEnv = env.Clone()
-serveronlyEnv.InjectThirdPartyIncludePaths(libraries=['snappy'])
+serveronlyEnv.InjectThirdParty(libraries=['snappy'])
 serveronlyEnv.Library(
     target="index_access_method",
     source=[
@@ -141,6 +146,7 @@ env.Library(
         'duplicate_key_tracker',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog/index_timestamp_helper',
         '$BUILD_DIR/mongo/db/multi_key_path_tracker',
         'index_access_methods',
     ],

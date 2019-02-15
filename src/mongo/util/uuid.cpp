@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -87,10 +86,6 @@ UUID UUID::parse(const BSONObj& obj) {
     auto res = parse(obj.getField("uuid"));
     uassert(40566, res.getStatus().reason(), res.isOK());
     return res.getValue();
-}
-
-UUID UUID::makeDefaultForChangeStream() {
-    return UUID{};
 }
 
 bool UUID::isUUIDString(const std::string& s) {

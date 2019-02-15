@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -88,7 +87,7 @@ boost::optional<repl::OplogEntry> createMatchingTransactionTableUpdate(
 
     return repl::OplogEntry(
         entry.getOpTime(),
-        0,  // hash
+        boost::none,  // hash
         repl::OpTypeEnum::kUpdate,
         NamespaceString::kSessionTransactionsTableNamespace,
         boost::none,  // uuid

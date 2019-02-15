@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -119,6 +118,9 @@ public:
                                     std::vector<BSONObj>* result) override;
 
     StatusWith<UserHandle> acquireUser(OperationContext* opCtx, const UserName& userName) override;
+    StatusWith<UserHandle> acquireUserForSessionRefresh(OperationContext* opCtx,
+                                                        const UserName& userName,
+                                                        const User::UserId& uid) override;
 
     void invalidateUserByName(OperationContext* opCtx, const UserName& user) override;
 
@@ -203,7 +205,7 @@ private:
     /**
      * A cache of whether there are any users set up for the cluster.
      */
-    AtomicBool _privilegeDocsExist;
+    AtomicWord<bool> _privilegeDocsExist;
 
     std::unique_ptr<AuthzManagerExternalState> _externalState;
 
@@ -256,16 +258,9 @@ private:
      */
     stdx::condition_variable _fetchPhaseIsReady;
 
-    AtomicBool _inUserManagementCommand{false};
+    AtomicWord<bool> _inUserManagementCommand{false};
 };
 
 extern int authorizationManagerCacheSize;
-
-// Hooks for IDL server parameter 'authorizationManagerPinnedUsers'.
-struct AuthorizationManagerPinnedUsersHooks {
-    static void appendBson(OperationContext* opCtx, BSONObjBuilder* out, StringData name);
-    static Status fromBson(const BSONElement& newValue);
-    static Status fromString(StringData str);
-};
 
 }  // namespace mongo

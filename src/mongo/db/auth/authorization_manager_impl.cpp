@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -220,18 +219,18 @@ const auto inUserManagementCommandsFlag = OperationContext::declareDecoration<bo
 
 int authorizationManagerCacheSize;
 
-void AuthorizationManagerPinnedUsersHooks::appendBson(OperationContext* opCtx,
-                                                      BSONObjBuilder* out,
-                                                      StringData name) {
-    return authorizationManagerPinnedUsers.append(opCtx, *out, std::string(name));
+void AuthorizationManagerPinnedUsersServerParameter::append(OperationContext* opCtx,
+                                                            BSONObjBuilder& out,
+                                                            const std::string& name) {
+    return authorizationManagerPinnedUsers.append(opCtx, out, name);
 }
 
-Status AuthorizationManagerPinnedUsersHooks::fromBson(const BSONElement& newValue) {
+Status AuthorizationManagerPinnedUsersServerParameter::set(const BSONElement& newValue) {
     return authorizationManagerPinnedUsers.set(newValue);
 }
 
-Status AuthorizationManagerPinnedUsersHooks::fromString(StringData str) {
-    return authorizationManagerPinnedUsers.setFromString(std::string(str));
+Status AuthorizationManagerPinnedUsersServerParameter::setFromString(const std::string& str) {
+    return authorizationManagerPinnedUsers.setFromString(str);
 }
 
 MONGO_REGISTER_SHIM(AuthorizationManager::create)()->std::unique_ptr<AuthorizationManager> {
@@ -457,6 +456,8 @@ Status AuthorizationManagerImpl::_initializeUserFromPrivilegeDocument(User* user
                                                 << "\"");
     }
 
+    user->setID(parser.extractUserIDFromUserDocument(privDoc));
+
     Status status = parser.initializeUserCredentialsFromUserDocument(user, privDoc);
     if (!status.isOK()) {
         return status;
@@ -575,6 +576,23 @@ StatusWith<UserHandle> AuthorizationManagerImpl::acquireUser(OperationContext* o
     }
 
     return user;
+}
+
+StatusWith<UserHandle> AuthorizationManagerImpl::acquireUserForSessionRefresh(
+    OperationContext* opCtx, const UserName& userName, const User::UserId& uid) {
+    auto swUserHandle = acquireUser(opCtx, userName);
+    if (!swUserHandle.isOK()) {
+        return swUserHandle.getStatus();
+    }
+
+    auto ret = std::move(swUserHandle.getValue());
+    if (uid != ret->getID()) {
+        return {ErrorCodes::UserNotFound,
+                str::stream() << "User id from privilege document '" << userName.toString()
+                              << "' does not match user id in session."};
+    }
+
+    return ret;
 }
 
 StatusWith<UserHandle> AuthorizationManagerImpl::_acquireUserSlowPath(CacheGuard& guard,

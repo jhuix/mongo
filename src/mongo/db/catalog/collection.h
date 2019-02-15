@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -33,6 +32,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
@@ -42,7 +42,6 @@
 #include "mongo/db/catalog/collection_info_cache.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/cursor_manager.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_interface.h"
@@ -197,8 +196,6 @@ public:
 
     virtual const RecordStore* getRecordStore() const = 0;
     virtual RecordStore* getRecordStore() = 0;
-
-    virtual CursorManager* getCursorManager() const = 0;
 
     virtual bool requiresIdIndex() const = 0;
 
@@ -429,6 +426,18 @@ public:
      * Collection is destroyed.
      */
     virtual const CollatorInterface* getDefaultCollator() const = 0;
+
+    /**
+     * Fills in each index specification with collation information from this collection and returns
+     * the new index specifications.
+     *
+     * The returned index specifications will not be equivalent to the ones specified in
+     * 'indexSpecs' if any missing collation information were filled in; however, the returned index
+     * specifications will match the form stored in the IndexCatalog should any of these indexes
+     * already exist.
+     */
+    virtual StatusWith<std::vector<BSONObj>> addCollationDefaultsToIndexSpecsForCreate(
+        OperationContext* opCtx, const std::vector<BSONObj>& indexSpecs) const = 0;
 
     /**
      * Returns a plan executor for a collection scan over this collection.

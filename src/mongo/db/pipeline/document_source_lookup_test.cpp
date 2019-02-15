@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -45,7 +44,7 @@
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/stub_mongo_process_interface.h"
 #include "mongo/db/pipeline/value.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/server_options.h"
@@ -215,12 +214,12 @@ TEST_F(DocumentSourceLookUpTest, LookupEmptyPipelineDoesntUseDiskAndIsOKInATrans
            DocumentSource::TransactionRequirement::kAllowed);
 }
 
-TEST_F(DocumentSourceLookUpTest, LookupWithChildStagesInheritsDiskUseRequirement) {
+TEST_F(DocumentSourceLookUpTest, LookupWithOutInPipelineNotAllowed) {
+    auto ERROR_CODE_OUT_BANNED_IN_LOOKUP = 51047;
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "coll");
     expCtx->setResolvedNamespace_forTest(fromNs, {fromNs, std::vector<BSONObj>{}});
-
-    auto docSource =
+    ASSERT_THROWS_CODE(
         DocumentSourceLookUp::createFromBson(BSON("$lookup" << BSON("from"
                                                                     << "coll"
                                                                     << "pipeline"
@@ -229,14 +228,9 @@ TEST_F(DocumentSourceLookUpTest, LookupWithChildStagesInheritsDiskUseRequirement
                                                                     << "as"
                                                                     << "as"))
                                                  .firstElement(),
-                                             expCtx);
-    auto lookup = static_cast<DocumentSourceLookUp*>(docSource.get());
-
-    ASSERT_TRUE(lookup->wasConstructedWithPipelineSyntax());
-    ASSERT(lookup->constraints(Pipeline::SplitState::kUnsplit).diskRequirement ==
-           DocumentSource::DiskUseRequirement::kWritesPersistentData);
-    ASSERT(lookup->constraints(Pipeline::SplitState::kUnsplit).transactionRequirement ==
-           DocumentSource::TransactionRequirement::kNotAllowed);
+                                             expCtx),
+        AssertionException,
+        ERROR_CODE_OUT_BANNED_IN_LOOKUP);
 }
 
 TEST_F(DocumentSourceLookUpTest, LiteParsedDocumentSourceLookupContainsExpectedNamespaces) {

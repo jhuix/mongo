@@ -1,6 +1,3 @@
-// cmdline.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -49,15 +46,8 @@ struct InsensitiveCompare {
     }
 };
 
-std::set<std::string, InsensitiveCompare> gRedactedDottedNames = {
-    // Legacy redacted names pending conversion.
-    "processManagement.windowsService.servicePassword",
-    "security.kmip.clientCertificatePassword",
-    "security.ldap.bind.queryPassword",
-};
-std::set<std::string, InsensitiveCompare> gRedactedSingleNames = {
-    "servicePassword", "kmipClientCertificatePassword", "ldapQueryPassword",
-};
+std::set<std::string, InsensitiveCompare> gRedactedDottedNames;
+std::set<std::string, InsensitiveCompare> gRedactedSingleNames;
 std::set<char> gRedactedCharacterNames;
 
 bool gGatherOptionsDone = false;

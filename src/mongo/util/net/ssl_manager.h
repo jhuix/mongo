@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -90,6 +89,24 @@ typedef SSLContextRef SSLConnectionType;
 #error "Unknown SSL Provider"
 #endif
 
+
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
+/*
+ * There are a number of OpenSSL types that we want to be able to use with unique_ptr that have a
+ * custom OpenSSL deleter function. This template implements a stateless deleter for types with
+ * C free functions:
+ * using UniqueX509 = std::unique_ptr<X509, OpenSSLDeleter<decltype(::X509_free), ::X509_free>>;
+ */
+template <typename Deleter, Deleter* impl>
+struct OpenSSLDeleter {
+    template <typename Obj>
+    void operator()(Obj* ptr) const {
+        if (ptr != nullptr) {
+            impl(ptr);
+        }
+    }
+};
+#endif
 /**
  * Maintain per connection SSL state for the Sock class. Used by SSLManagerInterface to perform SSL
  * operations.
@@ -143,11 +160,11 @@ const ASN1OID mongodbRolesOID("1.3.6.1.4.1.34601.2.1.1",
  * Counts of negogtiated version used by TLS connections.
  */
 struct TLSVersionCounts {
-    AtomicInt64 tlsUnknown;
-    AtomicInt64 tls10;
-    AtomicInt64 tls11;
-    AtomicInt64 tls12;
-    AtomicInt64 tls13;
+    AtomicWord<long long> tlsUnknown;
+    AtomicWord<long long> tls10;
+    AtomicWord<long long> tls11;
+    AtomicWord<long long> tls12;
+    AtomicWord<long long> tls13;
 
     static TLSVersionCounts& get(ServiceContext* serviceContext);
 };

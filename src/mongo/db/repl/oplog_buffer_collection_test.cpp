@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -109,7 +108,7 @@ NamespaceString makeNamespace(const T& t, const char* suffix = "") {
  * Generates oplog entries with the given number used for the timestamp.
  */
 BSONObj makeOplogEntry(int t) {
-    return BSON("ts" << Timestamp(t, t) << "h" << t << "ns"
+    return BSON("ts" << Timestamp(t, t) << "ns"
                      << "a.a"
                      << "v"
                      << 2

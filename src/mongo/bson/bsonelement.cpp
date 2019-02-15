@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -93,7 +92,7 @@ void BSONElement::jsonStringStream(JsonStringFormat format,
             if (number() >= -std::numeric_limits<double>::max() &&
                 number() <= std::numeric_limits<double>::max()) {
                 auto origPrecision = s.precision();
-                auto guard = MakeGuard([&s, origPrecision]() { s.precision(origPrecision); });
+                auto guard = makeGuard([&s, origPrecision]() { s.precision(origPrecision); });
                 s.precision(16);
                 s << number();
             }
@@ -217,7 +216,7 @@ void BSONElement::jsonStringStream(JsonStringFormat format,
             auto origFill = s.fill();
             auto origFmtF = s.flags();
             auto origWidth = s.width();
-            auto guard = MakeGuard([&s, origFill, origFmtF, origWidth] {
+            auto guard = makeGuard([&s, origFill, origFmtF, origWidth] {
                 s.fill(origFill);
                 s.setf(origFmtF);
                 s.width(origWidth);

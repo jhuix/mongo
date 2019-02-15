@@ -34,6 +34,7 @@
 #include "mongo/db/index/duplicate_key_tracker.h"
 
 #include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/util/assert_util.h"
@@ -74,8 +75,7 @@ Status DuplicateKeyTracker::recordKeys(OperationContext* opCtx, const std::vecto
         records.emplace_back(Record{RecordId(), RecordData(obj.objdata(), obj.objsize())});
     }
 
-    LOG(1) << "index build recording " << records.size()
-           << " duplicate key conflicts for unique index: "
+    LOG(1) << "recording " << records.size() << " duplicate key conflicts on unique index: "
            << _indexCatalogEntry->descriptor()->indexName();
 
     WriteUnitOfWork wuow(opCtx);
@@ -86,18 +86,31 @@ Status DuplicateKeyTracker::recordKeys(OperationContext* opCtx, const std::vecto
 
     wuow.commit();
 
+    _duplicateCounter.fetchAndAdd(records.size());
+
     return Status::OK();
 }
 
 Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx) const {
+    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+
     auto constraintsCursor = _keyConstraintsTable->rs()->getCursor(opCtx);
     auto record = constraintsCursor->next();
 
     auto index = _indexCatalogEntry->accessMethod()->getSortedDataInterface();
 
-    int count = 0;
+    static const char* curopMessage = "Index Build: checking for duplicate keys";
+    ProgressMeterHolder progress;
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        progress.set(
+            CurOp::get(opCtx)->setProgress_inlock(curopMessage, _duplicateCounter.load(), 1));
+    }
+
+
+    int resolved = 0;
     while (record) {
-        count++;
+        resolved++;
         BSONObj conflict = record->data.toBson();
         BSONObj keyObj = conflict[kKeyField].Obj();
 
@@ -105,12 +118,36 @@ Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx) const {
         if (!status.isOK())
             return status;
 
+        WriteUnitOfWork wuow(opCtx);
+        _keyConstraintsTable->rs()->deleteRecord(opCtx, record->id);
+
+        constraintsCursor->save();
+        wuow.commit();
+        constraintsCursor->restore();
+
+        progress->hit();
         record = constraintsCursor->next();
     }
+    progress->finished();
 
-    log() << "index build resolved " << count << " duplicate key conflicts for unique index: "
-          << _indexCatalogEntry->descriptor()->indexName();
+    invariant(resolved == _duplicateCounter.load());
+
+    int logLevel = (resolved > 0) ? 0 : 1;
+    LOG(logLevel) << "index build: resolved " << resolved
+                  << " duplicate key conflicts for unique index: "
+                  << _indexCatalogEntry->descriptor()->indexName();
     return Status::OK();
+}
+
+bool DuplicateKeyTracker::areAllConstraintsChecked(OperationContext* opCtx) const {
+    auto cursor = _keyConstraintsTable->rs()->getCursor(opCtx);
+    auto record = cursor->next();
+
+    // The table is empty only when there are no more constraints to check.
+    if (!record)
+        return true;
+
+    return false;
 }
 
 }  // namespace mongo

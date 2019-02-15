@@ -225,7 +225,6 @@
         getLog: {skip: "executes locally on mongos (not sent to any remote node)"},
         getMore: {skip: "requires a previously established cursor"},
         getParameter: {skip: "executes locally on mongos (not sent to any remote node)"},
-        getPrevError: {skip: "not supported in mongos"},
         getShardMap: {skip: "executes locally on mongos (not sent to any remote node)"},
         getShardVersion: {skip: "executes locally on mongos (not sent to any remote node)"},
         getnonce: {skip: "not on a user database"},
@@ -387,6 +386,23 @@
         saslContinue: {skip: "not on a user database"},
         saslStart: {skip: "not on a user database"},
         serverStatus: {skip: "executes locally on mongos (not sent to any remote node)"},
+        setIndexCommitQuorum: {
+            skipProfilerCheck: true,
+            sendsDbVersion: false,
+            sendsShardVersion: true,
+            setUp: function(mongosConn) {
+                // Expects the collection to exist, and doesn't implicitly create it.
+                assert.commandWorked(mongosConn.getDB(dbName).runCommand({create: collName}));
+            },
+            command: {
+                setIndexCommitQuorum: collName,
+                indexNames: ["index"],
+                commitQuorum: {commitQuorum: "majority"}
+            },
+            cleanUp: function(mongosConn) {
+                assert(mongosConn.getDB(dbName).getCollection(collName).drop());
+            },
+        },
         setFeatureCompatibilityVersion: {skip: "not on a user database"},
         setFreeMonitoring:
             {skip: "explicitly fails for mongos, primary mongod only", conditional: true},
@@ -396,7 +412,9 @@
         shutdown: {skip: "does not forward command to primary shard"},
         split: {skip: "does not forward command to primary shard"},
         splitVector: {skip: "does not forward command to primary shard"},
+        startRecordingTraffic: {skip: "executes locally on mongos (not sent to any remote node)"},
         startSession: {skip: "executes locally on mongos (not sent to any remote node)"},
+        stopRecordingTraffic: {skip: "executes locally on mongos (not sent to any remote node)"},
         update: {
             skipProfilerCheck: true,
             sendsDbVersion: false,

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -72,7 +71,7 @@ public:
             tokenData.clusterTime = ts;
             return ResumeToken(tokenData).toDocument();
         }
-        return ResumeToken(ResumeTokenData(ts, 0, 0, Value(Document{{"_id", id}}), testUuid()))
+        return ResumeToken(ResumeTokenData(ts, 0, 0, testUuid(), Value(Document{{"_id", id}})))
             .toDocument();
     }
 };

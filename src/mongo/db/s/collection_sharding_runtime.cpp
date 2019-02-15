@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -37,9 +36,13 @@
 #include "mongo/base/checked_cast.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+MONGO_EXPORT_SERVER_PARAMETER(migrationLockAcquisitionMaxWaitMS, int, 500);
+
 namespace {
 
 // How long to wait before starting cleanup of an emigrated chunk range
@@ -75,6 +78,7 @@ CollectionShardingRuntime::CollectionShardingRuntime(ServiceContext* sc,
                                                      NamespaceString nss,
                                                      executor::TaskExecutor* rangeDeleterExecutor)
     : CollectionShardingState(nss),
+      _stateChangeMutex(nss.toString()),
       _nss(std::move(nss)),
       _metadataManager(std::make_shared<MetadataManager>(sc, _nss, rangeDeleterExecutor)) {
     if (isNamespaceAlwaysUnsharded(_nss)) {
@@ -182,7 +186,13 @@ boost::optional<ScopedCollectionMetadata> CollectionShardingRuntime::_getMetadat
 
 CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, NamespaceString ns)
     : _nss(std::move(ns)), _opCtx(opCtx) {
-    AutoGetCollection autoColl(_opCtx, _nss, MODE_IX, MODE_X);
+    AutoGetCollection autoColl(_opCtx,
+                               _nss,
+                               MODE_IX,
+                               MODE_X,
+                               AutoGetCollection::ViewMode::kViewsForbidden,
+                               opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                                   Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
     CollectionShardingState::get(opCtx, _nss)->enterCriticalSectionCatchUpPhase(_opCtx);
 }
 
@@ -193,7 +203,13 @@ CollectionCriticalSection::~CollectionCriticalSection() {
 }
 
 void CollectionCriticalSection::enterCommitPhase() {
-    AutoGetCollection autoColl(_opCtx, _nss, MODE_IX, MODE_X);
+    AutoGetCollection autoColl(_opCtx,
+                               _nss,
+                               MODE_IX,
+                               MODE_X,
+                               AutoGetCollection::ViewMode::kViewsForbidden,
+                               _opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                                   Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
     CollectionShardingState::get(_opCtx, _nss)->enterCriticalSectionCommitPhase(_opCtx);
 }
 

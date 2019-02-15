@@ -1,6 +1,3 @@
-// wiredtiger_kv_engine.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -349,7 +346,12 @@ public:
      */
     Timestamp getPinnedOplog() const;
 
+    ClockSource* getClockSource() const {
+        return _clockSource;
+    }
+
 private:
+    class WiredTigerSessionSweeper;
     class WiredTigerJournalFlusher;
     class WiredTigerCheckpointThread;
 
@@ -434,6 +436,7 @@ private:
     // timestamp.
     const bool _keepDataHistory = true;
 
+    std::unique_ptr<WiredTigerSessionSweeper> _sessionSweeper;
     std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
     std::unique_ptr<WiredTigerCheckpointThread> _checkpointThread;
 

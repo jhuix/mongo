@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-2019 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -220,6 +220,7 @@ typedef struct {
 	uint32_t c_statistics_server;
 	uint32_t c_threads;
 	uint32_t c_timer;
+	uint32_t c_timing_stress_aggressive_sweep;
 	uint32_t c_timing_stress_checkpoint;
 	uint32_t c_timing_stress_lookaside_sweep;
 	uint32_t c_timing_stress_split_1;
@@ -381,7 +382,7 @@ mmrand(WT_RAND_STATE *rnd, u_int min, u_int max)
 	 * Test runs with small row counts can easily pass a max of 0 (for
 	 * example, "g.rows / 20"). Avoid the problem.
 	 */
-	if (min <= max)
+	if (max <= min)
 		return (min);
 
 	v = rng(rnd);

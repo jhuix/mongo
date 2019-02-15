@@ -130,6 +130,7 @@ Eron
 FALLOC
 FALLTHROUGH
 FH
+FIXME
 FLD
 FLSv
 FLv
@@ -737,6 +738,7 @@ fdopen
 fextend
 ffc
 fff
+ffffffffffffffff
 fflush
 ffs
 fgetc
@@ -1173,6 +1175,7 @@ scalability
 sched
 scr
 sd
+second's
 secretkey
 sed
 sessionp
@@ -1228,6 +1231,7 @@ subinit
 sublicense
 subone
 suboptimal
+subsystem's
 subtest
 subtree
 sunique
@@ -1385,6 +1389,7 @@ xff
 xxxx
 xxxxx
 xxxxxx
+zSeries
 zalloc
 zf
 zfree

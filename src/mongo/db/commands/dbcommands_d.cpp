@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -320,7 +319,7 @@ public:
                 exec->restoreState();
             }
 
-            if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
+            if (PlanExecutor::FAILURE == state) {
                 uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
                     "Executor error during filemd5 command"));
             }

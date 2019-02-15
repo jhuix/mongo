@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -44,6 +43,7 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+class CommitQuorumOptions;
 class Timestamp;
 
 namespace repl {
@@ -658,6 +658,23 @@ public:
      * we last restarted, then its value will be boost::none.
      */
     std::map<int, boost::optional<OpTime>> latestKnownOpTimeSinceHeartbeatRestartPerMember() const;
+
+    /**
+     * Checks if the 'commitQuorum' can be satisifed by 'members'. Returns true if it can be
+     * satisfied.
+     *
+     * 'members' must be part of the replica set configuration.
+     */
+    bool checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum,
+                                           const std::vector<MemberConfig>& members) const;
+
+    /**
+     * Returns 'true' if the 'commitQuorum' is satisifed by the 'commitReadyMembers'.
+     *
+     * 'commitReadyMembers' must be part of the replica set configuration.
+     */
+    bool checkIfCommitQuorumIsSatisfied(const CommitQuorumOptions& commitQuorum,
+                                        const std::vector<HostAndPort>& commitReadyMembers) const;
 
     ////////////////////////////////////////////////////////////
     //

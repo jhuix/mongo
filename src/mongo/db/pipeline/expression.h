@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -312,11 +311,11 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         BSONElement bsonExpr,
         const VariablesParseState& vps) {
-        boost::intrusive_ptr<ExpressionNaryBase> expr = new SubClass(expCtx);
+        auto expr = make_intrusive<SubClass>(expCtx);
         ExpressionVector args = parseArguments(expCtx, bsonExpr, vps);
         expr->validateArguments(args);
         expr->vpOperand = args;
-        return expr;
+        return std::move(expr);
     }
 
 protected:
@@ -597,10 +596,10 @@ public:
      * off the timezone if not specified.
      */
     Value serialize(bool explain) const final {
+        auto timezone = _timeZone ? _timeZone->serialize(explain) : Value();
         return Value(Document{
             {_opName,
-             Document{{"date", _date->serialize(explain)},
-                      {"timezone", _timeZone ? _timeZone->serialize(explain) : Value()}}}});
+             Document{{"date", _date->serialize(explain)}, {"timezone", std::move(timezone)}}}});
     }
 
     boost::intrusive_ptr<Expression> optimize() final {
@@ -1756,6 +1755,14 @@ public:
     const char* getOpName() const final;
 };
 
+class ExpressionRound final : public ExpressionRangedArity<ExpressionRound, 1, 2> {
+public:
+    explicit ExpressionRound(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : ExpressionRangedArity<ExpressionRound, 1, 2>(expCtx) {}
+
+    Value evaluate(const Document& root) const final;
+    const char* getOpName() const final;
+};
 
 class ExpressionSplit final : public ExpressionFixedArity<ExpressionSplit, 2> {
 public:
@@ -1950,12 +1957,12 @@ private:
 };
 
 
-class ExpressionTrunc final : public ExpressionSingleNumericArg<ExpressionTrunc> {
+class ExpressionTrunc final : public ExpressionRangedArity<ExpressionTrunc, 1, 2> {
 public:
     explicit ExpressionTrunc(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : ExpressionSingleNumericArg<ExpressionTrunc>(expCtx) {}
+        : ExpressionRangedArity<ExpressionTrunc, 1, 2>(expCtx) {}
 
-    Value evaluateNumericArg(const Value& numericArg) const final;
+    Value evaluate(const Document& root) const final;
     const char* getOpName() const final;
 };
 

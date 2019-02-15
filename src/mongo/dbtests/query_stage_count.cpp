@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -180,7 +179,6 @@ public:
             // do some work -- assumes that one work unit counts a single doc
             PlanStage::StageState state = count_stage.work(&wsid);
             ASSERT_NOT_EQUALS(state, PlanStage::FAILURE);
-            ASSERT_NOT_EQUALS(state, PlanStage::DEAD);
 
             // prepare for yield
             count_stage.saveState();

@@ -45,6 +45,7 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/global_lock_acquisition_tracker.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/curop_metrics.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/dbdirectclient.h"
@@ -66,15 +67,17 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
+#include "mongo/db/run_op_kill_cursors.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/transaction_coordinator_factory.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/snapshot_window_util.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/db/transaction_coordinator_factory.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/rpc/factory.h"
@@ -96,6 +99,19 @@ namespace mongo {
 MONGO_FAIL_POINT_DEFINE(rsStopGetMore);
 MONGO_FAIL_POINT_DEFINE(respondWithNotPrimaryInCommandDispatch);
 MONGO_FAIL_POINT_DEFINE(skipCheckingForNotMasterInCommandDispatch);
+MONGO_FAIL_POINT_DEFINE(waitAfterReadCommandFinishesExecution);
+
+// Tracks the number of times a legacy unacknowledged write failed due to
+// not master error resulted in network disconnection.
+Counter64 notMasterLegacyUnackWrites;
+ServerStatusMetricField<Counter64> displayNotMasterLegacyUnackWrites(
+    "repl.network.notMasterLegacyUnacknowledgedWrites", &notMasterLegacyUnackWrites);
+
+// Tracks the number of times an unacknowledged write failed due to not master error
+// resulted in network disconnection.
+Counter64 notMasterUnackWrites;
+ServerStatusMetricField<Counter64> displayNotMasterUnackWrites(
+    "repl.network.notMasterUnacknowledgedWrites", &notMasterUnackWrites);
 
 namespace {
 using logger::LogComponent;
@@ -327,7 +343,7 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
         auto signedTime = SignedLogicalTime(
             LogicalClock::get(opCtx)->getClusterTime(), TimeProofService::TimeProof(), 0);
 
-        // TODO SERVER-35663: invariant that signedTime.getTime() >= operationTime.
+        dassert(signedTime.getTime() >= operationTime);
         rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
         operationTime.appendAsOperationTime(commandBodyFieldsBob);
 
@@ -349,7 +365,7 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
         return;
     }
 
-    // TODO SERVER-35663: invariant that signedTime.getTime() >= operationTime.
+    dassert(signedTime.getTime() >= operationTime);
     rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
     operationTime.appendAsOperationTime(commandBodyFieldsBob);
 }
@@ -358,8 +374,7 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
                                  CommandInvocation* invocation,
                                  TransactionParticipant* txnParticipant,
                                  const OperationSessionInfoFromClient& sessionOptions,
-                                 rpc::ReplyBuilderInterface* replyBuilder) try {
-
+                                 rpc::ReplyBuilderInterface* replyBuilder) {
     if (!opCtx->getClient()->isInDirectClient()) {
         txnParticipant->beginOrContinue(*sessionOptions.getTxnNumber(),
                                         sessionOptions.getAutocommit(),
@@ -381,7 +396,7 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
         txnParticipant->unstashTransactionResources(opCtx, invocation->definition()->getName());
     }
 
-    ScopeGuard guard = MakeGuard([&txnParticipant, opCtx]() {
+    auto guard = makeGuard([&txnParticipant, opCtx] {
         txnParticipant->abortActiveUnpreparedOrStashPreparedTransaction(opCtx);
     });
 
@@ -406,7 +421,7 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
         // If this shard has completed an earlier statement for this transaction, it must already be
         // in the transaction's participant list, so it is guaranteed to learn its outcome.
         txnParticipant->stashTransactionResources(opCtx);
-        guard.Dismiss();
+        guard.dismiss();
         throw;
     }
 
@@ -419,16 +434,7 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
 
     // Stash or commit the transaction when the command succeeds.
     txnParticipant->stashTransactionResources(opCtx);
-    guard.Dismiss();
-} catch (const ExceptionFor<ErrorCodes::NoSuchTransaction>&) {
-    // We make our decision about the transaction state based on the oplog we have, so
-    // we set the client last op to the last optime observed by the system to ensure that
-    // we wait for the specified write concern on an optime greater than or equal to the
-    // the optime of our decision basis. Thus we know our decision basis won't be rolled
-    // back.
-    auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
-    replClient.setLastOpToSystemLastOpTime(opCtx);
-    throw;
+    guard.dismiss();
 }
 
 bool runCommandImpl(OperationContext* opCtx,
@@ -458,6 +464,16 @@ bool runCommandImpl(OperationContext* opCtx,
                 opCtx, invocation, txnParticipant, sessionOptions, replyBuilder);
         } else {
             invocation->run(opCtx, replyBuilder);
+            MONGO_FAIL_POINT_BLOCK(waitAfterReadCommandFinishesExecution, options) {
+                const BSONObj& data = options.getData();
+                auto db = data["db"].str();
+                if (db.empty() || request.getDatabase() == db) {
+                    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                        &waitAfterReadCommandFinishesExecution,
+                        opCtx,
+                        "waitAfterReadCommandFinishesExecution");
+                }
+            }
         }
     } else {
         auto wcResult = uassertStatusOK(extractWriteConcern(opCtx, request.body));
@@ -492,7 +508,11 @@ bool runCommandImpl(OperationContext* opCtx,
             } else {
                 invocation->run(opCtx, replyBuilder);
             }
-        } catch (const DBException&) {
+        } catch (const DBException& ex) {
+            if (ex.toStatus().code() == ErrorCodes::NoSuchTransaction &&
+                !opCtx->getWriteConcern().usedDefault) {
+                TransactionParticipant::performNoopWriteForNoSuchTransaction(opCtx);
+            }
             waitForWriteConcern(*extraFieldsBuilder);
             throw;
         }
@@ -550,7 +570,9 @@ void execCommandDatabase(OperationContext* opCtx,
     CommandHelpers::uassertShouldAttemptParse(opCtx, command, request);
     BSONObjBuilder extraFieldsBuilder;
     auto startOperationTime = getClientOperationTime(opCtx);
+
     auto invocation = command->parse(opCtx, request);
+
     OperationSessionInfoFromClient sessionOptions;
 
     try {
@@ -569,6 +591,7 @@ void execCommandDatabase(OperationContext* opCtx,
             opCtx,
             request.body,
             command->requiresAuth(),
+            command->attachLogicalSessionsToOpCtx(),
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet,
             opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking());
 
@@ -864,8 +887,8 @@ DbResponse receivedCommands(OperationContext* opCtx,
                             const Message& message,
                             const ServiceEntryPointCommon::Hooks& behaviors) {
     auto replyBuilder = rpc::makeReplyBuilder(rpc::protocolForMessage(message));
+    OpMsgRequest request;
     [&] {
-        OpMsgRequest request;
         try {  // Parse.
             request = rpc::opMsgRequestFromAnyProtocol(message);
         } catch (const DBException& ex) {
@@ -935,10 +958,16 @@ DbResponse receivedCommands(OperationContext* opCtx,
 
     if (OpMsg::isFlagSet(message, OpMsg::kMoreToCome)) {
         // Close the connection to get client to go through server selection again.
-        uassert(ErrorCodes::NotMaster,
-                "Not-master error during fire-and-forget command processing",
-                !LastError::get(opCtx->getClient()).hadNotMasterError());
-
+        if (LastError::get(opCtx->getClient()).hadNotMasterError()) {
+            notMasterUnackWrites.increment();
+            uasserted(ErrorCodes::NotMaster,
+                      str::stream() << "Not-master error while processing '"
+                                    << request.getCommandName()
+                                    << "' operation  on '"
+                                    << request.getDatabase()
+                                    << "' database via "
+                                    << "fire-and-forget command execution.");
+        }
         return {};  // Don't reply.
     }
 
@@ -956,6 +985,7 @@ DbResponse receivedQuery(OperationContext* opCtx,
                          const ServiceEntryPointCommon::Hooks& behaviors) {
     invariant(!nss.isCommand());
     globalOpCounters.gotQuery();
+    ServerReadConcernMetrics::get(opCtx)->recordReadConcern(repl::ReadConcernArgs::get(opCtx));
 
     DbMessage d(m);
     QueryMessage q(d);
@@ -999,7 +1029,7 @@ void receivedKillCursors(OperationContext* opCtx, const Message& m) {
 
     const char* cursorArray = dbmessage.getArray(n);
 
-    int found = CursorManager::killCursorGlobalIfAuthorized(opCtx, n, cursorArray);
+    int found = runOpKillCursors(opCtx, static_cast<size_t>(n), cursorArray);
 
     if (shouldLog(logger::LogSeverity::Debug(1)) || found != n) {
         LOG(found == n ? 1 : 0) << "killcursors: found " << found << " of " << n;
@@ -1102,12 +1132,15 @@ DbResponse receivedGetMore(OperationContext* opCtx,
             // Make sure that killCursorGlobal does not throw an exception if it is interrupted.
             UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
-            // If a cursor with id 'cursorid' was authorized, it may have been advanced
-            // before an exception terminated processGetMore.  Erase the ClientCursor
-            // because it may now be out of sync with the client's iteration state.
-            // SERVER-7952
-            // TODO Temporary code, see SERVER-4563 for a cleanup overview.
-            CursorManager::killCursorGlobal(opCtx, cursorid);
+            // If an error was thrown prior to auth checks, then the cursor should remain alive in
+            // order to prevent an unauthorized user from resulting in the death of a cursor. In
+            // other error cases, the cursor is dead and should be cleaned up.
+            //
+            // If killing the cursor fails, ignore the error and don't try again. The cursor should
+            // be reaped by the client cursor timeout thread.
+            CursorManager::get(opCtx)
+                ->killCursor(opCtx, cursorid, false /* shouldAudit */)
+                .ignore();
         }
 
         BSONObjBuilder err;
@@ -1202,6 +1235,8 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
         dbresponse = receivedCommands(opCtx, m, behaviors);
     } else if (op == dbQuery) {
         invariant(!isCommand);
+        opCtx->markKillOnClientDisconnect();
+
         dbresponse = receivedQuery(opCtx, nsString, c, m, behaviors);
     } else if (op == dbGetMore) {
         dbresponse = receivedGetMore(opCtx, m, currentOp, &forceLog);
@@ -1244,6 +1279,19 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
             LOG(3) << " Caught Assertion in " << networkOpToString(op) << ", continuing "
                    << redact(ue);
             debug.errInfo = ue.toStatus();
+        }
+        // A NotMaster error can be set either within receivedInsert/receivedUpdate/receivedDelete
+        // or within the AssertionException handler above.  Either way, we want to throw an
+        // exception here, which will cause the client to be disconnected.
+        if (LastError::get(opCtx->getClient()).hadNotMasterError()) {
+            notMasterLegacyUnackWrites.increment();
+            uasserted(ErrorCodes::NotMaster,
+                      str::stream() << "Not-master error while processing '"
+                                    << networkOpToString(op)
+                                    << "' operation  on '"
+                                    << nsString
+                                    << "' namespace via legacy "
+                                    << "fire-and-forget command execution.");
         }
     }
 

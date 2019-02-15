@@ -1,6 +1,3 @@
-// @file time_support.h
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -312,28 +309,29 @@ void sleepFor(DurationType time) {
 
 class Backoff {
 public:
-    Backoff(int maxSleepMillis, int resetAfter)
-        : _maxSleepMillis(maxSleepMillis),
-          _resetAfterMillis(maxSleepMillis + resetAfter),  // Don't reset < the max sleep
+    Backoff(Milliseconds maxSleep, Milliseconds resetAfter)
+        : _maxSleepMillis(durationCount<Milliseconds>(maxSleep)),
+          _resetAfterMillis(
+              durationCount<Milliseconds>(resetAfter)),  // Don't reset < the max sleep
           _lastSleepMillis(0),
           _lastErrorTimeMillis(0) {}
 
-    void nextSleepMillis();
+    Milliseconds nextSleep();
 
     /**
      * testing-only function. used in dbtests/basictests.cpp
      */
-    int getNextSleepMillis(int lastSleepMillis,
+    int getNextSleepMillis(long long lastSleepMillis,
                            unsigned long long currTimeMillis,
                            unsigned long long lastErrorTimeMillis) const;
 
 private:
     // Parameters
-    int _maxSleepMillis;
-    int _resetAfterMillis;
+    long long _maxSleepMillis;
+    long long _resetAfterMillis;
 
     // Last sleep information
-    int _lastSleepMillis;
+    long long _lastSleepMillis;
     unsigned long long _lastErrorTimeMillis;
 };
 

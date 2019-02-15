@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -91,6 +90,9 @@ using UniqueLock = stdx::unique_lock<stdx::mutex>;
 
 const auto kIdIndexName = "_id_"_sd;
 
+LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
+    return nss.isSystemDotViews() ? MODE_X : mode;
+}
 }  // namespace
 
 StorageInterfaceImpl::StorageInterfaceImpl()
@@ -118,6 +120,7 @@ StatusWith<int> StorageInterfaceImpl::getRollbackID(OperationContext* opCtx) {
 }
 
 StatusWith<int> StorageInterfaceImpl::initializeRollbackID(OperationContext* opCtx) {
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     auto status = createCollection(opCtx, _rollbackIdNss, CollectionOptions());
     if (!status.isOK()) {
         return status;
@@ -218,7 +221,7 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
 
         // Get locks and create the collection.
         AutoGetOrCreateDb db(opCtx.get(), nss.db(), MODE_X);
-        AutoGetCollection coll(opCtx.get(), nss, MODE_IX);
+        AutoGetCollection coll(opCtx.get(), nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
 
         if (coll.getCollection()) {
             return Status(ErrorCodes::NamespaceExists,
@@ -231,7 +234,8 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
             wunit.commit();
         }
 
-        autoColl = stdx::make_unique<AutoGetCollection>(opCtx.get(), nss, MODE_IX);
+        autoColl = stdx::make_unique<AutoGetCollection>(
+            opCtx.get(), nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
 
         // Build empty capped indexes.  Capped indexes cannot be built by the MultiIndexBlock
         // because the cap might delete documents off the back while we are inserting them into
@@ -431,7 +435,6 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
                                               const NamespaceString& nss,
                                               const CollectionOptions& options) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::createCollection", nss.ns(), [&] {
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetOrCreateDb databaseWriteGuard(opCtx, nss.db(), MODE_X);
         auto db = databaseWriteGuard.getDb();
         invariant(db);
@@ -454,7 +457,6 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
 
 Status StorageInterfaceImpl::dropCollection(OperationContext* opCtx, const NamespaceString& nss) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::dropCollection", nss.ns(), [&] {
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetDb autoDB(opCtx, nss.db(), MODE_X);
         if (!autoDB.getDb()) {
             // Database does not exist - nothing to do.
@@ -569,10 +571,10 @@ namespace {
 /**
  * Returns DeleteStageParams for deleteOne with fetch.
  */
-DeleteStageParams makeDeleteStageParamsForDeleteDocuments() {
-    DeleteStageParams deleteStageParams;
-    deleteStageParams.isMulti = true;
-    deleteStageParams.returnDeleted = true;
+std::unique_ptr<DeleteStageParams> makeDeleteStageParamsForDeleteDocuments() {
+    auto deleteStageParams = std::make_unique<DeleteStageParams>();
+    deleteStageParams->isMulti = true;
+    deleteStageParams->returnDeleted = true;
     return deleteStageParams;
 }
 
@@ -703,7 +705,6 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
                 case PlanExecutor::IS_EOF:
                     return Result(docs);
                 case PlanExecutor::FAILURE:
-                case PlanExecutor::DEAD:
                     return WorkingSetCommon::getMemberObjectStatus(out);
                 default:
                     MONGO_UNREACHABLE;

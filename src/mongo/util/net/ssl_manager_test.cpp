@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -324,6 +323,11 @@ TEST(SSLManager, DNParsingAndNormalization) {
         {"OU=Sales+CN=J.  Smith,DC=example,DC=net",
          {{"2.5.4.11", "Sales"},
           {"2.5.4.3", "J.  Smith"},
+          {"0.9.2342.19200300.100.1.25", "example"},
+          {"0.9.2342.19200300.100.1.25", "net"}}},
+        {"CN=server, O=, DC=example, DC=net",
+         {{"2.5.4.3", "server"},
+          {"2.5.4.10", ""},
           {"0.9.2342.19200300.100.1.25", "example"},
           {"0.9.2342.19200300.100.1.25", "net"}}},
         {R"(CN=James \"Jim\" Smith\, III,DC=example,DC=net)",

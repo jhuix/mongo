@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -68,38 +67,6 @@ using PatternSchema = InternalSchemaAllowedPropertiesMatchExpression::PatternSch
 using Pattern = InternalSchemaAllowedPropertiesMatchExpression::Pattern;
 
 namespace {
-// Standard JSON Schema keyword constants.
-constexpr StringData kSchemaAdditionalItemsKeyword = "additionalItems"_sd;
-constexpr StringData kSchemaAdditionalPropertiesKeyword = "additionalProperties"_sd;
-constexpr StringData kSchemaAllOfKeyword = "allOf"_sd;
-constexpr StringData kSchemaAnyOfKeyword = "anyOf"_sd;
-constexpr StringData kSchemaDependenciesKeyword = "dependencies"_sd;
-constexpr StringData kSchemaDescriptionKeyword = "description"_sd;
-constexpr StringData kSchemaEnumKeyword = "enum"_sd;
-constexpr StringData kSchemaExclusiveMaximumKeyword = "exclusiveMaximum"_sd;
-constexpr StringData kSchemaExclusiveMinimumKeyword = "exclusiveMinimum"_sd;
-constexpr StringData kSchemaItemsKeyword = "items"_sd;
-constexpr StringData kSchemaMaxItemsKeyword = "maxItems"_sd;
-constexpr StringData kSchemaMaxLengthKeyword = "maxLength"_sd;
-constexpr StringData kSchemaMaxPropertiesKeyword = "maxProperties"_sd;
-constexpr StringData kSchemaMaximumKeyword = "maximum"_sd;
-constexpr StringData kSchemaMinItemsKeyword = "minItems"_sd;
-constexpr StringData kSchemaMinLengthKeyword = "minLength"_sd;
-constexpr StringData kSchemaMinPropertiesKeyword = "minProperties"_sd;
-constexpr StringData kSchemaMinimumKeyword = "minimum"_sd;
-constexpr StringData kSchemaMultipleOfKeyword = "multipleOf"_sd;
-constexpr StringData kSchemaNotKeyword = "not"_sd;
-constexpr StringData kSchemaOneOfKeyword = "oneOf"_sd;
-constexpr StringData kSchemaPatternKeyword = "pattern"_sd;
-constexpr StringData kSchemaPatternPropertiesKeyword = "patternProperties"_sd;
-constexpr StringData kSchemaPropertiesKeyword = "properties"_sd;
-constexpr StringData kSchemaRequiredKeyword = "required"_sd;
-constexpr StringData kSchemaTitleKeyword = "title"_sd;
-constexpr StringData kSchemaTypeKeyword = "type"_sd;
-constexpr StringData kSchemaUniqueItemsKeyword = "uniqueItems"_sd;
-
-// MongoDB-specific (non-standard) JSON Schema keyword constants.
-constexpr StringData kSchemaBsonTypeKeyword = "bsonType"_sd;
 
 // Explicitly unsupported JSON Schema keywords.
 const std::set<StringData> unsupportedKeywords{
@@ -178,46 +145,8 @@ StatusWith<std::unique_ptr<InternalSchemaTypeExpression>> parseType(
     StringData keywordName,
     BSONElement typeElt,
     const StringMap<BSONType>& aliasMap) {
-    if (typeElt.type() != BSONType::String && typeElt.type() != BSONType::Array) {
-        return {Status(ErrorCodes::TypeMismatch,
-                       str::stream() << "$jsonSchema keyword '" << keywordName
-                                     << "' must be either a string or an array of strings")};
-    }
 
-    std::set<StringData> aliases;
-    if (typeElt.type() == BSONType::String) {
-        if (typeElt.valueStringData() == JSONSchemaParser::kSchemaTypeInteger) {
-            return {ErrorCodes::FailedToParse,
-                    str::stream() << "$jsonSchema type '" << JSONSchemaParser::kSchemaTypeInteger
-                                  << "' is not currently supported."};
-        }
-        aliases.insert(typeElt.valueStringData());
-    } else {
-        for (auto&& typeArrayEntry : typeElt.embeddedObject()) {
-            if (typeArrayEntry.type() != BSONType::String) {
-                return {Status(ErrorCodes::TypeMismatch,
-                               str::stream() << "$jsonSchema keyword '" << keywordName
-                                             << "' array elements must be strings")};
-            }
-
-            if (typeArrayEntry.valueStringData() == JSONSchemaParser::kSchemaTypeInteger) {
-                return {ErrorCodes::FailedToParse,
-                        str::stream() << "$jsonSchema type '"
-                                      << JSONSchemaParser::kSchemaTypeInteger
-                                      << "' is not currently supported."};
-            }
-
-            auto insertionResult = aliases.insert(typeArrayEntry.valueStringData());
-            if (!insertionResult.second) {
-                return {Status(ErrorCodes::FailedToParse,
-                               str::stream() << "$jsonSchema keyword '" << keywordName
-                                             << "' has duplicate value: "
-                                             << typeArrayEntry.valueStringData())};
-            }
-        }
-    }
-
-    auto typeSet = MatcherTypeSet::fromStringAliases(std::move(aliases), aliasMap);
+    auto typeSet = JSONSchemaParser::parseTypeSet(typeElt, aliasMap);
     if (!typeSet.isOK()) {
         return typeSet.getStatus();
     }
@@ -240,7 +169,8 @@ StatusWithMatchExpression parseMaximum(StringData path,
                                        bool isExclusiveMaximum) {
     if (!maximum.isNumber()) {
         return {Status(ErrorCodes::TypeMismatch,
-                       str::stream() << "$jsonSchema keyword '" << kSchemaMaximumKeyword
+                       str::stream() << "$jsonSchema keyword '"
+                                     << JSONSchemaParser::kSchemaMaximumKeyword
                                      << "' must be a number")};
     }
 
@@ -267,7 +197,8 @@ StatusWithMatchExpression parseMinimum(StringData path,
                                        bool isExclusiveMinimum) {
     if (!minimum.isNumber()) {
         return {Status(ErrorCodes::TypeMismatch,
-                       str::stream() << "$jsonSchema keyword '" << kSchemaMinimumKeyword
+                       str::stream() << "$jsonSchema keyword '"
+                                     << JSONSchemaParser::kSchemaMinimumKeyword
                                      << "' must be a number")};
     }
 
@@ -314,7 +245,8 @@ StatusWithMatchExpression parsePattern(StringData path,
                                        InternalSchemaTypeExpression* typeExpr) {
     if (pattern.type() != BSONType::String) {
         return {Status(ErrorCodes::TypeMismatch,
-                       str::stream() << "$jsonSchema keyword '" << kSchemaPatternKeyword
+                       str::stream() << "$jsonSchema keyword '"
+                                     << JSONSchemaParser::kSchemaPatternKeyword
                                      << "' must be a string")};
     }
 
@@ -335,13 +267,15 @@ StatusWithMatchExpression parseMultipleOf(StringData path,
                                           InternalSchemaTypeExpression* typeExpr) {
     if (!multipleOf.isNumber()) {
         return {Status(ErrorCodes::TypeMismatch,
-                       str::stream() << "$jsonSchema keyword '" << kSchemaMultipleOfKeyword
+                       str::stream() << "$jsonSchema keyword '"
+                                     << JSONSchemaParser::kSchemaMultipleOfKeyword
                                      << "' must be a number")};
     }
 
     if (multipleOf.numberDecimal().isNegative() || multipleOf.numberDecimal().isZero()) {
         return {Status(ErrorCodes::FailedToParse,
-                       str::stream() << "$jsonSchema keyword '" << kSchemaMultipleOfKeyword
+                       str::stream() << "$jsonSchema keyword '"
+                                     << JSONSchemaParser::kSchemaMultipleOfKeyword
                                      << "' must have a positive value")};
     }
     if (path.empty()) {
@@ -396,7 +330,7 @@ StatusWithMatchExpression parseLogicalKeyword(StringData path,
 StatusWithMatchExpression parseEnum(StringData path, BSONElement enumElement) {
     if (enumElement.type() != BSONType::Array) {
         return {ErrorCodes::TypeMismatch,
-                str::stream() << "$jsonSchema keyword '" << kSchemaEnumKeyword
+                str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaEnumKeyword
                               << "' must be an array, but found an element of type "
                               << enumElement.type()};
     }
@@ -404,7 +338,7 @@ StatusWithMatchExpression parseEnum(StringData path, BSONElement enumElement) {
     auto enumArray = enumElement.embeddedObject();
     if (enumArray.isEmpty()) {
         return {ErrorCodes::FailedToParse,
-                str::stream() << "$jsonSchema keyword '" << kSchemaEnumKeyword
+                str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaEnumKeyword
                               << "' cannot be an empty array"};
     }
 
@@ -415,7 +349,7 @@ StatusWithMatchExpression parseEnum(StringData path, BSONElement enumElement) {
         auto insertStatus = eqSet.insert(arrayElem);
         if (!insertStatus.second) {
             return {ErrorCodes::FailedToParse,
-                    str::stream() << "$jsonSchema keyword '" << kSchemaEnumKeyword
+                    str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaEnumKeyword
                                   << "' array cannot contain duplicate values."};
         }
 
@@ -451,7 +385,7 @@ StatusWithMatchExpression parseEnum(StringData path, BSONElement enumElement) {
 StatusWith<boost::container::flat_set<StringData>> parseRequired(BSONElement requiredElt) {
     if (requiredElt.type() != BSONType::Array) {
         return {ErrorCodes::TypeMismatch,
-                str::stream() << "$jsonSchema keyword '" << kSchemaRequiredKeyword
+                str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaRequiredKeyword
                               << "' must be an array, but found an element of type "
                               << requiredElt.type()};
     }
@@ -460,7 +394,8 @@ StatusWith<boost::container::flat_set<StringData>> parseRequired(BSONElement req
     for (auto&& propertyName : requiredElt.embeddedObject()) {
         if (propertyName.type() != BSONType::String) {
             return {ErrorCodes::TypeMismatch,
-                    str::stream() << "$jsonSchema keyword '" << kSchemaRequiredKeyword
+                    str::stream() << "$jsonSchema keyword '"
+                                  << JSONSchemaParser::kSchemaRequiredKeyword
                                   << "' must be an array of strings, but found an element of type: "
                                   << propertyName.type()};
         }
@@ -470,7 +405,7 @@ StatusWith<boost::container::flat_set<StringData>> parseRequired(BSONElement req
 
     if (propertyVec.empty()) {
         return {ErrorCodes::FailedToParse,
-                str::stream() << "$jsonSchema keyword '" << kSchemaRequiredKeyword
+                str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaRequiredKeyword
                               << "' cannot be an empty array"};
     }
 
@@ -478,7 +413,7 @@ StatusWith<boost::container::flat_set<StringData>> parseRequired(BSONElement req
                                                               propertyVec.end()};
     if (requiredProperties.size() != propertyVec.size()) {
         return {ErrorCodes::FailedToParse,
-                str::stream() << "$jsonSchema keyword '" << kSchemaRequiredKeyword
+                str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaRequiredKeyword
                               << "' array cannot contain duplicate values"};
     }
     return requiredProperties;
@@ -518,7 +453,8 @@ StatusWithMatchExpression parseProperties(
     bool ignoreUnknownKeywords) {
     if (propertiesElt.type() != BSONType::Object) {
         return {Status(ErrorCodes::TypeMismatch,
-                       str::stream() << "$jsonSchema keyword '" << kSchemaPropertiesKeyword
+                       str::stream() << "$jsonSchema keyword '"
+                                     << JSONSchemaParser::kSchemaPropertiesKeyword
                                      << "' must be an object")};
     }
     auto propertiesObj = propertiesElt.embeddedObject();
@@ -579,7 +515,8 @@ StatusWith<std::vector<PatternSchema>> parsePatternProperties(BSONElement patter
 
     if (patternPropertiesElt.type() != BSONType::Object) {
         return {Status(ErrorCodes::TypeMismatch,
-                       str::stream() << "$jsonSchema keyword '" << kSchemaPatternPropertiesKeyword
+                       str::stream() << "$jsonSchema keyword '"
+                                     << JSONSchemaParser::kSchemaPatternPropertiesKeyword
                                      << "' must be an object")};
     }
 
@@ -587,7 +524,7 @@ StatusWith<std::vector<PatternSchema>> parsePatternProperties(BSONElement patter
         if (patternSchema.type() != BSONType::Object) {
             return {Status(ErrorCodes::TypeMismatch,
                            str::stream() << "$jsonSchema keyword '"
-                                         << kSchemaPatternPropertiesKeyword
+                                         << JSONSchemaParser::kSchemaPatternPropertiesKeyword
                                          << "' has property '"
                                          << patternSchema.fieldNameStringData()
                                          << "' which is not an object")};
@@ -622,7 +559,7 @@ StatusWithMatchExpression parseAdditionalProperties(BSONElement additionalProper
         additionalPropertiesElt.type() != BSONType::Object) {
         return {Status(ErrorCodes::TypeMismatch,
                        str::stream() << "$jsonSchema keyword '"
-                                     << kSchemaAdditionalPropertiesKeyword
+                                     << JSONSchemaParser::kSchemaAdditionalPropertiesKeyword
                                      << "' must be an object or a boolean")};
     }
 
@@ -766,7 +703,7 @@ StatusWithMatchExpression translatePropertyDependency(StringData path, BSONEleme
         return {ErrorCodes::FailedToParse,
                 str::stream() << "property '" << dependency.fieldNameStringData()
                               << "' in $jsonSchema keyword '"
-                              << kSchemaDependenciesKeyword
+                              << JSONSchemaParser::kSchemaDependenciesKeyword
                               << "' cannot be an empty array"};
     }
 
@@ -777,7 +714,7 @@ StatusWithMatchExpression translatePropertyDependency(StringData path, BSONEleme
             return {ErrorCodes::TypeMismatch,
                     str::stream() << "array '" << dependency.fieldNameStringData()
                                   << "' in $jsonSchema keyword '"
-                                  << kSchemaDependenciesKeyword
+                                  << JSONSchemaParser::kSchemaDependenciesKeyword
                                   << "' can only contain strings, but found element of type: "
                                   << typeName(propertyDependency.type())};
         }
@@ -787,7 +724,7 @@ StatusWithMatchExpression translatePropertyDependency(StringData path, BSONEleme
             return {ErrorCodes::FailedToParse,
                     str::stream() << "array '" << dependency.fieldNameStringData()
                                   << "' in $jsonSchema keyword '"
-                                  << kSchemaDependenciesKeyword
+                                  << JSONSchemaParser::kSchemaDependenciesKeyword
                                   << "' contains duplicate element: "
                                   << propertyDependency.valueStringData()};
         }
@@ -820,7 +757,8 @@ StatusWithMatchExpression parseDependencies(StringData path,
                                             bool ignoreUnknownKeywords) {
     if (dependencies.type() != BSONType::Object) {
         return {ErrorCodes::TypeMismatch,
-                str::stream() << "$jsonSchema keyword '" << kSchemaDependenciesKeyword
+                str::stream() << "$jsonSchema keyword '"
+                              << JSONSchemaParser::kSchemaDependenciesKeyword
                               << "' must be an object"};
     }
 
@@ -830,7 +768,7 @@ StatusWithMatchExpression parseDependencies(StringData path,
             return {ErrorCodes::TypeMismatch,
                     str::stream() << "property '" << dependency.fieldNameStringData()
                                   << "' in $jsonSchema keyword '"
-                                  << kSchemaDependenciesKeyword
+                                  << JSONSchemaParser::kSchemaDependenciesKeyword
                                   << "' must be either an object or an array"};
         }
 
@@ -852,7 +790,8 @@ StatusWithMatchExpression parseUniqueItems(BSONElement uniqueItemsElt,
                                            InternalSchemaTypeExpression* typeExpr) {
     if (!uniqueItemsElt.isBoolean()) {
         return {ErrorCodes::TypeMismatch,
-                str::stream() << "$jsonSchema keyword '" << kSchemaUniqueItemsKeyword
+                str::stream() << "$jsonSchema keyword '"
+                              << JSONSchemaParser::kSchemaUniqueItemsKeyword
                               << "' must be a boolean"};
     } else if (path.empty()) {
         return {stdx::make_unique<AlwaysTrueMatchExpression>()};
@@ -882,7 +821,8 @@ StatusWith<boost::optional<long long>> parseItems(StringData path,
         for (auto subschema : itemsElt.embeddedObject()) {
             if (subschema.type() != BSONType::Object) {
                 return {ErrorCodes::TypeMismatch,
-                        str::stream() << "$jsonSchema keyword '" << kSchemaItemsKeyword
+                        str::stream() << "$jsonSchema keyword '"
+                                      << JSONSchemaParser::kSchemaItemsKeyword
                                       << "' requires that each element of the array is an "
                                          "object, but found a "
                                       << subschema.type()};
@@ -935,7 +875,7 @@ StatusWith<boost::optional<long long>> parseItems(StringData path,
         }
     } else {
         return {ErrorCodes::TypeMismatch,
-                str::stream() << "$jsonSchema keyword '" << kSchemaItemsKeyword
+                str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaItemsKeyword
                               << "' must be an array or an object, not "
                               << itemsElt.type()};
     }
@@ -969,7 +909,8 @@ Status parseAdditionalItems(StringData path,
             kNamePlaceholder.toString(), std::move(parsedOtherwiseExpr.getValue()));
     } else {
         return {ErrorCodes::TypeMismatch,
-                str::stream() << "$jsonSchema keyword '" << kSchemaAdditionalItemsKeyword
+                str::stream() << "$jsonSchema keyword '"
+                              << JSONSchemaParser::kSchemaAdditionalItemsKeyword
                               << "' must be either an object or a boolean, but got a "
                               << additionalItemsElt.type()};
     }
@@ -995,7 +936,7 @@ Status parseItemsAndAdditionalItems(StringMap<BSONElement>& keywordMap,
                                     InternalSchemaTypeExpression* typeExpr,
                                     AndMatchExpression* andExpr) {
     boost::optional<long long> startIndexForAdditionalItems;
-    if (auto itemsElt = keywordMap[kSchemaItemsKeyword]) {
+    if (auto itemsElt = keywordMap[JSONSchemaParser::kSchemaItemsKeyword]) {
         auto index = parseItems(path, itemsElt, ignoreUnknownKeywords, typeExpr, andExpr);
         if (!index.isOK()) {
             return index.getStatus();
@@ -1003,7 +944,7 @@ Status parseItemsAndAdditionalItems(StringMap<BSONElement>& keywordMap,
         startIndexForAdditionalItems = index.getValue();
     }
 
-    if (auto additionalItemsElt = keywordMap[kSchemaAdditionalItemsKeyword]) {
+    if (auto additionalItemsElt = keywordMap[JSONSchemaParser::kSchemaAdditionalItemsKeyword]) {
         return parseAdditionalItems(path,
                                     additionalItemsElt,
                                     startIndexForAdditionalItems,
@@ -1029,7 +970,7 @@ Status translateLogicalKeywords(StringMap<BSONElement>& keywordMap,
                                 StringData path,
                                 AndMatchExpression* andExpr,
                                 bool ignoreUnknownKeywords) {
-    if (auto allOfElt = keywordMap[kSchemaAllOfKeyword]) {
+    if (auto allOfElt = keywordMap[JSONSchemaParser::kSchemaAllOfKeyword]) {
         auto allOfExpr =
             parseLogicalKeyword<AndMatchExpression>(path, allOfElt, ignoreUnknownKeywords);
         if (!allOfExpr.isOK()) {
@@ -1038,7 +979,7 @@ Status translateLogicalKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(allOfExpr.getValue().release());
     }
 
-    if (auto anyOfElt = keywordMap[kSchemaAnyOfKeyword]) {
+    if (auto anyOfElt = keywordMap[JSONSchemaParser::kSchemaAnyOfKeyword]) {
         auto anyOfExpr =
             parseLogicalKeyword<OrMatchExpression>(path, anyOfElt, ignoreUnknownKeywords);
         if (!anyOfExpr.isOK()) {
@@ -1047,7 +988,7 @@ Status translateLogicalKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(anyOfExpr.getValue().release());
     }
 
-    if (auto oneOfElt = keywordMap[kSchemaOneOfKeyword]) {
+    if (auto oneOfElt = keywordMap[JSONSchemaParser::kSchemaOneOfKeyword]) {
         auto oneOfExpr = parseLogicalKeyword<InternalSchemaXorMatchExpression>(
             path, oneOfElt, ignoreUnknownKeywords);
         if (!oneOfExpr.isOK()) {
@@ -1056,10 +997,10 @@ Status translateLogicalKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(oneOfExpr.getValue().release());
     }
 
-    if (auto notElt = keywordMap[kSchemaNotKeyword]) {
+    if (auto notElt = keywordMap[JSONSchemaParser::kSchemaNotKeyword]) {
         if (notElt.type() != BSONType::Object) {
             return {ErrorCodes::TypeMismatch,
-                    str::stream() << "$jsonSchema keyword '" << kSchemaNotKeyword
+                    str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaNotKeyword
                                   << "' must be an object, but found an element of type "
                                   << notElt.type()};
         }
@@ -1073,7 +1014,7 @@ Status translateLogicalKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(notMatchExpr.release());
     }
 
-    if (auto enumElt = keywordMap[kSchemaEnumKeyword]) {
+    if (auto enumElt = keywordMap[JSONSchemaParser::kSchemaEnumKeyword]) {
         auto enumExpr = parseEnum(path, enumElt);
         if (!enumExpr.isOK()) {
             return enumExpr.getStatus();
@@ -1100,7 +1041,7 @@ Status translateArrayKeywords(StringMap<BSONElement>& keywordMap,
                               bool ignoreUnknownKeywords,
                               InternalSchemaTypeExpression* typeExpr,
                               AndMatchExpression* andExpr) {
-    if (auto minItemsElt = keywordMap[kSchemaMinItemsKeyword]) {
+    if (auto minItemsElt = keywordMap[JSONSchemaParser::kSchemaMinItemsKeyword]) {
         auto minItemsExpr = parseLength<InternalSchemaMinItemsMatchExpression>(
             path, minItemsElt, typeExpr, BSONType::Array);
         if (!minItemsExpr.isOK()) {
@@ -1109,7 +1050,7 @@ Status translateArrayKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(minItemsExpr.getValue().release());
     }
 
-    if (auto maxItemsElt = keywordMap[kSchemaMaxItemsKeyword]) {
+    if (auto maxItemsElt = keywordMap[JSONSchemaParser::kSchemaMaxItemsKeyword]) {
         auto maxItemsExpr = parseLength<InternalSchemaMaxItemsMatchExpression>(
             path, maxItemsElt, typeExpr, BSONType::Array);
         if (!maxItemsExpr.isOK()) {
@@ -1118,7 +1059,7 @@ Status translateArrayKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(maxItemsExpr.getValue().release());
     }
 
-    if (auto uniqueItemsElt = keywordMap[kSchemaUniqueItemsKeyword]) {
+    if (auto uniqueItemsElt = keywordMap[JSONSchemaParser::kSchemaUniqueItemsKeyword]) {
         auto uniqueItemsExpr = parseUniqueItems(uniqueItemsElt, path, typeExpr);
         if (!uniqueItemsExpr.isOK()) {
             return uniqueItemsExpr.getStatus();
@@ -1148,7 +1089,7 @@ Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
                                AndMatchExpression* andExpr,
                                bool ignoreUnknownKeywords) {
     boost::container::flat_set<StringData> requiredProperties;
-    if (auto requiredElt = keywordMap[kSchemaRequiredKeyword]) {
+    if (auto requiredElt = keywordMap[JSONSchemaParser::kSchemaRequiredKeyword]) {
         auto requiredStatus = parseRequired(requiredElt);
         if (!requiredStatus.isOK()) {
             return requiredStatus.getStatus();
@@ -1156,7 +1097,7 @@ Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
         requiredProperties = std::move(requiredStatus.getValue());
     }
 
-    if (auto propertiesElt = keywordMap[kSchemaPropertiesKeyword]) {
+    if (auto propertiesElt = keywordMap[JSONSchemaParser::kSchemaPropertiesKeyword]) {
         auto propertiesExpr = parseProperties(
             path, propertiesElt, typeExpr, requiredProperties, ignoreUnknownKeywords);
         if (!propertiesExpr.isOK()) {
@@ -1166,9 +1107,10 @@ Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
     }
 
     {
-        auto propertiesElt = keywordMap[kSchemaPropertiesKeyword];
-        auto patternPropertiesElt = keywordMap[kSchemaPatternPropertiesKeyword];
-        auto additionalPropertiesElt = keywordMap[kSchemaAdditionalPropertiesKeyword];
+        auto propertiesElt = keywordMap[JSONSchemaParser::kSchemaPropertiesKeyword];
+        auto patternPropertiesElt = keywordMap[JSONSchemaParser::kSchemaPatternPropertiesKeyword];
+        auto additionalPropertiesElt =
+            keywordMap[JSONSchemaParser::kSchemaAdditionalPropertiesKeyword];
 
         if (patternPropertiesElt || additionalPropertiesElt) {
             auto allowedPropertiesExpr = parseAllowedProperties(path,
@@ -1192,7 +1134,7 @@ Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(requiredExpr.getValue().release());
     }
 
-    if (auto minPropertiesElt = keywordMap[kSchemaMinPropertiesKeyword]) {
+    if (auto minPropertiesElt = keywordMap[JSONSchemaParser::kSchemaMinPropertiesKeyword]) {
         auto minPropExpr = parseNumProperties<InternalSchemaMinPropertiesMatchExpression>(
             path, minPropertiesElt, typeExpr);
         if (!minPropExpr.isOK()) {
@@ -1201,7 +1143,7 @@ Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(minPropExpr.getValue().release());
     }
 
-    if (auto maxPropertiesElt = keywordMap[kSchemaMaxPropertiesKeyword]) {
+    if (auto maxPropertiesElt = keywordMap[JSONSchemaParser::kSchemaMaxPropertiesKeyword]) {
         auto maxPropExpr = parseNumProperties<InternalSchemaMaxPropertiesMatchExpression>(
             path, maxPropertiesElt, typeExpr);
         if (!maxPropExpr.isOK()) {
@@ -1210,7 +1152,7 @@ Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(maxPropExpr.getValue().release());
     }
 
-    if (auto dependenciesElt = keywordMap[kSchemaDependenciesKeyword]) {
+    if (auto dependenciesElt = keywordMap[JSONSchemaParser::kSchemaDependenciesKeyword]) {
         auto dependenciesExpr = parseDependencies(path, dependenciesElt, ignoreUnknownKeywords);
         if (!dependenciesExpr.isOK()) {
             return dependenciesExpr.getStatus();
@@ -1239,7 +1181,7 @@ Status translateScalarKeywords(StringMap<BSONElement>& keywordMap,
                                InternalSchemaTypeExpression* typeExpr,
                                AndMatchExpression* andExpr) {
     // String keywords.
-    if (auto patternElt = keywordMap[kSchemaPatternKeyword]) {
+    if (auto patternElt = keywordMap[JSONSchemaParser::kSchemaPatternKeyword]) {
         auto patternExpr = parsePattern(path, patternElt, typeExpr);
         if (!patternExpr.isOK()) {
             return patternExpr.getStatus();
@@ -1247,7 +1189,7 @@ Status translateScalarKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(patternExpr.getValue().release());
     }
 
-    if (auto maxLengthElt = keywordMap[kSchemaMaxLengthKeyword]) {
+    if (auto maxLengthElt = keywordMap[JSONSchemaParser::kSchemaMaxLengthKeyword]) {
         auto maxLengthExpr = parseLength<InternalSchemaMaxLengthMatchExpression>(
             path, maxLengthElt, typeExpr, BSONType::String);
         if (!maxLengthExpr.isOK()) {
@@ -1256,7 +1198,7 @@ Status translateScalarKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(maxLengthExpr.getValue().release());
     }
 
-    if (auto minLengthElt = keywordMap[kSchemaMinLengthKeyword]) {
+    if (auto minLengthElt = keywordMap[JSONSchemaParser::kSchemaMinLengthKeyword]) {
         auto minLengthExpr = parseLength<InternalSchemaMinLengthMatchExpression>(
             path, minLengthElt, typeExpr, BSONType::String);
         if (!minLengthExpr.isOK()) {
@@ -1266,7 +1208,7 @@ Status translateScalarKeywords(StringMap<BSONElement>& keywordMap,
     }
 
     // Numeric keywords.
-    if (auto multipleOfElt = keywordMap[kSchemaMultipleOfKeyword]) {
+    if (auto multipleOfElt = keywordMap[JSONSchemaParser::kSchemaMultipleOfKeyword]) {
         auto multipleOfExpr = parseMultipleOf(path, multipleOfElt, typeExpr);
         if (!multipleOfExpr.isOK()) {
             return multipleOfExpr.getStatus();
@@ -1274,13 +1216,14 @@ Status translateScalarKeywords(StringMap<BSONElement>& keywordMap,
         andExpr->add(multipleOfExpr.getValue().release());
     }
 
-    if (auto maximumElt = keywordMap[kSchemaMaximumKeyword]) {
+    if (auto maximumElt = keywordMap[JSONSchemaParser::kSchemaMaximumKeyword]) {
         bool isExclusiveMaximum = false;
-        if (auto exclusiveMaximumElt = keywordMap[kSchemaExclusiveMaximumKeyword]) {
+        if (auto exclusiveMaximumElt =
+                keywordMap[JSONSchemaParser::kSchemaExclusiveMaximumKeyword]) {
             if (!exclusiveMaximumElt.isBoolean()) {
                 return {Status(ErrorCodes::TypeMismatch,
                                str::stream() << "$jsonSchema keyword '"
-                                             << kSchemaExclusiveMaximumKeyword
+                                             << JSONSchemaParser::kSchemaExclusiveMaximumKeyword
                                              << "' must be a boolean")};
             } else {
                 isExclusiveMaximum = exclusiveMaximumElt.boolean();
@@ -1291,21 +1234,23 @@ Status translateScalarKeywords(StringMap<BSONElement>& keywordMap,
             return maxExpr.getStatus();
         }
         andExpr->add(maxExpr.getValue().release());
-    } else if (keywordMap[kSchemaExclusiveMaximumKeyword]) {
+    } else if (keywordMap[JSONSchemaParser::kSchemaExclusiveMaximumKeyword]) {
         // If "exclusiveMaximum" is present, "maximum" must also be present.
         return {ErrorCodes::FailedToParse,
-                str::stream() << "$jsonSchema keyword '" << kSchemaMaximumKeyword
+                str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaMaximumKeyword
                               << "' must be a present if "
-                              << kSchemaExclusiveMaximumKeyword
+                              << JSONSchemaParser::kSchemaExclusiveMaximumKeyword
                               << " is present"};
     }
 
-    if (auto minimumElt = keywordMap[kSchemaMinimumKeyword]) {
+    if (auto minimumElt = keywordMap[JSONSchemaParser::kSchemaMinimumKeyword]) {
         bool isExclusiveMinimum = false;
-        if (auto exclusiveMinimumElt = keywordMap[kSchemaExclusiveMinimumKeyword]) {
+        if (auto exclusiveMinimumElt =
+                keywordMap[JSONSchemaParser::kSchemaExclusiveMinimumKeyword]) {
             if (!exclusiveMinimumElt.isBoolean()) {
                 return {ErrorCodes::TypeMismatch,
-                        str::stream() << "$jsonSchema keyword '" << kSchemaExclusiveMinimumKeyword
+                        str::stream() << "$jsonSchema keyword '"
+                                      << JSONSchemaParser::kSchemaExclusiveMinimumKeyword
                                       << "' must be a boolean"};
             } else {
                 isExclusiveMinimum = exclusiveMinimumElt.boolean();
@@ -1316,13 +1261,39 @@ Status translateScalarKeywords(StringMap<BSONElement>& keywordMap,
             return minExpr.getStatus();
         }
         andExpr->add(minExpr.getValue().release());
-    } else if (keywordMap[kSchemaExclusiveMinimumKeyword]) {
+    } else if (keywordMap[JSONSchemaParser::kSchemaExclusiveMinimumKeyword]) {
         // If "exclusiveMinimum" is present, "minimum" must also be present.
         return {ErrorCodes::FailedToParse,
-                str::stream() << "$jsonSchema keyword '" << kSchemaMinimumKeyword
+                str::stream() << "$jsonSchema keyword '" << JSONSchemaParser::kSchemaMinimumKeyword
                               << "' must be a present if "
-                              << kSchemaExclusiveMinimumKeyword
+                              << JSONSchemaParser::kSchemaExclusiveMinimumKeyword
                               << " is present"};
+    }
+
+    return Status::OK();
+}
+
+/**
+ * Parses JSON Schema encrypt keyword in 'keywordMap' and adds it to 'andExpr'. Returns a
+ * non-OK status if an error occurs during parsing.
+ */
+Status translateEncryptionKeywords(StringMap<BSONElement>& keywordMap,
+                                   StringData path,
+                                   InternalSchemaTypeExpression* typeExpr,
+                                   AndMatchExpression* andExpr) {
+    if (auto encryptElt = keywordMap[JSONSchemaParser::kSchemaEncryptKeyword]) {
+        if (encryptElt.type() != BSONType::Object) {
+            return {ErrorCodes::FailedToParse,
+                    str::stream() << "$jsonSchema keyword '"
+                                  << JSONSchemaParser::kSchemaEncryptKeyword
+                                  << "' must be an object "};
+        } else if (!encryptElt.embeddedObject().isEmpty()) {
+            return {ErrorCodes::FailedToParse,
+                    str::stream() << "$jsonSchema keyword '"
+                                  << JSONSchemaParser::kSchemaEncryptKeyword
+                                  << "' must be an empty object "};
+        }
+        andExpr->add(new InternalSchemaBinDataSubTypeExpression(path, BinDataType::Encrypt));
     }
 
     return Status::OK();
@@ -1334,18 +1305,20 @@ Status translateScalarKeywords(StringMap<BSONElement>& keywordMap,
  *  - title
  */
 Status validateMetadataKeywords(StringMap<BSONElement>& keywordMap) {
-    if (auto descriptionElem = keywordMap[kSchemaDescriptionKeyword]) {
+    if (auto descriptionElem = keywordMap[JSONSchemaParser::kSchemaDescriptionKeyword]) {
         if (descriptionElem.type() != BSONType::String) {
             return Status(ErrorCodes::TypeMismatch,
-                          str::stream() << "$jsonSchema keyword '" << kSchemaDescriptionKeyword
+                          str::stream() << "$jsonSchema keyword '"
+                                        << JSONSchemaParser::kSchemaDescriptionKeyword
                                         << "' must be of type string");
         }
     }
 
-    if (auto titleElem = keywordMap[kSchemaTitleKeyword]) {
+    if (auto titleElem = keywordMap[JSONSchemaParser::kSchemaTitleKeyword]) {
         if (titleElem.type() != BSONType::String) {
             return Status(ErrorCodes::TypeMismatch,
-                          str::stream() << "$jsonSchema keyword '" << kSchemaTitleKeyword
+                          str::stream() << "$jsonSchema keyword '"
+                                        << JSONSchemaParser::kSchemaTitleKeyword
                                         << "' must be of type string");
         }
     }
@@ -1356,35 +1329,36 @@ StatusWithMatchExpression _parse(StringData path, BSONObj schema, bool ignoreUnk
     // Map from JSON Schema keyword to the corresponding element from 'schema', or to an empty
     // BSONElement if the JSON Schema keyword is not specified.
     StringMap<BSONElement> keywordMap{
-        {std::string(kSchemaAdditionalItemsKeyword), {}},
-        {std::string(kSchemaAdditionalPropertiesKeyword), {}},
-        {std::string(kSchemaAllOfKeyword), {}},
-        {std::string(kSchemaAnyOfKeyword), {}},
-        {std::string(kSchemaBsonTypeKeyword), {}},
-        {std::string(kSchemaDependenciesKeyword), {}},
-        {std::string(kSchemaDescriptionKeyword), {}},
-        {std::string(kSchemaEnumKeyword), {}},
-        {std::string(kSchemaExclusiveMaximumKeyword), {}},
-        {std::string(kSchemaExclusiveMinimumKeyword), {}},
-        {std::string(kSchemaItemsKeyword), {}},
-        {std::string(kSchemaMaxItemsKeyword), {}},
-        {std::string(kSchemaMaxLengthKeyword), {}},
-        {std::string(kSchemaMaxPropertiesKeyword), {}},
-        {std::string(kSchemaMaximumKeyword), {}},
-        {std::string(kSchemaMinItemsKeyword), {}},
-        {std::string(kSchemaMinLengthKeyword), {}},
-        {std::string(kSchemaMinPropertiesKeyword), {}},
-        {std::string(kSchemaMinimumKeyword), {}},
-        {std::string(kSchemaMultipleOfKeyword), {}},
-        {std::string(kSchemaNotKeyword), {}},
-        {std::string(kSchemaOneOfKeyword), {}},
-        {std::string(kSchemaPatternKeyword), {}},
-        {std::string(kSchemaPatternPropertiesKeyword), {}},
-        {std::string(kSchemaPropertiesKeyword), {}},
-        {std::string(kSchemaRequiredKeyword), {}},
-        {std::string(kSchemaTitleKeyword), {}},
-        {std::string(kSchemaTypeKeyword), {}},
-        {std::string(kSchemaUniqueItemsKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaAdditionalItemsKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaAdditionalPropertiesKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaAllOfKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaAnyOfKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaBsonTypeKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaDependenciesKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaDescriptionKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaEncryptKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaEnumKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaExclusiveMaximumKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaExclusiveMinimumKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaItemsKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaMaxItemsKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaMaxLengthKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaMaxPropertiesKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaMaximumKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaMinItemsKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaMinLengthKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaMinPropertiesKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaMinimumKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaMultipleOfKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaNotKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaOneOfKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaPatternKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaPatternPropertiesKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaPropertiesKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaRequiredKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaTitleKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaTypeKeyword), {}},
+        {std::string(JSONSchemaParser::kSchemaUniqueItemsKeyword), {}},
     };
 
     for (auto&& elt : schema) {
@@ -1416,32 +1390,58 @@ StatusWithMatchExpression _parse(StringData path, BSONObj schema, bool ignoreUnk
         return metadataStatus;
     }
 
-    auto typeElem = keywordMap[kSchemaTypeKeyword];
-    auto bsonTypeElem = keywordMap[kSchemaBsonTypeKeyword];
+    auto typeElem = keywordMap[JSONSchemaParser::kSchemaTypeKeyword];
+    auto bsonTypeElem = keywordMap[JSONSchemaParser::kSchemaBsonTypeKeyword];
+    auto encryptElem = keywordMap[JSONSchemaParser::kSchemaEncryptKeyword];
     if (typeElem && bsonTypeElem) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "Cannot specify both $jsonSchema keywords '"
-                                    << kSchemaTypeKeyword
+                                    << JSONSchemaParser::kSchemaTypeKeyword
                                     << "' and '"
-                                    << kSchemaBsonTypeKeyword
+                                    << JSONSchemaParser::kSchemaBsonTypeKeyword
                                     << "'");
+    } else if (typeElem && encryptElem) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "$jsonSchema keyword '"
+                                    << JSONSchemaParser::kSchemaEncryptKeyword
+                                    << "' cannot be used in conjunction with '"
+                                    << JSONSchemaParser::kSchemaTypeKeyword
+                                    << "', '"
+                                    << JSONSchemaParser::kSchemaEncryptKeyword
+                                    << "' implies type 'bsonType::BinData'");
+    } else if (bsonTypeElem && encryptElem) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "$jsonSchema keyword '"
+                                    << JSONSchemaParser::kSchemaEncryptKeyword
+                                    << "' cannot be used in conjunction with '"
+                                    << JSONSchemaParser::kSchemaBsonTypeKeyword
+                                    << "', '"
+                                    << JSONSchemaParser::kSchemaEncryptKeyword
+                                    << "' implies type 'bsonType::BinData'");
     }
 
     std::unique_ptr<InternalSchemaTypeExpression> typeExpr;
     if (typeElem) {
-        auto parseTypeResult =
-            parseType(path, kSchemaTypeKeyword, typeElem, MatcherTypeSet::kJsonSchemaTypeAliasMap);
+        auto parseTypeResult = parseType(path,
+                                         JSONSchemaParser::kSchemaTypeKeyword,
+                                         typeElem,
+                                         MatcherTypeSet::kJsonSchemaTypeAliasMap);
         if (!parseTypeResult.isOK()) {
             return parseTypeResult.getStatus();
         }
         typeExpr = std::move(parseTypeResult.getValue());
     } else if (bsonTypeElem) {
         auto parseBsonTypeResult =
-            parseType(path, kSchemaBsonTypeKeyword, bsonTypeElem, kTypeAliasMap);
+            parseType(path, JSONSchemaParser::kSchemaBsonTypeKeyword, bsonTypeElem, kTypeAliasMap);
         if (!parseBsonTypeResult.isOK()) {
             return parseBsonTypeResult.getStatus();
         }
         typeExpr = std::move(parseBsonTypeResult.getValue());
+    } else if (encryptElem) {
+        // The presence of the encrypt keyword implies the restriction that the field must be
+        // of type BinData.
+        typeExpr = stdx::make_unique<InternalSchemaTypeExpression>(
+            path, MatcherTypeSet(BSONType::BinData));
     }
 
     auto andExpr = stdx::make_unique<AndMatchExpression>();
@@ -1454,6 +1454,12 @@ StatusWithMatchExpression _parse(StringData path, BSONObj schema, bool ignoreUnk
 
     translationStatus = translateArrayKeywords(
         keywordMap, path, ignoreUnknownKeywords, typeExpr.get(), andExpr.get());
+    if (!translationStatus.isOK()) {
+        return translationStatus;
+    }
+
+    translationStatus =
+        translateEncryptionKeywords(keywordMap, path, typeExpr.get(), andExpr.get());
     if (!translationStatus.isOK()) {
         return translationStatus;
     }
@@ -1483,12 +1489,51 @@ StatusWithMatchExpression _parse(StringData path, BSONObj schema, bool ignoreUnk
 }
 }  // namespace
 
-constexpr StringData JSONSchemaParser::kSchemaTypeArray;
-constexpr StringData JSONSchemaParser::kSchemaTypeBoolean;
-constexpr StringData JSONSchemaParser::kSchemaTypeInteger;
-constexpr StringData JSONSchemaParser::kSchemaTypeNull;
-constexpr StringData JSONSchemaParser::kSchemaTypeObject;
-constexpr StringData JSONSchemaParser::kSchemaTypeString;
+StatusWith<MatcherTypeSet> JSONSchemaParser::parseTypeSet(BSONElement typeElt,
+                                                          const StringMap<BSONType>& aliasMap) {
+    if (typeElt.type() != BSONType::String && typeElt.type() != BSONType::Array) {
+        return {Status(ErrorCodes::TypeMismatch,
+                       str::stream() << "$jsonSchema keyword '" << typeElt.fieldNameStringData()
+                                     << "' must be either a string or an array of strings")};
+    }
+
+    std::set<StringData> aliases;
+    if (typeElt.type() == BSONType::String) {
+        if (typeElt.valueStringData() == JSONSchemaParser::kSchemaTypeInteger) {
+            return {ErrorCodes::FailedToParse,
+                    str::stream() << "$jsonSchema type '" << JSONSchemaParser::kSchemaTypeInteger
+                                  << "' is not currently supported."};
+        }
+        aliases.insert(typeElt.valueStringData());
+    } else {
+        for (auto&& typeArrayEntry : typeElt.embeddedObject()) {
+            if (typeArrayEntry.type() != BSONType::String) {
+                return {Status(ErrorCodes::TypeMismatch,
+                               str::stream() << "$jsonSchema keyword '"
+                                             << typeElt.fieldNameStringData()
+                                             << "' array elements must be strings")};
+            }
+
+            if (typeArrayEntry.valueStringData() == JSONSchemaParser::kSchemaTypeInteger) {
+                return {ErrorCodes::FailedToParse,
+                        str::stream() << "$jsonSchema type '"
+                                      << JSONSchemaParser::kSchemaTypeInteger
+                                      << "' is not currently supported."};
+            }
+
+            auto insertionResult = aliases.insert(typeArrayEntry.valueStringData());
+            if (!insertionResult.second) {
+                return {Status(ErrorCodes::FailedToParse,
+                               str::stream() << "$jsonSchema keyword '"
+                                             << typeElt.fieldNameStringData()
+                                             << "' has duplicate value: "
+                                             << typeArrayEntry.valueStringData())};
+            }
+        }
+    }
+
+    return MatcherTypeSet::fromStringAliases(std::move(aliases), aliasMap);
+}
 
 StatusWithMatchExpression JSONSchemaParser::parse(BSONObj schema, bool ignoreUnknownKeywords) {
     LOG(5) << "Parsing JSON Schema: " << schema.jsonString();

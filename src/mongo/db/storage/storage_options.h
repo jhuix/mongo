@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -79,11 +78,11 @@ struct StorageGlobalParams {
 
     // --journalCommitInterval
     static const int kMaxJournalCommitIntervalMs;
-    AtomicInt32 journalCommitIntervalMs;
+    AtomicWord<int> journalCommitIntervalMs;
 
     // --notablescan
     // no table scans allowed
-    AtomicBool noTableScan;
+    AtomicWord<bool> noTableScan;
 
     // --directoryperdb
     // Stores each database’s files in its own folder in the data directory.

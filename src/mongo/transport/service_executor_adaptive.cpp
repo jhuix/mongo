@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -40,7 +39,6 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/transport/service_entry_point_utils.h"
 #include "mongo/transport/service_executor_task_names.h"
-#include "mongo/transport/thread_idle_callback.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/log.h"
@@ -224,7 +222,7 @@ Status ServiceExecutorAdaptive::schedule(ServiceExecutorAdaptive::Task task,
             _localThreadState->executing.markRunning();
             _threadsInUse.addAndFetch(1);
         }
-        const auto guard = MakeGuard([this, taskName] {
+        const auto guard = makeGuard([this, taskName] {
             if (--_localThreadState->recursionDepth == 0) {
                 _localThreadState->executingCurRun += _localThreadState->executing.markStopped();
                 _threadsInUse.subtractAndFetch(1);
@@ -238,11 +236,6 @@ Status ServiceExecutorAdaptive::schedule(ServiceExecutorAdaptive::Task task,
         task();
         _localThreadState->threadMetrics[static_cast<size_t>(taskName)]
             ._totalSpentExecuting.addAndFetch(_localTimer.sinceStartTicks());
-
-        if ((flags & ServiceExecutor::kMayYieldBeforeSchedule) &&
-            (_localThreadState->markIdleCounter++ & 0xf)) {
-            markThreadIdle();
-        }
     };
 
     // Dispatching a task on the io_context will run the task immediately, and may run it
@@ -254,9 +247,9 @@ Status ServiceExecutorAdaptive::schedule(ServiceExecutorAdaptive::Task task,
     // can be called immediately and recursively.
     if ((flags & kMayRecurse) &&
         (_localThreadState->recursionDepth + 1 < _config->recursionLimit())) {
-        _reactorHandle->schedule(Reactor::kDispatch, std::move(wrappedTask));
+        _reactorHandle->dispatch(std::move(wrappedTask));
     } else {
-        _reactorHandle->schedule(Reactor::kPost, std::move(wrappedTask));
+        _reactorHandle->schedule(std::move(wrappedTask));
     }
 
     _lastScheduleTimer.reset();
@@ -563,7 +556,7 @@ void ServiceExecutorAdaptive::_workerThreadRoutine(
     log() << "Started new database worker thread " << threadId;
 
     bool guardThreadsRunning = true;
-    const auto guard = MakeGuard([this, &guardThreadsRunning, state] {
+    const auto guard = makeGuard([this, &guardThreadsRunning, state] {
         if (guardThreadsRunning)
             _threadsRunning.subtractAndFetch(1);
         _pastThreadsSpentRunning.addAndFetch(state->running.totalTime());

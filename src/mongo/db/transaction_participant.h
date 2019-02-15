@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -56,7 +55,7 @@ namespace mongo {
 
 class OperationContext;
 
-extern AtomicInt32 transactionLifetimeLimitSeconds;
+extern AtomicWord<int> transactionLifetimeLimitSeconds;
 
 /**
  * Read timestamp to be used for a speculative transaction.  For transactions with read
@@ -74,6 +73,14 @@ enum class SpeculativeTransactionOpTime {
 };
 
 /**
+ * Reason a transaction was terminated.
+ */
+enum class TerminationCause {
+    kCommitted,
+    kAborted,
+};
+
+/**
  * A state machine that coordinates a distributed transaction commit with the transaction
  * coordinator.
  */
@@ -87,11 +94,13 @@ public:
      */
     class TxnResources {
     public:
+        enum class StashStyle { kPrimary, kSecondary, kSideTransaction };
+
         /**
          * Stashes transaction state from 'opCtx' in the newly constructed TxnResources.
          * Ephemerally holds the Client lock associated with opCtx.
          */
-        TxnResources(OperationContext* opCtx, bool keepTicket = false);
+        TxnResources(OperationContext* opCtx, StashStyle stashStyle);
         ~TxnResources();
 
         // Rule of 5: because we have a class-defined destructor, we need to explictly specify
@@ -160,6 +169,17 @@ public:
      */
     static TransactionParticipant* get(OperationContext* opCtx);
     static TransactionParticipant* get(Session* session);
+
+    /**
+     * When the server returns a NoSuchTransaction error for a command, it performs a noop write if
+     * there is a writeConcern on the command. The TransientTransactionError label is only appended
+     * to a NoSuchTransaction response for 'commitTransaction' and 'coordinateCommitTransaction' if
+     * there is no writeConcern error. This ensures that if 'commitTransaction' or
+     * 'coordinateCommitTransaction' is run with w:majority, then the TransientTransactionError
+     * label is only returned if the transaction is not committed on any valid branch of history,
+     * so the driver or application can safely retry the entire transaction.
+     */
+    static void performNoopWriteForNoSuchTransaction(OperationContext* opCtx);
 
     /**
      * Blocking method, which loads the transaction state from storage if it has been marked as
@@ -241,9 +261,14 @@ public:
     * Commits the transaction, including committing the write unit of work and updating
     * transaction state.
     *
+    * On a secondary, the "commitOplogEntryOpTime" will be the OpTime of the commitTransaction oplog
+    * entry.
+    *
     * Throws an exception if the transaction is not prepared or if the 'commitTimestamp' is null.
     */
-    void commitPreparedTransaction(OperationContext* opCtx, Timestamp commitTimestamp);
+    void commitPreparedTransaction(OperationContext* opCtx,
+                                   Timestamp commitTimestamp,
+                                   boost::optional<repl::OpTime> commitOplogEntryOpTime);
 
     /**
      * Aborts the transaction outside the transaction, releasing transaction resources.
@@ -283,11 +308,24 @@ public:
     void addTransactionOperation(OperationContext* opCtx, const repl::ReplOperation& operation);
 
     /**
-     * Returns and clears the stored operations for an multi-document (non-autocommit) transaction,
-     * and marks the transaction as closed.  It is illegal to attempt to add operations to the
-     * transaction after this is called.
+     * Returns a reference to the stored operations for a completed multi-document (non-autocommit)
+     * transaction. "Completed" implies that no more operations will be added to the transaction.
+     * It is legal to call this method only when the transaction state is in progress or committed.
      */
-    std::vector<repl::ReplOperation> endTransactionAndRetrieveOperations(OperationContext* opCtx);
+    std::vector<repl::ReplOperation>& retrieveCompletedTransactionOperations(
+        OperationContext* opCtx);
+
+    /**
+     * Clears the stored operations for an multi-document (non-autocommit) transaction, marking
+     * the transaction as closed.  It is illegal to attempt to add operations to the transaction
+     * after this is called.
+     */
+    void clearOperationsInMemory(OperationContext* opCtx);
+
+    /**
+     * Yield or reacquire locks for prepared transacitons, used on replication state transition.
+     */
+    void refreshLocksForPreparedTransaction(OperationContext* opCtx, bool yieldLocks);
 
     /**
      * May only be called while a multi-document transaction is not committed and adds the multi-key
@@ -472,8 +510,8 @@ public:
         bool committed,
         const repl::ReadConcernArgs& readConcernArgs) const {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        TransactionState::StateFlag terminationCause =
-            committed ? TransactionState::kCommitted : TransactionState::kAborted;
+        TerminationCause terminationCause =
+            committed ? TerminationCause::kCommitted : TerminationCause::kAborted;
         return _transactionInfoForLog(lockStats, terminationCause, readConcernArgs);
     }
 
@@ -492,6 +530,16 @@ public:
         return _speculativeTransactionReadOpTime;
     }
 
+    boost::optional<repl::OpTime> getFinishOpTimeForTest() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _finishOpTime;
+    }
+
+    boost::optional<repl::OpTime> getOldestOplogEntryOpTimeForTest() const {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        return _oldestOplogEntryOpTime;
+    }
+
     const Locker* getTxnResourceStashLockerForTest() const {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         invariant(_txnResourceStash);
@@ -503,9 +551,20 @@ public:
         _txnState.transitionTo(lk, TransactionState::kPrepared);
     }
 
-    void transitionToAbortedforTest() {
+    void transitionToCommittingWithPrepareforTest() {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        _txnState.transitionTo(lk, TransactionState::kAborted);
+        _txnState.transitionTo(lk, TransactionState::kCommittingWithPrepare);
+    }
+
+
+    void transitionToAbortedWithoutPrepareforTest() {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _txnState.transitionTo(lk, TransactionState::kAbortedWithoutPrepare);
+    }
+
+    void transitionToAbortedWithPrepareforTest() {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _txnState.transitionTo(lk, TransactionState::kAbortedWithPrepare);
     }
 
 private:
@@ -533,6 +592,7 @@ private:
         }
 
     private:
+        OperationContext* _opCtx;
         std::unique_ptr<Locker> _locker;
         std::unique_ptr<RecoveryUnit> _recoveryUnit;
         OplogSlot _oplogSlot;
@@ -553,7 +613,8 @@ private:
             kCommittingWithoutPrepare = 1 << 3,
             kCommittingWithPrepare = 1 << 4,
             kCommitted = 1 << 5,
-            kAborted = 1 << 6
+            kAbortedWithoutPrepare = 1 << 6,
+            kAbortedWithPrepare = 1 << 7
         };
 
         using StateSet = int;
@@ -600,7 +661,7 @@ private:
         }
 
         bool isAborted(WithLock) const {
-            return _state == kAborted;
+            return _state == kAbortedWithoutPrepare || _state == kAbortedWithPrepare;
         }
 
         std::string toString() const {
@@ -689,7 +750,7 @@ private:
     // Clean up the transaction resources unstashed on operation context.
     void _cleanUpTxnResourceOnOpCtx(WithLock wl,
                                     OperationContext* opCtx,
-                                    TransactionState::StateFlag terminationCause);
+                                    TerminationCause terminationCause);
 
     // Checks if the current transaction number of this transaction still matches with the
     // parent session as well as the transaction number of the current operation context.
@@ -706,7 +767,7 @@ private:
     // transaction must be committed or aborted when this function is called.
     void _logSlowTransaction(WithLock wl,
                              const SingleThreadedLockStats* lockStats,
-                             TransactionState::StateFlag terminationCause,
+                             TerminationCause terminationCause,
                              repl::ReadConcernArgs readConcernArgs);
 
     // This method returns a string with information about a slow transaction. The format of the
@@ -714,7 +775,7 @@ private:
     // transaction must be completed (committed or aborted) and a valid LockStats reference must be
     // passed in order for this method to be called.
     std::string _transactionInfoForLog(const SingleThreadedLockStats* lockStats,
-                                       TransactionState::StateFlag terminationCause,
+                                       TerminationCause terminationCause,
                                        repl::ReadConcernArgs readConcernArgs) const;
 
     // Reports transaction stats for both active and inactive transactions using the provided

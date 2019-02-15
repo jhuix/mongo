@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -52,7 +51,7 @@ stdx::mutex shutdownMutex;
 stdx::condition_variable shutdownTasksComplete;
 boost::optional<ExitCode> shutdownExitCode;
 bool shutdownTasksInProgress = false;
-AtomicUInt32 shutdownFlag;
+AtomicWord<unsigned> shutdownFlag;
 std::stack<stdx::function<void()>> shutdownTasks;
 stdx::thread::id shutdownTasksThreadId;
 

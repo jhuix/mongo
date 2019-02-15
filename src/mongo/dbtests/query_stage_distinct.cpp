@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -289,7 +288,6 @@ public:
 
         while (PlanStage::IS_EOF != (state = distinct.work(&wsid))) {
             ASSERT_NE(PlanStage::FAILURE, state);
-            ASSERT_NE(PlanStage::DEAD, state);
             if (PlanStage::ADVANCED == state) {
                 seen.push_back(getIntFieldDotted(ws, wsid, "b"));
             }

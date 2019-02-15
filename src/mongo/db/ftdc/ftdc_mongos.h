@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -46,11 +45,5 @@ void startMongoSFTDC();
  * Stop Full Time Data Capture
  */
 void stopMongoSFTDC();
-
-/**
- * Set Parameters utility methods
- */
-Status ftdcDirectoryFromString(StringData str);
-void ftdcDirectoryAppendBSON(OperationContext* opCtx, BSONObjBuilder* b, StringData name);
 
 }  // namespace mongo

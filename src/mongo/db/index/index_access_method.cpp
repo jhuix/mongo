@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -183,7 +182,7 @@ Status AbstractIndexAccessMethod::insert(OperationContext* opCtx,
                                          const RecordId& loc,
                                          const InsertDeleteOptions& options,
                                          InsertResult* result) {
-    invariant(options.fromIndexBuilder || !_btreeState->isBuilding());
+    invariant(options.fromIndexBuilder || !_btreeState->isHybridBuilding());
 
     BSONObjSet multikeyMetadataKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
@@ -283,7 +282,7 @@ Status AbstractIndexAccessMethod::remove(OperationContext* opCtx,
                                          const RecordId& loc,
                                          const InsertDeleteOptions& options,
                                          int64_t* numDeleted) {
-    invariant(!_btreeState->isBuilding());
+    invariant(!_btreeState->isHybridBuilding());
     invariant(numDeleted);
 
     *numDeleted = 0;
@@ -468,7 +467,7 @@ Status AbstractIndexAccessMethod::update(OperationContext* opCtx,
                                          const UpdateTicket& ticket,
                                          int64_t* numInserted,
                                          int64_t* numDeleted) {
-    invariant(!_btreeState->isBuilding());
+    invariant(!_btreeState->isHybridBuilding());
     invariant(ticket.newKeys.size() ==
               ticket.oldKeys.size() + ticket.added.size() - ticket.removed.size());
     invariant(numInserted);
@@ -634,7 +633,6 @@ int64_t AbstractIndexAccessMethod::BulkBuilderImpl::getKeysInserted() const {
 
 Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
                                              BulkBuilder* bulk,
-                                             bool mayInterrupt,
                                              bool dupsAllowed,
                                              set<RecordId>* dupRecords,
                                              std::vector<BSONObj>* dupKeysInserted) {
@@ -646,13 +644,13 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
 
     std::unique_ptr<BulkBuilder::Sorter::Iterator> it(bulk->done());
 
-    stdx::unique_lock<Client> lk(*opCtx->getClient());
-    ProgressMeterHolder pm(
-        CurOp::get(opCtx)->setMessage_inlock("Index Bulk Build: (2/3) btree bottom up",
-                                             "Index: (2/3) BTree Bottom Up Progress",
-                                             bulk->getKeysInserted(),
-                                             10));
-    lk.unlock();
+    static const char* message = "Index Build: inserting keys from external sorter into index";
+    ProgressMeterHolder pm;
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        pm.set(CurOp::get(opCtx)->setProgress_inlock(
+            message, bulk->getKeysInserted(), 3 /* secondsBetween */));
+    }
 
     auto builder = std::unique_ptr<SortedDataBuilderInterface>(
         _newInterface->getBulkBuilder(opCtx, dupsAllowed));
@@ -663,9 +661,7 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
     const Ordering ordering = Ordering::make(_descriptor->keyPattern());
 
     while (it->more()) {
-        if (mayInterrupt) {
-            opCtx->checkForInterrupt();
-        }
+        opCtx->checkForInterrupt();
 
         WriteUnitOfWork wunit(opCtx);
 
@@ -722,16 +718,11 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
 
     pm.finished();
 
-    {
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        CurOp::get(opCtx)->setMessage_inlock("Index Bulk Build: (3/3) btree-middle",
-                                             "Index: (3/3) BTree Middle Progress");
-    }
-
-    LOG(timer.seconds() > 10 ? 0 : 1) << "\t done building bottom layer, going to commit";
+    log() << "index build: inserted " << bulk->getKeysInserted()
+          << " keys from external sorter into index in " << timer.seconds() << " seconds";
 
     WriteUnitOfWork wunit(opCtx);
-    SpecialFormatInserted specialFormatInserted = builder->commit(mayInterrupt);
+    SpecialFormatInserted specialFormatInserted = builder->commit(true /* mayInterrupt */);
     // It's ok to insert KeyStrings with long TypeBits but we need to mark the feature
     // tracker bit so that downgrade binary which cannot read the long TypeBits fails to
     // start up.
@@ -826,7 +817,7 @@ SortedDataInterface* AbstractIndexAccessMethod::getSortedDataInterface() const {
  * places, rather than compiled in one place and linked, and so cannot provide a globally unique ID.
  */
 std::string nextFileName() {
-    static AtomicUInt32 indexAccessMethodFileCounter;
+    static AtomicWord<unsigned> indexAccessMethodFileCounter;
     return "extsort-index." + std::to_string(indexAccessMethodFileCounter.fetchAndAdd(1));
 }
 

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -98,6 +97,7 @@ public:
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
+                                  std::uint64_t numRecords,
                                   CollectionDropType dropType) override;
 
     void onRenameCollection(OperationContext* opCtx,
@@ -105,6 +105,7 @@ public:
                             const NamespaceString& toCollection,
                             OptionalCollectionUUID uuid,
                             OptionalCollectionUUID dropTargetUUID,
+                            std::uint64_t numRecords,
                             bool stayTemp) override;
 
     repl::OpTime preRenameCollection(OperationContext* opCtx,
@@ -112,6 +113,7 @@ public:
                                      const NamespaceString& toCollection,
                                      OptionalCollectionUUID uuid,
                                      OptionalCollectionUUID dropTargetUUID,
+                                     std::uint64_t numRecords,
                                      bool stayTemp) override;
     void postRenameCollection(OperationContext* opCtx,
                               const NamespaceString& fromCollection,
@@ -182,6 +184,7 @@ void OpObserverMock::onCreateCollection(OperationContext* opCtx,
 repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
                                               const NamespaceString& collectionName,
                                               OptionalCollectionUUID uuid,
+                                              std::uint64_t numRecords,
                                               const CollectionDropType dropType) {
     _logOp(opCtx, collectionName, "drop");
     // If the oplog is not disabled for this namespace, then we need to reserve an op time for the
@@ -189,7 +192,8 @@ repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
     if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, collectionName)) {
         OpObserver::Times::get(opCtx).reservedOpTimes.push_back(dropOpTime);
     }
-    auto noopOptime = OpObserverNoop::onDropCollection(opCtx, collectionName, uuid, dropType);
+    auto noopOptime =
+        OpObserverNoop::onDropCollection(opCtx, collectionName, uuid, numRecords, dropType);
     invariant(noopOptime.isNull());
     return {};
 }
@@ -199,10 +203,12 @@ void OpObserverMock::onRenameCollection(OperationContext* opCtx,
                                         const NamespaceString& toCollection,
                                         OptionalCollectionUUID uuid,
                                         OptionalCollectionUUID dropTargetUUID,
+                                        std::uint64_t numRecords,
                                         bool stayTemp) {
-    preRenameCollection(opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
+    preRenameCollection(
+        opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
     OpObserverNoop::onRenameCollection(
-        opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
+        opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
     onRenameCollectionCalled = true;
     onRenameCollectionDropTarget = dropTargetUUID;
 }
@@ -224,11 +230,12 @@ repl::OpTime OpObserverMock::preRenameCollection(OperationContext* opCtx,
                                                  const NamespaceString& toCollection,
                                                  OptionalCollectionUUID uuid,
                                                  OptionalCollectionUUID dropTargetUUID,
+                                                 std::uint64_t numRecords,
                                                  bool stayTemp) {
     _logOp(opCtx, fromCollection, "rename");
     OpObserver::Times::get(opCtx).reservedOpTimes.push_back(renameOpTime);
     OpObserverNoop::preRenameCollection(
-        opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
+        opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
     return {};
 }
 void OpObserverMock::_logOp(OperationContext* opCtx,
@@ -409,7 +416,7 @@ void _createIndexOnEmptyCollection(OperationContext* opCtx,
         AutoGetCollection autoColl(opCtx, nss, MODE_X);
         auto collection = autoColl.getCollection();
         ASSERT_TRUE(collection) << "Cannot create index on empty collection " << nss
-                                << " because collection " << nss.ns() << " does not exist.";
+                                << " because collection " << nss << " does not exist.";
 
         auto indexInfoObj = BSON(
             "v" << int(IndexDescriptor::kLatestIndexVersion) << "key" << BSON("a" << 1) << "name"
@@ -434,7 +441,7 @@ void _insertDocument(OperationContext* opCtx, const NamespaceString& nss, const 
         AutoGetCollection autoColl(opCtx, nss, MODE_X);
         auto collection = autoColl.getCollection();
         ASSERT_TRUE(collection) << "Cannot insert document " << doc << " into collection " << nss
-                                << " because collection " << nss.ns() << " does not exist.";
+                                << " because collection " << nss << " does not exist.";
 
         WriteUnitOfWork wuow(opCtx);
         OpDebug* const opDebug = nullptr;

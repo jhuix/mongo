@@ -300,7 +300,6 @@
             }
         },
         getParameter: {skip: isUnrelated},
-        getPrevError: {skip: isUnrelated},
         getShardMap: {skip: isUnrelated},
         getShardVersion: {
             command: {getShardVersion: "test.view"},
@@ -317,7 +316,6 @@
         hostInfo: {skip: isUnrelated},
         insert: {command: {insert: "view", documents: [{x: 1}]}, expectFailure: true},
         invalidateUserCache: {skip: isUnrelated},
-        invalidateViewCatalog: {command: {invalidateViewCatalog: 1}},
         isdbgrid: {skip: isUnrelated},
         isMaster: {skip: isUnrelated},
         killCursors: {
@@ -515,7 +513,9 @@
             expectFailure: true,
         },
         stageDebug: {skip: isAnInternalCommand},
+        startRecordingTraffic: {skip: isUnrelated},
         startSession: {skip: isAnInternalCommand},
+        stopRecordingTraffic: {skip: isUnrelated},
         top: {skip: "tested in views/views_stats.js"},
         touch: {
             command: {touch: "view", data: true},

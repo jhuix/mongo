@@ -1,6 +1,3 @@
-// ttl.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -253,14 +250,14 @@ private:
         auto canonicalQuery = CanonicalQuery::canonicalize(opCtx, std::move(qr));
         invariant(canonicalQuery.getStatus());
 
-        DeleteStageParams params;
-        params.isMulti = true;
-        params.canonicalQuery = canonicalQuery.getValue().get();
+        auto params = std::make_unique<DeleteStageParams>();
+        params->isMulti = true;
+        params->canonicalQuery = canonicalQuery.getValue().get();
 
         auto exec =
             InternalPlanner::deleteWithIndexScan(opCtx,
                                                  collection,
-                                                 params,
+                                                 std::move(params),
                                                  desc,
                                                  startKey,
                                                  endKey,

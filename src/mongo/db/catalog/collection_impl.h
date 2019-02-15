@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -100,10 +99,6 @@ public:
 
     RecordStore* getRecordStore() final {
         return _recordStore;
-    }
-
-    CursorManager* getCursorManager() const final {
-        return _cursorManager.get();
     }
 
     bool requiresIdIndex() const final;
@@ -353,6 +348,9 @@ public:
      */
     const CollatorInterface* getDefaultCollator() const final;
 
+    StatusWith<std::vector<BSONObj>> addCollationDefaultsToIndexSpecsForCreate(
+        OperationContext* opCtx, const std::vector<BSONObj>& indexSpecs) const final;
+
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
         OperationContext* opCtx,
         PlanExecutor::YieldPolicy yieldPolicy,
@@ -412,8 +410,6 @@ private:
 
     ValidationAction _validationAction;
     ValidationLevel _validationLevel;
-
-    std::unique_ptr<CursorManager> _cursorManager;
 
     // Notifier object for awaitData. Threads polling a capped collection for new data can wait
     // on this object until notified of the arrival of new data.

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -178,7 +177,7 @@ private:
     stdx::mutex _mutex;  // Protects all members, except for _valid.
     ViewMap _viewMap;
     DurableViewCatalog* _durable;
-    AtomicBool _valid;
+    AtomicWord<bool> _valid;
     ViewGraph _viewGraph;
     bool _viewGraphNeedsRefresh = true;  // Defers initializing the graph until the first insert.
 };

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -108,6 +107,12 @@ public:
     bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx, const NamespaceString& ns) override;
 
     virtual Status checkIfWriteConcernCanBeSatisfied(const WriteConcernOptions& writeConcern) const;
+
+    virtual Status checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum) const;
+
+    virtual StatusWith<bool> checkIfCommitQuorumIsSatisfied(
+        const CommitQuorumOptions& commitQuorum,
+        const std::vector<HostAndPort>& commitReadyMembers) const;
 
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
@@ -288,8 +293,10 @@ public:
 
     virtual bool setContainsArbiter() const override;
 
+    virtual void attemptToAdvanceStableTimestamp() override;
+
 private:
-    AtomicUInt64 _snapshotNameGenerator;
+    AtomicWord<unsigned long long> _snapshotNameGenerator;
     ServiceContext* const _service;
     ReplSettings _settings;
     StorageInterface* _storage = nullptr;

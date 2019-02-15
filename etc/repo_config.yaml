@@ -90,6 +90,14 @@ repos:
       - yum/redhat/7/mongodb-org
       - yum/redhat/7Server/mongodb-org
 
+  - name: rhel72
+    type: rpm
+    edition: org
+    bucket: repo.mongodb.org
+    repos:
+      - yum/redhat/7/mongodb-org
+      - yum/redhat/7Server/mongodb-org
+
   - name: amazon
     type: rpm
     edition: org
@@ -200,6 +208,7 @@ repos:
       - amd64
       - i386
       - s390x
+      - arm64
     repos:
       - apt/ubuntu/dists/bionic/mongodb-org
 
@@ -369,5 +378,6 @@ repos:
       - amd64
       - i386
       - s390x
+      - arm64
     repos:
       - apt/ubuntu/dists/bionic/mongodb-enterprise

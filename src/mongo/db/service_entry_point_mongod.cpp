@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -102,7 +101,7 @@ public:
         // Ensures that if we tried to do a write, we wait for write concern, even if that write was
         // a noop.
         if ((lastOpAfterRun == lastOpBeforeRun) &&
-            GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken()) {
+            GlobalLockAcquisitionTracker::get(opCtx).getGlobalWriteLocked()) {
             repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
             lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
         }
@@ -119,7 +118,7 @@ public:
         // from the primary.
         if (repl::ReadConcernArgs::get(opCtx).getLevel() ==
             repl::ReadConcernLevel::kLinearizableReadConcern) {
-            uassertStatusOK(mongo::waitForLinearizableReadConcern(opCtx));
+            uassertStatusOK(mongo::waitForLinearizableReadConcern(opCtx, 0));
         }
     }
 

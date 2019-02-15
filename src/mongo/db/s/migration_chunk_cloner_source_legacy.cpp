@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -617,7 +616,7 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* opC
         }
     }
 
-    if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
+    if (PlanExecutor::FAILURE == state) {
         return WorkingSetCommon::getMemberObjectStatus(obj).withContext(
             "Executor error while scanning for documents belonging to chunk");
     }

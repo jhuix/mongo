@@ -1,6 +1,3 @@
-//@file update.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -121,8 +118,10 @@ BSONObj applyUpdateOperators(OperationContext* opCtx,
 
     const bool validateForStorage = false;
     const FieldRefSet emptyImmutablePaths;
+    const bool isInsert = false;
 
-    uassertStatusOK(driver.update(StringData(), &doc, validateForStorage, emptyImmutablePaths));
+    uassertStatusOK(
+        driver.update(StringData(), &doc, validateForStorage, emptyImmutablePaths, isInsert));
 
     return doc.getObject();
 }

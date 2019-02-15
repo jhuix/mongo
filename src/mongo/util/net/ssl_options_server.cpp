@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -108,9 +107,10 @@ MONGO_STARTUP_OPTIONS_POST(SSLServerOptions)(InitializerContext*) {
         }
     }
 
-    if (params.count("net.tls.PEMKeyFile")) {
+    if (params.count("net.tls.certificateKeyFile")) {
         sslGlobalParams.sslPEMKeyFile =
-            boost::filesystem::absolute(params["net.tls.PEMKeyFile"].as<string>()).generic_string();
+            boost::filesystem::absolute(params["net.tls.certificateKeyFile"].as<string>())
+                .generic_string();
     }
 
     if (params.count("net.tls.clusterFile")) {
@@ -202,7 +202,7 @@ MONGO_STARTUP_OPTIONS_POST(SSLServerOptions)(InitializerContext*) {
         bool usingCertifiateSelectors = params.count("net.tls.certificateSelector");
         if (sslGlobalParams.sslPEMKeyFile.size() == 0 && !usingCertifiateSelectors) {
             return {ErrorCodes::BadValue,
-                    "need tlsPEMKeyFile or certificateSelector when TLS is enabled"};
+                    "need tlsCertificateKeyFile or certificateSelector when TLS is enabled"};
         }
         if (!sslGlobalParams.sslCRLFile.empty() && sslGlobalParams.sslCAFile.empty()) {
             return {ErrorCodes::BadValue, "need tlsCAFile with tlsCRLFile"};
@@ -271,6 +271,23 @@ Status canonicalizeSSLServerOptions(moe::Environment* params) {
         }
     }
 
+    if (params->count("net.ssl.mode")) {
+        auto mode = (*params)["net.ssl.mode"].as<std::string>();
+        auto ret = params->remove("net.ssl.mode");
+        if (!ret.isOK()) {
+            return ret;
+        }
+
+        if (StringData(mode).endsWith("SSL")) {
+            mode.replace(mode.size() - 3, 3, "TLS");
+        }
+
+        ret = params->set("net.tls.mode", moe::Value(mode));
+        if (!ret.isOK()) {
+            return ret;
+        }
+    }
+
     return Status::OK();
 }
 
@@ -284,8 +301,9 @@ MONGO_STARTUP_OPTIONS_VALIDATE(SSLServerOptions)(InitializerContext*) {
     const auto& params = moe::startupOptionsParsed;
 
     if (params.count("install") || params.count("reinstall")) {
-        if (params.count("net.tls.PEMKeyFile") &&
-            !boost::filesystem::path(params["net.tls.PEMKeyFile"].as<string>()).is_absolute()) {
+        if (params.count("net.tls.certificateKeyFile") &&
+            !boost::filesystem::path(params["net.tls.certificateKeyFile"].as<string>())
+                 .is_absolute()) {
             return {ErrorCodes::BadValue,
                     "PEMKeyFile requires an absolute file path with Windows services"};
         }

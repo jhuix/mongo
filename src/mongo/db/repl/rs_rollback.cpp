@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -49,6 +48,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
@@ -66,12 +66,12 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_process.h"
-#include "mongo/db/repl/replication_state_transition_lock_guard.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/storage/remove_saver.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
@@ -231,10 +231,6 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
     if (isNestedApplyOpsCommand) {
         if (!ourObj.hasField("ts")) {
             bob.appendTimestamp("ts");
-        }
-        if (!ourObj.hasField("h")) {
-            long long dummyHash = 0;
-            bob.append("h", dummyHash);
         }
     }
     bob.appendElements(ourObj);
@@ -746,7 +742,7 @@ void dropCollection(OperationContext* opCtx,
                     Collection* collection,
                     Database* db) {
     if (RollbackImpl::shouldCreateDataFiles()) {
-        Helpers::RemoveSaver removeSaver("rollback", "", nss.ns());
+        RemoveSaver removeSaver("rollback", "", nss.ns());
 
         // Performs a collection scan and writes all documents in the collection to disk
         // in order to keep an archive of items that were rolled back.
@@ -766,11 +762,10 @@ void dropCollection(OperationContext* opCtx,
         }
 
         // If we exited the above for loop with any other execState than IS_EOF, this means that
-        // a FAILURE or DEAD state was returned. If a DEAD state occurred, the collection or
-        // database that we are attempting to save may no longer be valid. If a FAILURE state
-        // was returned, either an unrecoverable error was thrown by exec, or we attempted to
-        // retrieve data that could not be provided by the PlanExecutor. In both of these cases
-        // it is necessary for a full resync of the server.
+        // a FAILURE state was returned. If a FAILURE state was returned, either an unrecoverable
+        // error was thrown by exec, or we attempted to retrieve data that could not be provided
+        // by the PlanExecutor. In both of these cases it is necessary for a full resync of the
+        // server.
 
         if (execState != PlanExecutor::IS_EOF) {
             if (execState == PlanExecutor::FAILURE &&
@@ -1258,13 +1253,13 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         // while rolling back createCollection operations.
 
         const auto& uuid = nsAndGoodVersionsByDocID.first;
-        unique_ptr<Helpers::RemoveSaver> removeSaver;
+        unique_ptr<RemoveSaver> removeSaver;
         invariant(!fixUpInfo.collectionsToDrop.count(uuid));
 
         NamespaceString nss = catalog.lookupNSSByUUID(uuid);
 
         if (RollbackImpl::shouldCreateDataFiles()) {
-            removeSaver = std::make_unique<Helpers::RemoveSaver>("rollback", "", nss.ns());
+            removeSaver = std::make_unique<RemoveSaver>("rollback", "", nss.ns());
         }
 
         const auto& goodVersionsByDocID = nsAndGoodVersionsByDocID.second;
@@ -1473,7 +1468,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
     }
 
     // Reload the lastAppliedOpTime and lastDurableOpTime value in the replcoord and the
-    // lastAppliedHash value in bgsync to reflect our new last op. The rollback common point does
+    // lastApplied value in bgsync to reflect our new last op. The rollback common point does
     // not necessarily represent a consistent database state. For example, on a secondary, we may
     // have rolled back to an optime that fell in the middle of an oplog application batch. We make
     // the database consistent again after rollback by applying ops forward until we reach

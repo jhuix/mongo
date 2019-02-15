@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -70,7 +69,7 @@ MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
     }
 
     // Need to mark the UUIDCatalog as open if we our closeAll fails, dismissed if successful.
-    auto reopenOnFailure = MakeGuard([opCtx] { UUIDCatalog::get(opCtx).onOpenCatalog(opCtx); });
+    auto reopenOnFailure = makeGuard([opCtx] { UUIDCatalog::get(opCtx).onOpenCatalog(opCtx); });
     // Closing UUID Catalog: only lookupNSSByUUID will fall back to using pre-closing state to
     // allow authorization for currently unknown UUIDs. This is needed because authorization needs
     // to work before acquiring locks, and might otherwise spuriously regard a UUID as unknown
@@ -80,14 +79,13 @@ MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
 
     // Close all databases.
     log() << "closeCatalog: closing all databases";
-    constexpr auto reason = "closing databases for closeCatalog";
-    databaseHolder->closeAll(opCtx, reason);
+    databaseHolder->closeAll(opCtx);
 
     // Close the storage engine's catalog.
     log() << "closeCatalog: closing storage engine catalog";
     opCtx->getServiceContext()->getStorageEngine()->closeCatalog(opCtx);
 
-    reopenOnFailure.Dismiss();
+    reopenOnFailure.dismiss();
     return minVisibleTimestampMap;
 }
 
@@ -161,9 +159,10 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
             log() << "openCatalog: rebuilding index: collection: " << collNss.toString()
                   << ", index: " << indexName;
         }
+
+        std::vector<BSONObj> indexSpecs = entry.second.second;
         fassert(40690,
-                rebuildIndexesOnCollection(
-                    opCtx, dbCatalogEntry, collCatalogEntry, std::move(entry.second)));
+                rebuildIndexesOnCollection(opCtx, dbCatalogEntry, collCatalogEntry, indexSpecs));
     }
 
     // Open all databases and repopulate the UUID catalog.

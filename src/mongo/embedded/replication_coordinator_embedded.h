@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -103,6 +102,13 @@ public:
     void stepDown(OperationContext*, bool, const Milliseconds&, const Milliseconds&) override;
 
     Status checkIfWriteConcernCanBeSatisfied(const WriteConcernOptions&) const override;
+
+    Status checkIfCommitQuorumCanBeSatisfied(
+        const CommitQuorumOptions& commitQuorum) const override;
+
+    StatusWith<bool> checkIfCommitQuorumIsSatisfied(
+        const CommitQuorumOptions& commitQuorum,
+        const std::vector<HostAndPort>& commitReadyMembers) const override;
 
     void setMyLastAppliedOpTime(const repl::OpTime&) override;
     void setMyLastDurableOpTime(const repl::OpTime&) override;
@@ -231,6 +237,8 @@ public:
     boost::optional<Timestamp> getRecoveryTimestamp() override;
 
     bool setContainsArbiter() const override;
+
+    void attemptToAdvanceStableTimestamp() override;
 
 private:
     // Back pointer to the ServiceContext that has started the instance.

@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -90,6 +89,9 @@ public:
     }
     std::string getFilesystemPathForDb(const std::string& dbName) const final {
         return "";
+    }
+    std::set<std::string> getDropPendingIdents() const final {
+        return {};
     }
 };
 

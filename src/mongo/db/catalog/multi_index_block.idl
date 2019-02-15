@@ -39,7 +39,16 @@ server_parameters:
       - runtime
       - startup
     cpp_varname: useReadOnceCursorsForIndexBuilds
-    cpp_vartype: AtomicBool
+    cpp_vartype: AtomicWord<bool>
+    default: true
+
+  enableHybridIndexBuilds:
+    description: "Build all indexes by performing external sorting while accepting concurrent client writes"
+    set_at:
+      - runtime
+      - startup
+    cpp_varname: enableHybridIndexBuilds
+    cpp_vartype: AtomicWord<bool>
     default: true
 
   maxIndexBuildMemoryUsageMegabytes:
@@ -48,7 +57,7 @@ server_parameters:
       - runtime
       - startup
     cpp_varname: maxIndexBuildMemoryUsageMegabytes
-    cpp_vartype: AtomicInt32
+    cpp_vartype: AtomicWord<int>
     default: 500
     validator:
       gte: 100

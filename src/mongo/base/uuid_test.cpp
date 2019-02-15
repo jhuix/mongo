@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -188,12 +187,6 @@ TEST(UUIDTest, toBSONUsingBSONMacro) {
     auto expectedBson = bob.obj();
 
     ASSERT_BSONOBJ_EQ(expectedBson, bson);
-}
-
-TEST(UUIDTest, NilUUID) {
-    // Test that UUID::nil() returns an all-zero UUID.
-    auto nilUUID = UUID::parse("00000000-0000-0000-0000-000000000000");
-    ASSERT_EQUALS(UUID::makeDefaultForChangeStream(), unittest::assertGet(nilUUID));
 }
 
 }  // namespace

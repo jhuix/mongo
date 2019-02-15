@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -31,12 +30,18 @@
 #pragma once
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/metadata_manager.h"
+#include "mongo/db/s/sharding_state_lock.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/variant.h"
 #include "mongo/util/decorable.h"
 
 namespace mongo {
+
+extern AtomicWord<int> migrationLockAcquisitionMaxWaitMS;
 
 /**
  * See the comments for CollectionShardingState for more information on how this class fits in the
@@ -47,13 +52,15 @@ class CollectionShardingRuntime final : public CollectionShardingState,
     MONGO_DISALLOW_COPYING(CollectionShardingRuntime);
 
 public:
+    using CSRLock = ShardingStateLock<CollectionShardingRuntime>;
+
     CollectionShardingRuntime(ServiceContext* sc,
                               NamespaceString nss,
                               executor::TaskExecutor* rangeDeleterExecutor);
 
     /**
-     * Obtains the sharding state for the specified collection. If it does not exist, it will be
-     * created and will remain active until the collection is dropped or unsharded.
+     * Obtains the sharding runtime state for the specified collection. If it does not exist, it
+     * will be created and will remain active until the collection is dropped or unsharded.
      *
      * Must be called with some lock held on the specific collection being looked up and the
      * returned pointer should never be stored.
@@ -142,8 +149,14 @@ public:
     }
 
 private:
+    friend CSRLock;
+
     friend boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         OperationContext*, NamespaceString const&, OID const&, int, CollectionRangeDeleter*);
+
+    // Object-wide ResourceMutex to protect changes to the CollectionShardingRuntime or objects
+    // held within.
+    Lock::ResourceMutex _stateChangeMutex;
 
     // Namespace this state belongs to.
     const NamespaceString _nss;

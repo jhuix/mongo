@@ -1,6 +1,3 @@
-// expression_parser.cpp
-
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -68,7 +65,7 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
 #include "mongo/db/matcher/schema/json_schema_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/string_map.h"
@@ -549,15 +546,28 @@ StatusWithMatchExpression parseRegexDocument(StringData name, const BSONObj& doc
                     regex = e.valueStringData();
                 } else if (e.type() == BSONType::RegEx) {
                     regex = e.regex();
-                    regexOptions = e.regexFlags();
+                    if (!StringData{e.regexFlags()}.empty()) {
+                        if (!regexOptions.empty()) {
+                            return {Status(ErrorCodes::Error(51074),
+                                           "options set in both $regex and $options")};
+                        }
+                        regexOptions = e.regexFlags();
+                    }
                 } else {
                     return {Status(ErrorCodes::BadValue, "$regex has to be a string")};
                 }
 
                 break;
             case PathAcceptingKeyword::OPTIONS:
-                if (e.type() != BSONType::String)
+                if (e.type() != BSONType::String) {
                     return {Status(ErrorCodes::BadValue, "$options has to be a string")};
+                }
+
+                if (!regexOptions.empty()) {
+                    return {Status(ErrorCodes::Error(51075),
+                                   "options set in both $regex and $options")};
+                }
+
                 regexOptions = e.valueStringData();
                 break;
             default:
@@ -1372,13 +1382,34 @@ StatusWithMatchExpression parseNot(StringData name,
         return parseStatus;
     }
 
-    for (size_t i = 0; i < theAnd->numChildren(); i++) {
-        if (theAnd->getChild(i)->matchType() == MatchExpression::REGEX) {
-            return {ErrorCodes::BadValue, "$not cannot have a regex"};
-        }
+    return {stdx::make_unique<NotMatchExpression>(theAnd.release())};
+}
+
+StatusWithMatchExpression parseInternalSchemaBinDataSubType(StringData name, BSONElement e) {
+    if (!e.isNumber()) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << InternalSchemaBinDataSubTypeExpression::kName
+                                    << " must be represented as a number");
     }
 
-    return {stdx::make_unique<NotMatchExpression>(theAnd.release())};
+    auto valueAsInt = MatchExpressionParser::parseIntegerElementToInt(e);
+    if (!valueAsInt.isOK()) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Invalid numerical BinData subtype value for "
+                                    << InternalSchemaBinDataSubTypeExpression::kName
+                                    << ": "
+                                    << e.number());
+    }
+
+    if (!isValidBinDataType(valueAsInt.getValue())) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << InternalSchemaBinDataSubTypeExpression::kName
+                                    << " value must represent BinData subtype: "
+                                    << valueAsInt.getValue());
+    }
+
+    return {stdx::make_unique<InternalSchemaBinDataSubTypeExpression>(
+        name, static_cast<BinDataType>(valueAsInt.getValue()))};
 }
 
 /**
@@ -1708,6 +1739,10 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
         case PathAcceptingKeyword::INTERNAL_SCHEMA_EQ: {
             return {stdx::make_unique<InternalSchemaEqMatchExpression>(name, e)};
         }
+
+        case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE: {
+            return parseInternalSchemaBinDataSubType(name, e);
+        }
     }
 
     return {
@@ -1845,6 +1880,8 @@ MONGO_INITIALIZER(MatchExpressionParser)(InitializerContext* context) {
             {"_internalExprEq", PathAcceptingKeyword::INTERNAL_EXPR_EQ},
             {"_internalSchemaAllElemMatchFromIndex",
              PathAcceptingKeyword::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX},
+            {"_internalSchemaBinDataSubType",
+             PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE},
             {"_internalSchemaEq", PathAcceptingKeyword::INTERNAL_SCHEMA_EQ},
             {"_internalSchemaFmod", PathAcceptingKeyword::INTERNAL_SCHEMA_FMOD},
             {"_internalSchemaMatchArrayIndex",

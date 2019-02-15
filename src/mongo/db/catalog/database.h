@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -132,7 +131,7 @@ public:
     virtual void init(OperationContext* opCtx) = 0;
 
     // closes files and other cleanup see below.
-    virtual void close(OperationContext* const opCtx, const std::string& reason) = 0;
+    virtual void close(OperationContext* const opCtx) = 0;
 
     virtual const std::string& name() const = 0;
 

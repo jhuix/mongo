@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -46,7 +45,7 @@
 #include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/plan_ranker.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_test_lib.h"
 #include "mongo/db/query/query_solution.h"
